@@ -1,0 +1,5 @@
+# .t files are Hexen source (the test suite), not Terra/Raku/Turing --
+# GitHub's Linguist guesses by extension alone and has no entry for Hexen yet.
+# Marking them undetectable keeps the language stats honest (C, the actual
+# compiler) instead of mislabeling Hexen source as some other language.
+*.t linguist-detectable=false

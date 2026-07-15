@@ -1,0 +1,820 @@
+# Hexen Language Reference
+
+Terse, complete, no rationale. One construct per entry: signature, then a
+minimal example. For "why," see `specs.md`. For workflow, see `GUIDE.md`.
+
+```
+extern fn printf(u8* fmt, ...) i32
+fn main() i32 {
+    printf("Hello, world!\n")
+    return 0
+}
+```
+
+---
+
+## Lexical
+
+```
+// line comment
+/* block comment */
+0x1F  0b101  42  3.14  1.5e10
+"string literal"        // u8* into static storage
+'a'                     // u8
+true  false  null
+```
+
+Statements end at newline. `;` is accepted, never required. Two statements
+may share a line.
+
+---
+
+## Primitive types
+
+```
+u8 u16 u32 u64   i8 i16 i32 i64   f32 f64   bool   void
+```
+
+`void` = no return value (function return position only). Not a real type
+elsewhere.
+
+---
+
+## Declarations
+
+```
+TYPE name              // variable
+TYPE name = expr       // variable with initializer
+TYPE name              // parameter, field — same grammar everywhere
+```
+
+No `let`, `var`, `:`. Type is always first.
+
+```
+fn name(TYPE a, TYPE b) RETTYPE { ... }
+fn name(TYPE a)         { ... }          // omitted return = void
+extern fn name(TYPE a) RETTYPE           // no body; links against libc/host
+extern fn printf(u8* fmt, ...) i32       // "..." = C varargs (extern only)
+pub fn name(...) ...                     // exported via -emit-mod
+```
+
+---
+
+## Scoping
+
+A bare `{ }` block is a real scope, identical in kind to an `if`/`while`/
+`for` body:
+```
+i32 x = 1
+{ i32 y = 2  x = x + y }   // y dies here
+return x                    // y is undeclared from here on
+```
+- **Same scope, same name twice = compile error** ("already declared") —
+  params, locals, function names, globals. No silent shadow-by-redeclaration.
+- **Nested scope may shadow** an outer name freely; the outer scope resumes
+  its own binding once the inner one closes.
+- **Sequential (non-nested) blocks may reuse the same name** — each is its
+  own scope, not in conflict with the other.
+- A `for` loop's own induction variable dies with the loop — referencing it
+  afterward is "undeclared identifier."
+
+---
+
+## Type grammar
+
+```
+type      ::= base postfix*
+base      ::= primitive | named | fn_type | anon_struct | "(" type ")"
+postfix   ::= "*" | "[" constexpr "]" | "[" "]"
+named     ::= IDENT | IDENT "[" type_or_value ("," type_or_value)* "]"
+fn_type   ::= "fn" "(" (type ("," type)*)? ")" type?
+anon_struct ::= "struct" "{" (type IDENT)* "}"
+```
+
+Postfixes bind left-to-right over what's built so far:
+
+```
+u32*[4]     // array(4) of u32*
+u32[4]*     // pointer to u32[4]
+u32[2][3]   // array(2) of array(3) of u32 — leftmost dim indexes first
+```
+
+Parens are pure grouping, only needed to stop a greedy `fn` return type
+from eating a trailing postfix:
+
+```
+(fn(u32) u32)[4]    // array of 4 function pointers
+fn(u32) u32[4]      // one function returning u32[4]
+```
+
+Anonymous struct type (not a declaration — usable anywhere a type is):
+
+```
+struct { i32 x  i32 y } p
+```
+Identity is structural (keyed on field types): two anonymous structs with
+the same field types are the same type. Named structs stay nominal.
+
+---
+
+## Pointers
+
+```
+u32* p = &x
+u32 v = *p
+*p = 99
+u32** pp = &p
+```
+- Field access / indexing auto-deref: `p.field`, `arr_ptr[i]`.
+- `null` is valid for any pointer type.
+- `p + 1` scales by `sizeof(*p)`. `ptr - ptr` (same type) → `i64` element distance.
+- `void*` arithmetic is a compile error (both directions).
+- `*x` on a non-pointer is a compile error, not a raw dereference.
+
+---
+
+## Casts
+
+```
+(u32) x           // scalar: truncate/widen/reinterpret
+(f32) i           // int -> float
+(i32) f           // float -> int, truncates toward zero
+(u8*) ptr         // pointer reinterpret
+(fn(u32) u32) x   // integer -> function pointer
+(Point){.x=1}     // cast also supplies a target type for an untyped literal
+```
+
+---
+
+## `new` / `delete`
+
+```
+Node* n = new Node{.data = 42, .next = null}   // single object
+u8* arr = new[1024] u8                          // array (count, not bytes)
+delete n
+delete arr
+```
+No GC, no RAII, no destructor call on `delete`.
+
+---
+
+## Structs
+
+```
+struct Point { f32 x  f32 y }
+struct Config {
+    i32 base_id = 100                 // field default: any constexpr
+    i32 offset  = compute(10) * 2
+}
+struct Empty {}                        // zero-size, legal
+
+Config c = {}                          // {} or a partial literal applies defaults
+Config c2                              // bare decl — no literal, no defaults applied
+```
+- By-value pass/return (full copy). Use `Point*` for aliasing.
+- `a == b` on two structs/arrays: field-by-field value equality.
+- Lanewise `+ - * & | ^` and `== !=` on same-shaped aggregates. No `/ % < > <= >=`
+  on aggregates, no aggregate-scalar broadcast.
+- Recursive-by-value layout errors on first use (`sizeof`/instantiation), not on
+  declaration. Self-pointer (`Node* next`) is always fine.
+
+Literals:
+```
+Point p = {.x = 1.0, .y = 2.0}   // designated
+Point p = {1.0, 2.0}             // positional, declaration order
+Point p = {.x = 1.0}             // partial — rest default or zero
+```
+
+### `super` — field embedding
+
+```
+struct Base { u32 tag }
+struct Derived {
+    super Base info     // promotes Base's fields to Derived's top level
+    u32 extra
+}
+```
+- `d.tag` reaches the promoted field directly.
+- `d.info` gives the whole embedded `Base` as an **independent copy** —
+  writing through the promoted name does not alias writing through `.info`.
+- Works in `struct` and `union` bodies. Embedded type may be a generic
+  param (`super T base`), resolved at instantiation.
+- Copies fields only, never methods.
+- `(Base*)&derived_val` reads through the shared prefix (see Casts).
+
+---
+
+## Unions
+
+```
+union Value { i32 i  f32 f  u8* s }
+```
+Same field grammar as struct; fields overlap at offset 0 instead of stacking.
+
+---
+
+## Enums
+
+```
+enum Color { u32 R  u32 G  u32 B }        // every variant has a payload
+enum Option[T] { T Some  None }            // mixed payload / no-payload
+enum Direction { North South East West }  // no variant has a payload
+```
+Layout: `u32` tag + largest payload, laid out like any struct.
+
+Construction (contextual — target type supplies the enum):
+```
+Option[u32] o = .Some{42}
+Option[u32] n = .None
+```
+
+`match` on an enum **value** (exhaustive, or `else`):
+```
+match o {
+    .Some{v} { ... }     // v bound to payload
+    .None    { ... }     // no payload -> no binding
+}
+```
+A bound name in an arm is scoped to that arm only.
+
+---
+
+## `match`
+
+One rule, one keyword, scrutinee is either a **value** or a **type**:
+
+```
+match scrutinee {
+    PATTERN { ... }
+    PATTERN { ... }
+    else    { ... }      // required unless exhaustive/wildcard
+}
+```
+Arms ordered, first match wins, no fallthrough. A known/literal thing in a
+pattern position is **compared**; an unbound identifier is a **binding**.
+No `else` and nothing matches = no-op (never an error). That one rule reads
+the same whether the scrutinee is a value or a type — only what counts as
+"a pattern" changes:
+
+**Scrutinee is a value** — an enum, a non-float primitive, or a struct/array
+(pattern = a compile-time constant literal):
+```
+match n {
+    0 { ... }              // compared
+    1 { ... }
+    else { ... }
+}
+match opt {
+    .Some{v} { ... }       // v bound to the payload
+    .None    { ... }
+}
+```
+
+**Scrutinee is a type** — pattern is any type-grammar production at all
+(not a fixed list), nested to any depth (`Box[Pair[A,B]*][N]` is legal).
+Evaporates entirely at compile time. **Every slot in a pattern is decided
+independently** — the same known-vs-unbound rule from above, applied per
+identifier, not per pattern shape: `E[N]` binds both, but `E[23]` requires
+the element to be a wildcard while pinning the size to exactly 23, and
+`i32[N]` is the other way around — any mix is legal in any shape:
+```
+match T {
+    P*          { }   // pointer: P bound to pointee
+    E[N]        { }   // array: E = element, N = size — BOTH free here
+    fn(A) B     { }   // function: A = arg type(s), B = return — BOTH free here
+    Box[E]      { }   // generic, any arity: E = the type argument
+    Stack[E, N] { }   // generic + const-generic together
+    u32         { }   // compared, same rule as `0` above
+    S           { }   // bare wildcard — binds the whole type
+    struct { A x  B y } { }   // struct destructure, positional on types
+    impl { fn free() }  { }   // structural capability query — yes/no, no binding
+    else        { }
+}
+```
+A repeated wildcard binds consistently (`fn(A) A` matches only when arg and
+return are the same type — the identical "already bound, now check" rule a
+repeated value in a value pattern would need).
+
+---
+
+## `impl` — methods
+
+```
+struct Counter { u32 val }
+impl Counter {
+    fn inc()          { self.val = self.val + 1 }
+    fn add(u32 n)      { self.val = self.val + n }
+    fn get() u32       { return self.val }
+}
+```
+- Desugars to `fn Counter_inc(Counter* self) {...}`. `x.m(a)` rewrites to
+  `Counter_m(&x, a)` (or `Counter_m(x, a)` if `x` is already `Counter*`).
+- Field lookup wins over method lookup — a method never shadows a field.
+- `pub impl` exports every method; no per-method `pub`.
+- Only `fn` inside `impl`. No nested types, no `const`, no static methods,
+  no constructors (write an ordinary function returning the struct instead).
+- Generic struct: `impl Box[T] { ... }` — params read from the struct's own
+  declaration. `impl Box[u8]` (a concrete instantiation) is a compile error.
+- A method may declare its own extra type params: `fn map[U](U v) U { ... }`.
+
+---
+
+## `alias`
+
+```
+alias Byte = u8                              // plain
+alias Pair[T] = struct { T a  T b }           // generic, body is anonymous struct
+alias Getter = impl { fn get() i32 }          // pattern-only (see match/impl-query)
+alias Drawable = struct { (fn(void*) i32) draw }  // vtable-shaped struct
+```
+An alias is a parse-time expansion — the use site resolves to the underlying
+type before any later pass runs; interchangeable with what it names. No
+`typedef` keyword; `alias` is the one mechanism. `impl` honors an alias to a
+plain struct (`impl RA` where `alias RA = Raw` attaches to `Raw`); an alias
+to a generic *instantiation* is rejected the same way `impl Box[u8]` is.
+
+---
+
+## Generics
+
+```
+struct Box[T] { T val }
+struct Pair[A, B] { A first  B second }
+struct Node[T] { T data  Node[T]* next }         // self-ref via pointer OK
+
+fn id[T](T x) T { return x }
+```
+- Monomorphized per distinct instantiation; no runtime type info.
+- Inference: bottom-up from arguments, top-down from target type
+  (decl/return/param/field/cast), left-to-right first-pin-wins with
+  mismatch as a compile error.
+- Explicit call-site type args work: `make[i64]()` — verified against the
+  current compiler. (`specs.md` §17.2 claims this is a parse error; that
+  claim did not reproduce — treat `specs.md` as stale on this point, not
+  this reference.)
+
+### Const (value) generics
+
+```
+struct Vec[T, u32 N] { T[N] e }
+struct Mat[T, u32 R, u32 C] { T[R * C] cells }
+```
+A slot is a **value param** iff it ends in a name that isn't already a
+type — `u32 N` is a value param pinned to `u32`; a bare `T` is a type
+param. A value param may itself be a struct or array type, not only a
+scalar, and is usable as an ordinary value inside method bodies.
+
+A struct-typed value param can be given as an inline brace literal at the
+instantiation site — no named variable needed, and its fields are readable
+inside method bodies like any const-folded value:
+```
+struct Cfg { u32 rows  u32 cols }
+struct Screen[T, Cfg C] { T[C.rows * C.cols] px }
+impl Screen[T, Cfg C] {
+    fn plot(u32 r, u32 c, T v) { self.px[r * C.cols + c] = v }
+}
+Screen[i32, {.rows=2, .cols=8}] s   // a 2x8 screen — 16 px, baked into the type
+```
+
+Two const-generic value params inferred from **different arguments and
+checked against each other** — a shape-mismatched matrix multiply is a
+compile-time type error, not a runtime bug:
+```
+struct M[T, u32 R, u32 C] { T[R * C] e }
+fn matmul[T, u32 R, u32 K, u32 Cc](M[T, R, K] a, M[T, K, Cc] b) M[T, R, Cc] {
+    // R, K, Cc all recovered from a's and b's own types; K must agree
+    // between them or this call is a compile error, not a bad result.
+    ...
+}
+```
+
+### Variadic packs
+
+```
+fn f[T...](T... args) i32 { ... }
+```
+`T... args` bundles every trailing call argument into one synthesized
+anonymous struct value. Peel one at a time via type-level `match`, recursing
+on the tail (`Rest`) until it's empty — the base case is the zero-field
+struct, not a count you track yourself:
+```
+fn pack_len[T](T dummy) u32 {
+    match T {
+        struct {} { return 0 }              // base case: no fields left
+        struct { A a  Rest... r } {
+            Rest r2 = {}                    // an empty instance of the tail type
+            return 1 + pack_len(r2)          // recurse on it
+        }
+    }
+}
+```
+The tail (`Rest...`) must be the last field in the pattern — it can't be
+followed by anything.
+
+### Repeated wildcards and back-inference
+
+A repeated wildcard name in one pattern must resolve to the same type
+everywhere it appears — `match fn(u32) u32 { fn(A) A {...} }` matches
+(arg and return really are both `u32`); `fn(u32) i32` would fall through.
+
+A const-generic value parameter doesn't need to be given explicitly — it's
+recovered from an already-typed argument's own instantiation:
+```
+struct Vec[T, u32 N] { T[N] e }
+fn firstEl[T, u32 N](Vec[T, N] v) T { return v.e[0] }
+firstEl(some_vec_i32_4)   // T=i32, N=4 both recovered from some_vec's own type
+```
+
+---
+
+## `unpack` — irrefutable destructure
+
+```
+unpack {.x = px, .y = py} = point
+unpack {a, b, c} = array_value
+```
+Sugar for a struct/array match arm that's known to always match — no
+`else`, bound names escape into the *enclosing* scope (unlike a match arm).
+Rejects anything refutable (a literal-pinned field, an enum-variant
+pattern) — use `match` for those.
+
+---
+
+## `with` — declaration grouping
+
+```
+with extern {
+    fn malloc(u64 n) u8*
+    fn free(u8* p)
+}
+with const u32 { RED = 0  GREEN = 1  BLUE = 2 }
+with pub const u32 { X = 100  Y = 200 }
+```
+Pure prefix-sharing at parse time. Prefixes: any combination of `pub`,
+`extern`, `const`, plus a type for the `const TYPE { NAME = val }` form.
+Doesn't nest.
+
+---
+
+## Function pointers
+
+```
+fn(i32, i32) i32 f = add    // declare + assign a real function
+i32 r = f(3, 4)             // call through it
+```
+Stored in a struct field (a dispatch table), called through the field:
+```
+struct BinOps { fn(i32,i32) i32 add  fn(i32,i32) i32 mul }
+BinOps ops = {.add = add, .mul = mul}
+i32 r = ops.add(3, 4) + ops.mul(3, 4)
+```
+`==`/`!=` compare **identity** — same underlying function, not shape:
+```
+fn(i32) i32 a = f
+fn(i32) i32 b = f
+fn(i32) i32 c = g
+bool same    = (a == b)   // true
+bool differs = (a == c)   // false
+```
+A function pointer can be an enum variant's payload, matched and called:
+```
+enum OpKind { fn(i32) i32 Named  None }
+OpKind o = .Named{double}
+match o {
+    .Named{h} { return h(21) }
+    .None     { return 0 }
+}
+```
+Arithmetic on a function pointer is a compile error (nothing to scale by).
+
+---
+
+## Control flow
+
+```
+if cond { ... } else if cond2 { ... } else { ... }
+while cond { ... }
+for i32 i = 0 to 10 { ... }              // exclusive end, step +1
+for i32 i = 10 to 0 by (0 - 1) { ... }   // explicit step
+break
+continue
+return expr
+return                                    // void function only
+defer stmt
+```
+`if`/`match` are statements, not expressions.
+
+`defer` runs its statement at scope exit, LIFO order, including on early
+`return` (not just normal fall-through):
+```
+fn f() i32 {
+    defer printf("first\n")
+    defer printf("second\n")
+    return 0
+}
+// prints: second
+//         first
+```
+
+---
+
+## `sizeof` / `alignof` / `offsetof` / `nameof`
+
+```
+sizeof(x)             // u64, byte size of x's type — takes a value OR a bare type
+sizeof(SomeType)      // u64, byte size of a bare type
+alignof(SomeType)     // u64 — bare TYPE ONLY, not a value expression
+offsetof(Struct, N)   // u64, byte offset of field index N (0-based)
+nameof(SomeType)       // u8* — the type's own name, e.g. "Point"
+nameof(Struct, N)     // u8* — the name of field index N
+```
+
+---
+
+## Globals / `const`
+
+```
+u32 g_counter = 0                 // mutable global
+const u32 MAX = 1024               // compile-time constant, any constexpr
+const Point ORIGIN = {.x=0, .y=0}  // aggregate const also supported
+```
+
+`const X = f()` runs `f` at compile time via a full AST-walking interpreter
+— the SAME interpreter, not a restricted subset. There is nothing you can
+write in an ordinary function that you cannot also write in a `const`
+initializer: `for`/`while`/`break`/`continue`, `new`/`delete` and real
+pointer chains, `impl` methods, `super`-promoted fields, generics, `match`
+on both values and types. A heap-allocated linked list, built with `new`
+and traversed through `.next` pointers, folds to a single constant just
+like `1 + 1` does:
+```
+struct Node { i32 val  Node* next }
+fn build(u32 n) Node* {
+    Node* head = null
+    for u32 i = 0 to n {
+        head = new Node{.val = (i32)i, .next = head}
+    }
+    return head
+}
+fn sum(Node* head) i32 {
+    i32 total = 0
+    Node* cur = head
+    while cur != null {
+        total = total + cur.val
+        cur = cur.next
+    }
+    return total
+}
+const i32 RESULT = sum(build(10))   // folds to 45 at compile time — new,
+                                     // pointers, and a while-loop traversal,
+                                     // all resolved before the binary exists
+fn main() i32 { return RESULT }
+```
+
+---
+
+## Modules
+
+```
+pub fn foo() u32 { ... }      // exported
+fn bar() u32 { ... }          // file-private
+```
+No `import` keyword. `-emit-mod <path>` writes every `pub` item as a
+generated interface file (structs, `extern fn` signatures, const values) —
+pass that file as an ordinary input alongside its consumers.
+
+---
+
+## Operators
+
+```
++  -  *  /  %              arithmetic
+&  |  ^  <<  >>            bitwise
+&&  ||  !                  logical (short-circuit)
+==  !=  <  >  <=  >=       comparison
+=  +=  -=  *=  /=  %=      assignment / compound assignment
+&=  |=  ^=  <<=  >>=       bitwise compound assignment
+```
+No operator overloading. `/` truncates toward zero, `%` takes dividend's
+sign. Unsigned narrow overflow wraps (defined behavior).
+
+---
+
+## Showcases
+
+Every construct above is shown in isolation. These compose several at once.
+
+**Function pointer returning a generic struct, called and field-accessed
+inline:**
+```
+struct Box[T] { T val }
+struct Node { fn() Box[u32] get_box }
+fn make_box() Box[u32] { return {.val = 99} }
+fn main() i32 {
+    Node n = {.get_box = make_box}
+    return (i32) n.get_box().val
+}
+```
+
+**Triple pointer to an array of enums, dereferenced and matched:**
+```
+enum State { u32 Active  bool Inactive }
+fn main() i32 {
+    State[2] arr = { .Active{42}, .Inactive{true} }
+    State[2]* p1 = &arr
+    State[2]** p2 = &p1
+    State[2]*** p3 = &p2
+    match (***p3)[0] {
+        .Active{v}   { return (i32) v }
+        .Inactive{b} { return -1 }
+    }
+    return -2
+}
+```
+
+**Nested `match`, unwrapping two recursive calls in one arm:**
+```
+enum Option[T] { T Some  None }
+fn fib(u32 n) Option[u32] {
+    if n < 2 { return .Some{n} }
+    match fib(n - 1) {
+        .Some{a} {
+            match fib(n - 2) {
+                .Some{b} { return .Some{a + b} }
+                .None    { return .None }
+            }
+        }
+        .None { return .None }
+    }
+    return .None
+}
+```
+
+**Literal-guarded pattern**: a literal in one field position pins it to a
+constant while another position in the same pattern still binds freely —
+first-match-wins arm order decides which shape fires:
+```
+struct Vec { i32[2] xy }
+enum Shape { Vec Line  None }
+fn desc(Shape s) i32 {
+    match s {
+        .Line{{ .xy = {0, y} }} { return y }       // first elem pinned to 0
+        .Line{{ .xy = {x, y} }} { return x + y }    // falls through otherwise
+        .None { return -1 }
+    }
+}
+```
+
+**Compile-time recursive walk over a struct's own field list** — no runtime
+reflection, `match` on the *type*, peeling one field at a time via
+pack-tail destructuring:
+```
+extern fn printf(u8* fmt, ...) i32
+struct Pair[T] { T a  T b }
+struct Widget { u8 tag  Pair[i32] data }
+fn dump[Orig, Walk, u32 N](i32 depth) void {
+    match Walk {
+        struct { H head  Rest... rest } {
+            printf("%s %s\n", nameof(H), nameof(Orig, N))
+            dump[Orig, Rest, N + 1](depth)
+        }
+        struct {} {}
+    }
+}
+fn main() i32 { dump[Widget, Widget, 0](0)  return 0 }
+```
+
+**A hand-built existential**: an opaque pointer plus a vtable built from a
+variadic pack of per-type thunks — no language feature named "interface" or
+"trait" anywhere in it:
+```
+struct Dyn[V] { void* obj  V vt }
+fn dyn[T, V](T* o, V... fns) Dyn[V] { return { .obj = (void*)o, .vt = fns } }
+alias Getter = struct { (fn(void*) i32) get }
+fn t_get[T](void* p) i32 { T* o = (T*)p  return o.get() }
+struct A { i32 v }
+impl A { fn get() i32 { return 3 } }
+struct B { u8* s }
+impl B { fn get() i32 { return 7 } }
+fn main() i32 {
+    A a = { .v = 0 }
+    B b = { .s = "x" }
+    Dyn[Getter][2] items
+    items[0] = dyn[A, Getter](&a, t_get[A])
+    items[1] = dyn[B, Getter](&b, t_get[B])
+    i32 sum = 0
+    for u32 i = 0 to 2 { sum = sum + items[i].vt.get(items[i].obj) }
+    return sum   // 10
+}
+```
+The same dispatch function can instead be a **const-generic value
+parameter** baked into the type itself — `sizeof` the result is then just
+the data pointer (8 bytes): the "virtual call" is fully resolved at compile
+time, nothing stored at runtime.
+```
+struct Circle { i32 r }
+impl Circle { fn area() i32 { return 42 } }
+fn t_area[T](void* p) i32 { T* o = (T*)p  return o.area() }
+struct DynA[fn(void*) i32 F] { void* obj }
+impl DynA[F] { fn area() i32 { return F(self.obj) } }
+fn main() i32 {
+    Circle c = { .r = 1 }
+    DynA[t_area[Circle]] d = { .obj = (void*)&c }
+    return (i32)sizeof(d)   // 8
+}
+```
+
+Structural capability check **inside a generic function body**, choosing at
+compile time between a real thunk and a null vtable entry:
+```
+fn as_getter[T](T* o) Dyn[Getter] {
+    match T {
+        impl { fn get() i32 } { return dyn[T, Getter](o, t_get[T]) }
+        else { return { .obj = null, .vt = { .get = null } } }
+    }
+}
+```
+
+`super` combined with the vtable pattern: a `Derived*` upcast to `Base*`
+dispatches through `Base`'s own method and reads the shared field prefix:
+```
+struct Base { i32 x }
+impl Base { fn get() i32 { return self.x } }
+struct Derived { super Base base  i32 extra }
+impl Derived { fn get() i32 { return self.x + self.extra } }
+fn main() i32 {
+    Derived d
+    d.x = 20   // promoted field, offset 0 — same offset Base.x has
+    d.extra = 3
+    Base* upcast = (Base*)&d
+    return d.get() + upcast.get()   // 23 + 20 = 43
+}
+```
+
+**A generic enum whose variants are mixed** (one payload is the type
+parameter, the other is a fixed concrete type — not every variant has to be
+generic), **nested inside another generic enum as an array payload**,
+matched two levels deep, calling a function pointer inside the inner arm:
+```
+enum Res[T] { T Ok  i32 Err }
+enum Node[T] { Res[T][2] Branch  T Leaf }
+fn sum_node[T](Node[T] n, fn(T) i32 f) i32 {
+    match n {
+        .Branch{b} {
+            i32 acc = 0
+            for u32 i = 0 to 2 {
+                match b[i] {
+                    .Ok{v}  { acc = acc + f(v) }
+                    .Err{e} { acc = acc + e }
+                }
+            }
+            return acc
+        }
+        .Leaf{v} { return f(v) }
+    }
+    return 0
+}
+fn id(i32 x) i32 { return x }
+fn main() i32 {
+    Res[i32][2] arr = { .Ok{10}, .Err{5} }
+    return sum_node(.Branch{arr}, id)   // f(10) + 5 = 15
+}
+```
+
+**Two const-generic value parameters at once**, a real 2D matrix, with an
+`impl` method returning a new instance of the same generic instantiation:
+```
+struct Mat[T, u32 R, u32 C] { T[R][C] d }
+impl Mat[T, R, C] {
+    fn add(Mat[T, R, C]* other) Mat[T, R, C] {
+        Mat[T, R, C] res
+        for u32 i = 0 to R {
+            for u32 j = 0 to C { res.d[i][j] = self.d[i][j] + other.d[i][j] }
+        }
+        return res
+    }
+}
+fn main() i32 {
+    Mat[i32, 2, 3] m1
+    m1.d[0][0]=1  m1.d[0][1]=2  m1.d[0][2]=3
+    m1.d[1][0]=4  m1.d[1][1]=5  m1.d[1][2]=6
+    Mat[i32, 2, 3] m2
+    m2.d[0][0]=10  m2.d[0][1]=20  m2.d[0][2]=30
+    m2.d[1][0]=40  m2.d[1][1]=50  m2.d[1][2]=60
+    Mat[i32, 2, 3] m3 = m1.add(&m2)
+    return m3.d[1][2]   // 66
+}
+```
+
+---
+
+## CLI
+
+```
+./torrent file.t                    # JIT: compile + run main()
+./torrent -c file.t -o out.o         # AOT: emits a RELOCATABLE object, not a runnable binary
+gcc -o out aot_shim.c out.o          # link with the C entry-point shim to get a runnable binary
+./torrent a.t b.t                    # multiple files, one compilation
+./torrent file.t -- arg1 arg2        # args after -- go to your program's argv
+./torrent -emit-mod out.tmod file.t  # write pub interface file
+```
