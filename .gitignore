@@ -20,6 +20,10 @@
 !docs/
 !docs/REFERENCE.md
 
+!.github/
+!.github/workflows/
+!.github/workflows/ci.yml
+
 # Scratch/debug one-off tools at root -- not part of the real compiler build
 # (see Makefile's SRC list for what actually is).
 aot_shim.c
