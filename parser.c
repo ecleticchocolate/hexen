@@ -763,7 +763,14 @@ static bool parse_anonymous_aggregate_type(Type* base_t) {
                 Lexer_Save(&save);
                 Token   at_start = s_curr;
                 Type*   spec = parse_type();
-                if (spec && s_curr.type == TOK_IDENTIFIER) {
+                // A real payload-type spec is followed by either the variant's own
+                // name (`i32 Circle`) or, for a pack-tail wildcard, `...` before the
+                // tail's binding name (`Rest... r`) -- without the second case, `Rest`
+                // parsed fine as a type but the lookahead saw `...` next (not an
+                // identifier) and wrongly concluded "not a payload type after all,
+                // this must be a bare no-payload variant literally named Rest",
+                // silently eating the wildcard as a variant name instead of a type.
+                if (spec && (s_curr.type == TOK_IDENTIFIER || s_curr.type == TOK_ELLIPSIS)) {
                     ft = spec;
                 } else {
                     Lexer_Restore(&save);
@@ -777,9 +784,6 @@ static bool parse_anonymous_aggregate_type(Type* base_t) {
         }
         
         if (s_curr.type == TOK_ELLIPSIS) {
-            if (anon_is_enum)
-                parse_error("a `T...` pack-tail is not meaningful in an anonymous enum "
-                            "(variants are an unordered set, not a positional field list)");
             if (pack_idx != -1)
                 parse_error("at most one `T...` pack-tail field is allowed per anonymous aggregate");
             pack_idx = (int)fcount;
@@ -3512,6 +3516,7 @@ static ASTNode* parse_struct_decl_ex(bool is_enum, bool is_overlapping, bool is_
             cap *= 2;
             sd->fields = (StructField*)realloc(sd->fields, cap * sizeof(StructField));
         }
+        size_t this_idx = sd->field_count;
         StructField* f = &sd->fields[sd->field_count++];
         f->name = strndup(fname.start, fname.length);
         f->type = ftype;          // NULL for a no-payload variant
@@ -3519,6 +3524,7 @@ static ASTNode* parse_struct_decl_ex(bool is_enum, bool is_overlapping, bool is_
         f->has_default = has_default;
         f->default_val_buf = default_val_buf;
         f->is_super_param = false;
+        f->variant_tag = is_enum ? (uint32_t)this_idx : 0; // meaningless for struct/union
 
         if (s_curr.type == TOK_SEMI) advance(); // optional separator
     }

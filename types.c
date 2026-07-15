@@ -53,13 +53,22 @@ static bool prim_signed(PrimitiveKind p) {
 // arrays compare correctly. Extend here when structs/arrays gain real members.
 bool Type_Equals(const Type* a, const Type* b);
 
-// Is this return type "no return value"? Two spellings reach here: an OMITTED return
-// (`fn(u32)`), which the parser leaves as NULL, and an EXPLICIT `void` (`fn(u32) void`),
-// which is a real PRIM_VOID/PRIM_V type node. Same meaning, so treat them alike.
-static bool ret_is_void(const Type* t) {
+// Is this "no value" -- an OMITTED type (parser leaves NULL: a function's return
+// with nothing written, an enum variant with no payload) or an EXPLICIT `void`
+// (a real PRIM_VOID/PRIM_V type node)? Two spellings of the identical thing;
+// shared by fn_ret_equal below and reflect_unify (reflections.c), where a
+// no-payload enum variant's wildcard-bound H must compare equal to a literal
+// `void` pattern the same way an omitted return type already compares equal to
+// an explicit one.
+bool Type_IsVoidLike(const Type* t) {
     return !t || (t->cls == TYPE_PRIMITIVE &&
                   (t->primitive == PRIM_VOID || t->primitive == PRIM_V));
 }
+
+// Is this return type "no return value"? Two spellings reach here: an OMITTED return
+// (`fn(u32)`), which the parser leaves as NULL, and an EXPLICIT `void` (`fn(u32) void`),
+// which is a real PRIM_VOID/PRIM_V type node. Same meaning, so treat them alike.
+static bool ret_is_void(const Type* t) { return Type_IsVoidLike(t); }
 
 // Return-type equality for function types, normalizing the two void spellings.
 static bool fn_ret_equal(const Type* a, const Type* b) {
@@ -782,8 +791,22 @@ Type* Type_Substitute(Type* t, const char** params, Type** args, size_t n) {
                 if (newf[i] != sd->fields[i].type) any = true;
             }
             if (any) {
+                // Preserve is_enum/is_overlapping in both the name (so a substituted
+                // enum pattern can never dedupe-collide with a struct/union of the
+                // same field shape -- same reasoning as Struct_MakeAnon's kind-prefixed
+                // name) and on the re-registered StructDef itself. Without this, an
+                // `enum { u32 h }` pattern used inside a GENERIC function silently
+                // lost its is_enum flag the moment substitution ran (even with zero
+                // actual TYPE_PARAMs left to substitute, `any` can still be true via
+                // e.g. a wildcard-bound field), and reflect_unify's
+                // `cs->is_enum == ps->is_enum` gate then always failed against a real
+                // enum concrete type -- a concrete-typed enum pattern (`u32 h`) never
+                // matched anything, while a WILDCARD enum pattern (`H h`) happened to
+                // take a different path earlier and worked. Same class of bug already
+                // fixed once for Struct_MakeAnon; this is the substitution-time sibling.
+                const char* kw = sd->is_enum ? "enum{" : (sd->is_overlapping ? "union{" : "struct{");
                 char namebuf[1024]; size_t off = 0;
-                off += snprintf(namebuf + off, sizeof(namebuf) - off, "struct{");
+                off += snprintf(namebuf + off, sizeof(namebuf) - off, "%s", kw);
                 for (size_t i = 0; i < fc; i++) {
                     char tn[128]; Type_ToString(newf[i], tn, sizeof(tn));
                     off += snprintf(namebuf + off, sizeof(namebuf) - off, "%s%s%s",
@@ -793,7 +816,8 @@ Type* Type_Substitute(Type* t, const char** params, Type** args, size_t n) {
                 snprintf(namebuf + off, sizeof(namebuf) - off, "}");
                 StructDef* nsd = Struct_Register(namebuf, strlen(namebuf));
                 if (nsd->field_count == 0 && !nsd->laid_out) {
-                    nsd->is_enum = false;
+                    nsd->is_enum = sd->is_enum;
+                    nsd->is_overlapping = sd->is_overlapping;
                     nsd->is_anonymous = true;
                     nsd->pack_field_index = sd->pack_field_index;
                     nsd->fields = (StructField*)calloc(fc, sizeof(StructField));
@@ -802,6 +826,7 @@ Type* Type_Substitute(Type* t, const char** params, Type** args, size_t n) {
                         nsd->fields[i].name = sd->fields[i].name;
                         nsd->fields[i].type = newf[i];
                         nsd->fields[i].offset = 0;
+                        nsd->fields[i].variant_tag = sd->fields[i].variant_tag;
                     }
                 }
                 c->struct_name = nsd->name;
@@ -1384,7 +1409,7 @@ static void pack_expand_call_args(ASTNode* node) {
         vals[i] = a;
     }
     if (ok) {
-        StructDef* sd = Struct_MakeAnon(ftypes, pack_n);
+        StructDef* sd = Struct_MakeAnon(ftypes, pack_n, false); // a T... call-arg bundle is always struct-shaped
         // field_names/field_name_lens are indexed unconditionally by later
         // typecheck passes even when sdef is pre-set (positional literal), so
         // mirror the synthesized "_0","_1",... names Struct_MakeAnon gave each
@@ -1600,7 +1625,17 @@ Type* Type_MakePrim(int primitive_kind) { return make_prim((PrimitiveKind)primit
 static void check_assignable(Type* dst, ASTNode* src, const char* where) {
     Type* st = src ? Type_Infer(src) : NULL;
     if (!dst || !st) {
-        if (dst != st) {
+        // Same two-spellings-of-void normalization as Type_Equals' fn_ret_equal /
+        // reflect_unify's Type_IsVoidLike check elsewhere: a bare `return` (src
+        // NULL, so st NULL) against a function whose return type was written
+        // EXPLICITLY as `void` (dst is a real PRIM_V Type*, not NULL) must be
+        // treated as the SAME "nothing" on both sides, not a pointer-identity
+        // mismatch between "no type" and "the void type." Without this, `return`
+        // (no expression) only worked when the return type was OMITTED, and
+        // hard-erred as "void vs value" the moment `void` was written explicitly
+        // -- the one case an explicit `void` return type should behave IDENTICALLY
+        // to an omitted one, since REFERENCE.md documents them as interchangeable.
+        if (!(Type_IsVoidLike(dst) && Type_IsVoidLike(st))) {
             char msg[256];
             snprintf(msg, sizeof(msg), "type mismatch in %s: void vs value", where);
             Error_AtNode(src, msg, NULL);
@@ -1774,7 +1809,12 @@ void Typecheck_Tree(ASTNode* node) {
                 // instantiation) defers — that copy gets resolved later, once,
                 // by Resolve_Reflect_Matches right after clone_ast.
                 Type* scrut = node->if_stmt.reflect_scrutinee;
-                if (scrut && scrut->cls != TYPE_PARAM) {
+                // See Resolve_Reflect_Matches's identical fix: a NULL scrutinee is
+                // not automatically "still an unresolved generic param" -- it's also
+                // the genuine, resolved value of an omitted type (a no-payload enum
+                // variant's H). Only bail when scrut is a REAL TYPE_PARAM node.
+                bool still_generic = scrut && scrut->cls == TYPE_PARAM;
+                if (!still_generic) {
                     ReflectBindings binds = {0};
                     if (reflect_unify(scrut, node->if_stmt.reflect_pattern, &binds)) {
                         ASTNode* body = node->if_stmt.true_block;
@@ -2900,7 +2940,19 @@ static void Resolve_Reflect_Matches(ASTNode* n) {
         case AST_IF:
             if (n->if_stmt.reflect_pattern) {
                 Type* scrut = n->if_stmt.reflect_scrutinee;
-                if (scrut && scrut->cls != TYPE_PARAM) {
+                // A NULL scrutinee is NOT automatically "still generic, not yet
+                // substituted" -- it's also the genuine, resolved value of an
+                // omitted type (a no-payload enum variant's H, after Type_Substitute
+                // ran and legitimately produced NULL; see Type_IsVoidLike). Only an
+                // ACTUAL unresolved TYPE_PARAM node means "wait, substitution hasn't
+                // happened yet" -- that requires scrut to be non-NULL. Treating every
+                // NULL as "still generic" left THIS match unresolved forever (neither
+                // arm ever selected), so downstream code silently fell back to
+                // whatever this half-finished AST_IF happened to do next -- the same
+                // silent-wrongness class as the Struct_MakeAnon/Type_Substitute
+                // is_enum bugs already fixed this session, just one level up.
+                bool still_generic = scrut && scrut->cls == TYPE_PARAM;
+                if (!still_generic) {
                     ReflectBindings binds = {0};
                     if (reflect_unify(scrut, n->if_stmt.reflect_pattern, &binds)) {
                         ASTNode* body = n->if_stmt.true_block;

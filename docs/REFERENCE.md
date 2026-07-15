@@ -35,8 +35,11 @@ may share a line.
 u8 u16 u32 u64   i8 i16 i32 i64   f32 f64   bool   void
 ```
 
-`void` = no return value (function return position only). Not a real type
-elsewhere.
+`void` = no return value in function-return position (written or omitted —
+both mean the same thing). Elsewhere it's a genuine zero-sized unit type, not
+specially restricted: `void x`, `void[N]`, a struct field, or a generic type
+argument (`Box[void]`) are all legal and all cost 0 bytes; `void == void` is
+always `true`. See Showcases for the idiomatic uses this enables.
 
 ---
 
@@ -803,6 +806,33 @@ fn main() i32 {
     m2.d[1][0]=40  m2.d[1][1]=50  m2.d[1][2]=60
     Mat[i32, 2, 3] m3 = m1.add(&m2)
     return m3.d[1][2]   // 66
+}
+```
+
+**`void` as a genuine zero-sized unit type** — not a dedicated feature, just an
+ordinary `Type*` that inherits every mechanism ordinary types get. A fallible
+operation with no success payload costs nothing extra to express, and `{}`
+already supplies the one unit value with no dedicated literal syntax needed:
+```
+extern fn printf(u8* fmt, ...) i32
+enum Result[T, E] { T Ok  E Err }
+struct Config { i32 x }
+fn validate(Config* c) Result[void, u8*] {
+    if c.x <= 0 { return .Err{"bad config"} }
+    return .Ok{}          // {} supplies the void payload
+}
+fn main() i32 {
+    Config good = {.x = 1}
+    Config bad = {.x = 0}
+    match validate(&good) {
+        .Ok{v}  { printf("good: ok, sizeof(v)=%d\n", (i32)sizeof(v)) }   // 0
+        .Err{e} { printf("good: err %s\n", e) }
+    }
+    match validate(&bad) {
+        .Ok{v}  { printf("bad: ok\n") }
+        .Err{e} { printf("bad: err %s\n", e) }   // "bad config"
+    }
+    return 0
 }
 ```
 

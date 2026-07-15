@@ -30,13 +30,17 @@ StructDef* Struct_Register(const char* name, size_t len) {
     return sd;
 }
 
-StructDef* Struct_MakeAnon(Type** field_types, size_t field_count) {
+StructDef* Struct_MakeAnon(Type** field_types, size_t field_count, bool is_overlapping) {
     // Content-derived name, same scheme as the parser's `struct { A x  B y }`
     // literal path: "struct{<t0>,<t1>,...}" -- structural identity == name
     // identity, so a pack shape reused across call sites dedups for free.
+    // A union-tail rebundle gets its own "union{...}" name (is_overlapping
+    // folded into the key) so it can never collide/dedupe against the
+    // struct-shaped rebundle of the same field types -- same layout-affecting
+    // flag, same reasoning as is_enum getting its own name prefix below.
     char namebuf[1024];
     size_t off = 0;
-    off += snprintf(namebuf + off, sizeof(namebuf) - off, "struct{");
+    off += snprintf(namebuf + off, sizeof(namebuf) - off, is_overlapping ? "union{" : "struct{");
     for (size_t i = 0; i < field_count; i++) {
         char tn[128];
         Type_ToString(field_types[i], tn, sizeof(tn));
@@ -48,6 +52,7 @@ StructDef* Struct_MakeAnon(Type** field_types, size_t field_count) {
     StructDef* sd = Struct_Register(namebuf, strlen(namebuf));
     if (sd->field_count == 0 && !sd->laid_out) {
         sd->is_enum = false;
+        sd->is_overlapping = is_overlapping;
         sd->is_anonymous = true;
         // Struct_MakeAnon always builds from already-concrete field types (a call-site
         // pack bundle or a reflect_unify pack-tail rebundle) -- never a pattern itself,
@@ -62,6 +67,51 @@ StructDef* Struct_MakeAnon(Type** field_types, size_t field_count) {
             sd->fields[i].name = strdup(fnbuf);
             sd->fields[i].type = field_types[i];
             sd->fields[i].offset = 0;
+        }
+        Struct_Layout(sd);
+    }
+    return sd;
+}
+
+// Same rebundling idea as Struct_MakeAnon, but for the TAIL of an enum's
+// variant list (a `Rest...` pack-tail peel on an enum type -- see reflect_unify's
+// pack-tail branch in reflections.c). An enum-tail is a real, smaller enum, not a
+// struct: it needs is_enum=true and, critically, each variant's ORIGINAL absolute
+// tag preserved (variant_tags[i]) rather than renumbered to 0,1,2... -- the whole
+// point is that concrete VALUES of the original enum are still valid values of
+// this rebundled type (same bytes, same tag meaning), so match/Enum_VariantIndex
+// on the rebundle must agree with match on the original. Variant names are
+// synthesized (like Struct_MakeAnon's field names) since nothing generic reads
+// them back off the REBUNDLE -- the established idiom (see describe.t,
+// generic_json.t) is nameof(Orig, N) against the ORIGINAL type + a tracked index,
+// never nameof(Rest, i) against a peeled tail.
+StructDef* Struct_MakeAnonEnum(Type** variant_types, uint32_t* variant_tags, size_t variant_count) {
+    char namebuf[1024];
+    size_t off = 0;
+    off += snprintf(namebuf + off, sizeof(namebuf) - off, "enum{");
+    for (size_t i = 0; i < variant_count; i++) {
+        char tn[128];
+        if (variant_types[i]) Type_ToString(variant_types[i], tn, sizeof(tn));
+        else snprintf(tn, sizeof(tn), "void");
+        off += snprintf(namebuf + off, sizeof(namebuf) - off, "%u:%s%s",
+                         variant_tags[i], tn, (i + 1 < variant_count) ? "," : "");
+    }
+    snprintf(namebuf + off, sizeof(namebuf) - off, "}");
+
+    StructDef* sd = Struct_Register(namebuf, strlen(namebuf));
+    if (sd->field_count == 0 && !sd->laid_out) {
+        sd->is_enum = true;
+        sd->is_anonymous = true;
+        sd->pack_field_index = -1;
+        sd->fields = (StructField*)calloc(variant_count ? variant_count : 1, sizeof(StructField));
+        sd->field_count = variant_count;
+        for (size_t i = 0; i < variant_count; i++) {
+            char fnbuf[16];
+            snprintf(fnbuf, sizeof(fnbuf), "_%u", variant_tags[i]);
+            sd->fields[i].name = strdup(fnbuf);
+            sd->fields[i].type = variant_types[i];
+            sd->fields[i].offset = 0;
+            sd->fields[i].variant_tag = variant_tags[i];
         }
         Struct_Layout(sd);
     }
@@ -87,6 +137,7 @@ void Struct_AppendField(StructField** fields, size_t* count, size_t* cap, Struct
     f->has_default = proto.has_default;
     f->default_val_buf = proto.default_val_buf;
     f->is_super_param = false;
+    f->variant_tag = proto.variant_tag; // preserve on copy (super splice, generic instantiation)
 }
 
 StructDef* Struct_Instantiate(StructDef* gen, Type** targs, size_t targ_count) {
@@ -168,7 +219,8 @@ StructDef* Struct_Instantiate(StructDef* gen, Type** targs, size_t targ_count) {
             }
 
             StructField f = { .name = gf->name, .type = subst_type,
-                .has_default = gf->has_default, .default_val_buf = gf->default_val_buf };
+                .has_default = gf->has_default, .default_val_buf = gf->default_val_buf,
+                .variant_tag = gf->variant_tag };
             Struct_AppendField(&inst->fields, &inst->field_count, &icap, f);
         }
     }
@@ -192,6 +244,7 @@ void Struct_UpdateInstantiations(StructDef* gen) {
                     : NULL;
                 inst->fields[j].has_default = gen->fields[j].has_default;
                 inst->fields[j].default_val_buf = gen->fields[j].default_val_buf;
+                inst->fields[j].variant_tag = gen->fields[j].variant_tag;
             }
             Struct_Layout(inst);
         }
@@ -209,12 +262,17 @@ StructField* Struct_FindField(StructDef* sd, const char* name, size_t len) {
     return NULL;
 }
 
-// The variant index of `name` in enum `sd` -- this position IS the tag value. -1 if
-// not found. (A variant is just a StructField; this is its index in fields[].)
+// The TAG VALUE of variant `name` in enum `sd` -- NOT necessarily its index in
+// fields[]. Ordinarily the two coincide (a plain `enum Foo { A B C }` numbers
+// tags 0,1,2 in declaration order, same as array position) -- they diverge
+// only for an anonymous sub-enum built by peeling a `Rest...` pack-tail off a
+// concrete enum (Struct_MakeAnon), whose fields[0] keeps its ORIGINAL absolute
+// tag instead of renumbering to 0. Returns -1 if not found.
 int Enum_VariantIndex(StructDef* sd, const char* name, size_t len) {
     if (!sd) return -1;
     for (size_t i = 0; i < sd->field_count; i++) {
-        if (strlen(sd->fields[i].name) == len && strncmp(sd->fields[i].name, name, len) == 0) return i;
+        if (strlen(sd->fields[i].name) == len && strncmp(sd->fields[i].name, name, len) == 0)
+            return (int)sd->fields[i].variant_tag;
     }
     return -1;
 }

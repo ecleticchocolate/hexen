@@ -108,6 +108,16 @@ bool reflect_unify(Type* concrete, Type* pattern, ReflectBindings* out) {
         return bind(out, pattern->param_name, concrete);
     }
 
+    // Same normalization Type_Equals' function-return-type case already applies
+    // (see Type_IsVoidLike/fn_ret_equal in types.c): an OMITTED type (a no-payload
+    // enum variant's stored NULL field type, reached here after a wildcard bound
+    // to it -- e.g. `enum { H h  Rest... r }` then `match H { void {...} }`) must
+    // compare equal to an EXPLICIT `void` pattern. Without this, H's binding
+    // (concrete=NULL) never matched a literal `void` pattern, even though
+    // nameof(H) already prints "void" for the identical value -- the STRING
+    // representation and the STRUCTURAL comparison silently disagreed.
+    if (Type_IsVoidLike(concrete) && Type_IsVoidLike(pattern)) return true;
+
     if (!concrete || !pattern) return false;
 
     // ── `impl { fn name(A) B }` ───────────────────────────────────────────────
@@ -307,7 +317,27 @@ bool reflect_unify(Type* concrete, Type* pattern, ReflectBindings* out) {
                     size_t rest_n = cs->field_count - fixed;
                     Type** rest_types = (Type**)malloc((rest_n ? rest_n : 1) * sizeof(Type*));
                     for (size_t i = 0; i < rest_n; i++) rest_types[i] = cs->fields[fixed + i].type;
-                    StructDef* rest_sd = Struct_MakeAnon(rest_types, rest_n);
+                    StructDef* rest_sd;
+                    if (cs->is_enum) {
+                        // The tail of an ENUM's variant list is a smaller enum, not a
+                        // struct -- and it must keep each remaining variant's ORIGINAL
+                        // absolute tag (Enum_VariantIndex/match's tag-compare codegen
+                        // read variant_tag, not array position), so the rebundle stays
+                        // a valid reinterpretation of the SAME bytes as the concrete
+                        // type, exactly like a struct-tail already is.
+                        uint32_t* rest_tags = (uint32_t*)malloc((rest_n ? rest_n : 1) * sizeof(uint32_t));
+                        for (size_t i = 0; i < rest_n; i++) rest_tags[i] = cs->fields[fixed + i].variant_tag;
+                        rest_sd = Struct_MakeAnonEnum(rest_types, rest_tags, rest_n);
+                        free(rest_tags);
+                    } else {
+                        // Preserve is_overlapping too: a union's Rest tail must stay a
+                        // union (fields overlapping at offset 0), not silently become a
+                        // struct with fields stacked one after another -- same class of
+                        // bug as the enum tag issue above, just on the layout axis
+                        // instead of the tag axis. A plain struct's Rest is unaffected
+                        // (is_overlapping is already false there).
+                        rest_sd = Struct_MakeAnon(rest_types, rest_n, cs->is_overlapping);
+                    }
                     free(rest_types);
                     Type* rest_type = (Type*)calloc(1, sizeof(Type));
                     rest_type->cls = TYPE_STRUCT;

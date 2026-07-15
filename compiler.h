@@ -193,6 +193,16 @@ typedef struct StructField {
     // expanded, so instantiation just copies its promoted fields like any
     // other plain field -- nothing left to defer).
     bool is_super_param;
+    // For an enum variant ONLY: its ABSOLUTE tag value (the number actually
+    // stored in memory and compared by `match`/codegen). Ordinarily equal to
+    // the field's own index in fields[] -- but a `Rest...` pack-tail peel on
+    // an enum type (see Struct_MakeAnon) rebundles a SUFFIX of the original
+    // variant list into a smaller anonymous enum, whose own fields[0] is no
+    // longer tag 0. Without this, a peeled sub-enum could not tell which
+    // absolute tag its local index 0 corresponds to, and every tag compare
+    // downstream (Enum_VariantIndex, match's codegen, nameof) would silently
+    // read the wrong variant. Meaningless (0) for a struct/union field.
+    uint32_t variant_tag;
 } StructField;
 
 typedef struct StructDef {
@@ -264,7 +274,8 @@ StructDef* Struct_Instantiate(StructDef* gen, Type** args, size_t argc); // gene
 // Prototype: synthesize (or find, structurally deduped) an anonymous struct type
 // from a list of already-known field types, with compiler-generated field names
 // ("_0", "_1", ...). Used to bind a `T... args` pack param at a call site.
-StructDef* Struct_MakeAnon(Type** field_types, size_t field_count);
+StructDef* Struct_MakeAnon(Type** field_types, size_t field_count, bool is_overlapping);
+StructDef* Struct_MakeAnonEnum(Type** variant_types, uint32_t* variant_tags, size_t variant_count);
 void Struct_UpdateInstantiations(StructDef* gen);
 void Struct_Layout(StructDef* sd); // assign field offsets + size; errors on by-value cycle
 uint64_t Type_SizeOf(const Type* t); // full storage size in bytes (basis for sizeof)
@@ -685,6 +696,9 @@ bool Type_Equals(const Type* a, const Type* b); // structural equality (recurses
 bool Type_IsSigned(const Type* t);   // signed integer? (i8..i64). pointers/unsigned/bool => false
 bool Type_IsFloat(const Type* t);    // f32 or f64?
 bool Type_IsAggregate(const Type* t); // struct or array? (addressed, not register-held)
+// "No value" -- an OMITTED type (NULL: an omitted fn return, a no-payload enum
+// variant) or an EXPLICIT void/PRIM_V node. Two spellings of the same thing.
+bool Type_IsVoidLike(const Type* t);
 Type* Type_Substitute(Type* t, const char** params, Type** args, size_t n);
 Type* Type_FnLitShape(Type* t); // unwrap TYPE_FN_LITERAL to its underlying TYPE_FUNCTION shape; no-op otherwise
 int  Type_Width(const Type* t);      // size in bytes of the value in a register context (1,2,4,8)
