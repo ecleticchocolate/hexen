@@ -1008,12 +1008,29 @@ static bool ce_eval_ident(ASTNode* node, int64_t* out) {
             // to fold (a function has no arena presence, unlike a pointer whose
             // value is an arena offset). Mirror the pointer convention with the
             // one representation that already IS stable and unique per function
-            // for the life of this compiler run: the Symbol* itself. Non-generic
-            // only for now -- a bare reference to a generic fn as a value would
-            // need its type_args resolved first, which this path doesn't attempt.
+            // for the life of this compiler run: the Symbol* itself.
             if (node->ident.sym && node->ident.sym->kind == SYM_FUNCTION &&
                 !node->ident.sym->generic_decl) {
                 *out = (int64_t)(intptr_t)node->ident.sym;
+                s_ce_isfloat = false; s_ce_isagg = false; s_ce_isfnsym = true;
+                return true;
+            }
+            // Same, but for a GENERIC function referenced with explicit type args
+            // as a value (`id_i32[i32]`, stored in a fn-ptr-typed field/variable,
+            // never called directly here) -- instantiate it first to get the real,
+            // concrete Symbol*, then fold that exactly like the non-generic case
+            // above. Without this, id_i32[i32] silently had no fold path at all:
+            // the non-generic branch excludes it (generic_decl is set), and
+            // nothing else in this function recognizes an explicit-type-args
+            // generic ident either -- so a struct literal field or const
+            // initializer storing a generic function reference always failed
+            // with "not a constant expression," while the identical shape with
+            // a plain (non-generic) function folded fine.
+            if (node->ident.sym && node->ident.sym->kind == SYM_FUNCTION &&
+                node->ident.sym->generic_decl && node->ident.type_arg_count > 0) {
+                Symbol* isym = Generic_Instantiate(node->ident.sym, node->ident.type_args,
+                                                    node->ident.type_arg_count);
+                *out = (int64_t)(intptr_t)isym;
                 s_ce_isfloat = false; s_ce_isagg = false; s_ce_isfnsym = true;
                 return true;
             }

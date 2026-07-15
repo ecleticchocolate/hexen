@@ -1750,6 +1750,10 @@ static bool stmt_always_returns(ASTNode* n) {
     }
 }
 
+// Forward decl: defined below, but Typecheck_Tree's AST_IF case (a non-generic
+// `match T`'s resolution path) needs to call it -- see that case for why.
+static void Resolve_Reflect_Matches(ASTNode* n);
+
 void Typecheck_Tree(ASTNode* node) {
     if (!node) return;
 
@@ -1818,8 +1822,21 @@ void Typecheck_Tree(ASTNode* node) {
                     ReflectBindings binds = {0};
                     if (reflect_unify(scrut, node->if_stmt.reflect_pattern, &binds)) {
                         ASTNode* body = node->if_stmt.true_block;
-                        if (binds.count > 0)
+                        if (binds.count > 0) {
                             body = clone_ast(body, binds.names, binds.args, binds.count, false);
+                            // clone_ast's own AST_NAMEOF case only substitutes the type
+                            // reference -- it never actually folds the node into a real
+                            // AST_STRING (that conversion lives solely in
+                            // Resolve_Reflect_Matches, normally run by Generic_Instantiate
+                            // right after ITS OWN clone_ast call). This path is the OTHER
+                            // place a match gets resolved -- an ordinary, non-generic
+                            // function's `match T` -- and it was skipping that pass
+                            // entirely, leaving nameof(A)/nameof(B) permanently unresolved
+                            // ("never resolved to a constant") even though sizeof(A) on
+                            // the identical binding worked fine (AST_SIZEOF needs no such
+                            // fold-to-string step).
+                            Resolve_Reflect_Matches(body);
+                        }
                         reflect_bindings_free(&binds);
                         *node = *body;
                         Typecheck_Tree(node);
