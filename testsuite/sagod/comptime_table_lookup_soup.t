@@ -1,0 +1,2 @@
+//@ expect val 30
+enum Opt[T]{T Some None} struct Entry{u32 key Opt[u32] val} struct Table{Entry[3] entries} fn lookup(Table t,u32 k)Opt[u32]{for u32 i=0 to 3{if t.entries[i].key==k{return t.entries[i].val}} return .None} fn build()Table{return {.entries={{.key=1,.val=.Some{10}},{.key=2,.val=.Some{20}},{.key=3,.val=.None}}}} fn compute()u32{Table t=build() u32 acc=0 for u32 k=1 to 4{match lookup(t,k){.Some{v} {acc=acc+v} .None {}}} return acc} const u32 R=compute() fn main()i32{return (i32)R}

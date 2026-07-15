@@ -1,0 +1,5 @@
+//@ expect val 121
+struct Point{i32 x i32 y}
+struct Box[T]{ T val }
+impl Box[T] { fn nm() u8* { return nameof(T, 1) } }
+fn main() i32 { Box[Point] b u8* n = b.nm() return (i32)n[0] }

@@ -1,0 +1,26 @@
+# Deny by default -- this repo tracks only the compiler sources, the
+# Makefile, and the testsuite. Everything else in this working directory
+# (scratch .t files, one-off refactor scripts, backups, compiled binaries,
+# stdlib/docs/tools/examples not yet ready to publish) is intentionally
+# left untracked rather than deleted.
+*
+
+!.gitignore
+
+!*.c
+!*.h
+!Makefile
+!test.sh
+
+!testsuite/
+!testsuite/**
+
+# Scratch/debug one-off tools at root -- not part of the real compiler build
+# (see Makefile's SRC list for what actually is).
+aot_shim.c
+poc_main.c
+print_ast_enums.c
+print_ast_return.c
+print_jit.c
+runner.c
+test_offset.c
