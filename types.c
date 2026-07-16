@@ -139,7 +139,13 @@ bool Type_Equals(const Type* a, const Type* b) {
 uint64_t Type_AlignOf(const Type* t) {
     if (!t) return 8;
     switch (t->cls) {
-        case TYPE_PRIMITIVE: return (uint64_t)Type_Width(t);
+        case TYPE_PRIMITIVE:
+            // void/v has 0 bytes of STORAGE (Type_SizeOf), so it imposes no alignment
+            // requirement -- must NOT share Type_Width's register-context fallback (8),
+            // which exists only for register moves and was never meant to be read as
+            // an alignment (see Type_Width's own comment).
+            if (t->primitive == PRIM_VOID || t->primitive == PRIM_V) return 1;
+            return (uint64_t)Type_Width(t);
         case TYPE_POINTER:   return 8;
         case TYPE_ARRAY:     return Type_AlignOf(t->array.element);
         case TYPE_STRUCT: {
@@ -381,7 +387,10 @@ static Type* make_ptr(Type* base) {
 }
 
 static bool is_untyped_int_literal(ASTNode* n);
+static bool is_untyped_float_literal(ASTNode* n);
+static bool is_null_literal(ASTNode* n);
 static bool int_fits(int64_t v, const Type* dst);
+static bool check_assignable_ne(Type* dst, ASTNode* src, const char* where);
 
 // Usual-arithmetic-conversion (lite, for v1 integers):
 // result is the operand with the larger width; on a tie, unsigned wins.
@@ -492,6 +501,15 @@ static bool coerce_literal_to_target(ASTNode* node, Type* target) {
     return false;
 }
 
+// Forward declaration — resolve_brace_literal's scalar-leaf case needs this to
+// validate (not just rewrite) a literal landing in a primitive/pointer slot,
+// exactly like every other literal-placement site (decl, assignment, return,
+// call arg) already does. Without this, an aggregate literal's leaves skipped
+// straight to coerce_literal_to_target (the value-changing rewrite only) and
+// never hit the fit/kind checks that check_assignable owns, so e.g. a float
+// literal in an i32 field raw-stored its bits instead of erroring.
+static void check_assignable(Type* dst, ASTNode* src, const char* where);
+
 // Forward declaration — resolve_brace_literal needs this for struct-field /
 // array-element values that are themselves unresolved generic references
 // (a call to a generic function, or a bare name referring to one).
@@ -563,6 +581,20 @@ void resolve_brace_literal(ASTNode* node, Type* target) {
             }
             resolve_brace_literal(node->struct_lit.values[i], f->type);
             infer_generic(node->struct_lit.values[i], f->type);
+            // resolve_brace_literal only REWRITES a literal that fits (int->float);
+            // a literal that doesn't fit (float->int, out-of-range int, null->non-ptr)
+            // falls through unchanged and must still be validated here, exactly like
+            // every other literal-placement site (decl/assign/return/call arg) already
+            // is via check_assignable — otherwise it silently reaches codegen with its
+            // raw bits reinterpreted as the field's type instead of erroring. Gated to
+            // literal leaves only: this same resolver walk also runs over match/unpack
+            // DESTRUCTURE patterns (`{.x = a, .y = b}`), where a field "value" is really
+            // a bare bind identifier (possibly `_`) with no symbol yet — check_assignable
+            // would wrongly see that as an unresolved-type value and error "void vs value".
+            ASTNode* fv = node->struct_lit.values[i];
+            if (is_untyped_int_literal(fv) || is_untyped_float_literal(fv) || is_null_literal(fv)) {
+                check_assignable(f->type, fv, "struct field");
+            }
         }
         node->result_type = target;
         return;
@@ -664,6 +696,15 @@ void resolve_brace_literal(ASTNode* node, Type* target) {
         for (size_t i = 0; i < node->array_lit.count; i++) {
             resolve_brace_literal(node->array_lit.values[i], elem);
             infer_generic(node->array_lit.values[i], elem);
+            // See the struct-field case above: validate literals resolve_brace_literal
+            // left unrewritten (wrong-direction or out-of-range) instead of letting them
+            // silently reach codegen with mismatched bits. Gated to literal leaves only
+            // -- this walk also runs over match/unpack array-destructure patterns, whose
+            // elements may be bare bind identifiers (or `_`), not values.
+            ASTNode* ev = node->array_lit.values[i];
+            if (is_untyped_int_literal(ev) || is_untyped_float_literal(ev) || is_null_literal(ev)) {
+                check_assignable(elem, ev, "array element");
+            }
         }
         node->result_type = target;
         return;
@@ -896,6 +937,31 @@ Symbol* Method_Resolve(const Type* t, const char* mname, size_t mlen) {
     return s;
 }
 
+// Call-operator overload: `a(x)` where `a` is a struct (or pointer-to-struct)
+// VALUE, not a function, desugars to `a.__call(x)` if the struct defines that
+// method -- same sugar trick as s_op_methods below (a + b -> a.__add(b)), just
+// for AST_CALL instead of a binary node. Rewrites target_expr into the
+// AST_FIELD shape try_rewrite_method_call already knows how to mangle/
+// self-inject, then defers to it. Returns true if it rewrote the node (caller
+// must re-run its own type-inference/typecheck on `node` afterward); false
+// (no-op) if `tgt` isn't a struct or has no __call method, so the caller falls
+// through to its ordinary "calling non-function" error unchanged.
+static bool try_rewrite_call_operator(ASTNode* node, Type* tgt) {
+    // Method_Resolve (not Struct_FindField -- see the s_op_methods dispatch
+    // fix above for the full story) already unwraps pointer-to-struct and
+    // resolves through a generic base, so no manual unwrap is needed here.
+    if (!tgt || !Method_Resolve(tgt, "__call", 6)) return false;
+    ASTNode* field = (ASTNode*)calloc(1, sizeof(ASTNode));
+    field->type = AST_FIELD;
+    field->field.base = node->call.target_expr;
+    field->field.field_name = "__call";
+    field->field.field_name_len = 6;
+    field->line = node->line;
+    field->column = node->column;
+    node->call.target_expr = field;
+    return true;
+}
+
 void try_rewrite_method_call(ASTNode* node) {
     if (!node->call.target_expr || node->call.target_expr->type != AST_FIELD) return;
     ASTNode* field_node = node->call.target_expr;
@@ -955,9 +1021,222 @@ void try_rewrite_method_call(ASTNode* node) {
     }
 }
 
+static const char* s_op_methods[] = {
+    [AST_ADD] = "__add", [AST_SUB] = "__sub", [AST_MUL] = "__mul",
+    [AST_DIV] = "__div", [AST_MOD] = "__mod",
+    [AST_BIT_AND] = "__bitand", [AST_BIT_OR] = "__bitor", [AST_BIT_XOR] = "__bitxor",
+    [AST_SHL] = "__shl", [AST_SHR] = "__shr",
+    [AST_EQ] = "__eq", [AST_NEQ] = "__neq", [AST_LT] = "__lt",
+    [AST_GT] = "__gt", [AST_LTE] = "__lte", [AST_GTE] = "__gte",
+    [AST_ASSIGN] = "__assign",
+};
+
+// Separate (not folded into s_op_methods) because these are genuinely UNARY --
+// AST_LOGICAL_NOT/AST_BIT_NOT store their one operand in node->unary, not
+// node->binary.{left,right} -- and mixing node kinds with different payload
+// shapes into one indexed-by-node-type table would make the array's implicit
+// "covers every type from 0 up to here" sizing fragile. Unary minus (-x) is
+// NOT here: the parser desugars it to `0 - x` (AST_SUB) before it ever reaches
+// this table, so a struct-__neg hook would need a real AST_NEG node first --
+// out of scope for now (see docs discussion), unlike ! and ~ which already are
+// distinct unary AST nodes with nothing standing in the way.
+static const char* s_unary_op_methods[] = {
+    [AST_LOGICAL_NOT] = "__not", [AST_BIT_NOT] = "__bitnot",
+};
+
+// Shared core: rewrite `node` IN PLACE from a one- or two-operand shape
+// (`recv op arg` -- binary op; `recv[arg]` indexing; or `op recv` unary, with
+// arg == NULL) into `recv.mname(arg)` / `recv.mname()` (an AST_CALL over an
+// AST_FIELD), PROVIDED `recv`'s type defines method `mname`. Pure AST surgery
+// only -- does NOT call try_rewrite_method_call/infer_generic itself, so it's
+// safe to call from a context that hasn't type-inferred this node yet
+// (infer_generic's own bootstrap, below) as well as from Type_Infer (which
+// immediately re-enters itself after rewriting). One core so every operator
+// shape (arithmetic/comparison via s_op_methods, __index, unary via
+// s_unary_op_methods, and any future one) shares the exact same rewrite
+// instead of hand-copying it per operator.
+static bool rewrite_operand_to_method_call(ASTNode* node, ASTNode* recv, ASTNode* arg, const char* mname) {
+    // A bare type operand (`T == i32`, a generic type-param used in reflect
+    // comparison position) must NOT reach Type_Infer here: it now hard-errors
+    // on AST_TYPE_EXPR (see that case), and callers of this function run on
+    // every candidate node unconditionally, before Typecheck_Tree's OWN
+    // dedicated "cannot use a bare type as an operand" guard has had a chance
+    // to fire with its more specific message. Bail quietly and let that guard
+    // do its job, exactly as if this function didn't exist for this node.
+    if (recv->type == AST_TYPE_EXPR || (arg && arg->type == AST_TYPE_EXPR)) return false;
+    Type* rt = Type_Infer(recv);
+    if (!rt) return false;
+    Symbol* msym = Method_Resolve(rt, mname, strlen(mname));
+    if (!msym) return false;
+
+    // AST_ASSIGN is the one operator with a competing, ALSO-valid non-overload
+    // meaning: ordinary same-type struct assignment (`b = a`). Every other
+    // operator this core handles has no such competitor (Method_Resolve alone
+    // is a correct-enough check there), but for `=` specifically, a struct
+    // that declares __assign(i32) must NOT hijack `b = a` (a Vector assigned
+    // another Vector) just because the method NAME exists -- it has to also
+    // check the RHS actually fits __assign's declared parameter, via
+    // check_assignable_ne (the SAME real rule check_assignable uses, not a
+    // second copy of it). This has to live HERE, in the shared core, not in
+    // just one caller (e.g. only Typecheck_Tree's AST_ASSIGN case) -- Type_Infer
+    // and infer_generic both call this function too, unconditionally, on every
+    // node they visit, and a gate bolted onto only one of the three callers
+    // left the other two free to rewrite (and corrupt) an ordinary assignment
+    // whenever THEY happened to visit the node first.
+    if (node->type == AST_ASSIGN) {
+        if (!msym->type || msym->type->cls != TYPE_FUNCTION ||
+            msym->type->function.param_count < 2) {
+            return false;
+        }
+        Type* param_t = msym->type->function.param_types[1]; // [0] is injected self
+        // For a generic struct (Box[T]), Method_Resolve finds the TEMPLATE's
+        // __assign, whose declared param is still the abstract T, not the
+        // receiver's concrete i32 -- check_assignable_ne(T, 42, ...) would
+        // then always fail (T isn't structurally equal to anything a real
+        // value could be), rejecting a legitimate `b = 42` on a Box[i32].
+        // Substitute using the receiver's own type_args, the same generic_base
+        // + type_args pair try_rewrite_method_call uses (self_type_args) for
+        // the identical purpose one level up (the CALL's return type instead
+        // of this ASSIGN's argument type).
+        if (rt->cls == TYPE_STRUCT) {
+            StructDef* rt_sd = Struct_Find(rt->struct_name);
+            if (rt_sd && rt_sd->generic_base && rt_sd->type_arg_count > 0) {
+                param_t = Type_Substitute(param_t, rt_sd->generic_base->type_params,
+                                          rt_sd->type_args, rt_sd->type_arg_count);
+            }
+        }
+        if (!check_assignable_ne(param_t, arg, "__assign argument")) return false;
+    }
+
+    ASTNode* target = (ASTNode*)calloc(1, sizeof(ASTNode));
+    target->type = AST_FIELD;
+    target->field.base = recv;
+    target->field.field_name = mname;
+    target->field.field_name_len = strlen(mname);
+    target->line = node->line;
+    target->column = node->column;
+
+    node->type = AST_CALL;
+    node->call.target_expr = target;
+    if (arg) {
+        ASTNode** args = (ASTNode**)calloc(1, sizeof(ASTNode*));
+        args[0] = arg;
+        node->call.args = args;
+        node->call.arg_count = 1;
+    } else {
+        node->call.args = NULL;
+        node->call.arg_count = 0;
+    }
+    return true;
+}
+
+// s_op_methods case (a+b -> a.__add(b), etc.): needed at BOTH Type_Infer
+// (lazy) and infer_generic (top-down, before Type_Infer ever runs on this
+// node) -- see infer_generic's call site for why a generic struct's
+// overloaded operator (Box[T]'s __add) needs the earlier hook too, not just
+// the lazy one Type_Infer would otherwise rely on alone.
+static bool try_rewrite_operator_method(ASTNode* node) {
+    if (node->type >= (ASTNodeType)(sizeof(s_op_methods)/sizeof(s_op_methods[0]))) return false;
+    const char* mname = s_op_methods[node->type];
+    if (!mname) return false;
+    return rewrite_operand_to_method_call(node, node->binary.left, node->binary.right, mname);
+}
+
+// v[i] -> v.__index(i), same shared core, same two call sites (Type_Infer +
+// infer_generic) and same reason: infer_generic must see this already
+// AST_CALL-shaped BEFORE Type_Infer's lazy rewrite would otherwise fire, or a
+// generic struct's __index return type never gets its self_type_args
+// substituted (identical failure mode s_op_methods had for Box[T]'s __add).
+static bool try_rewrite_index_method(ASTNode* node) {
+    if (node->type != AST_INDEX) return false;
+    return rewrite_operand_to_method_call(node, node->index.base, node->index.index, "__index");
+}
+
+// If __index returns T* (a pointer INTO the container, e.g. &self.data[i]),
+// v[i] must mean "the T at that address," not "the address itself" -- same
+// read/write duality a raw array/pointer index already has (specs.md: "array
+// indexing auto-derefs through a pointer"). That existing auto-deref is
+// written specifically for AST_INDEX/AST_FIELD whose BASE is a pointer; it
+// has no idea an AST_CALL's return value might also want the same treatment,
+// because nothing needed that before __index existed. Rather than teach
+// AST_CALL a bespoke special case, reuse the ACTUAL general mechanism this
+// language already has for "dereference a pointer value": AST_DEREF, whose
+// own Type_Infer case already handles any pointer operand uniformly, and
+// whose compile_lvalue case already treats the operand's value as the write
+// address -- both for free, no new logic in either.
+//
+// MUST run strictly AFTER try_rewrite_index_method's own follow-up
+// (try_rewrite_method_call + infer_generic, done by whichever caller invoked
+// the rewrite) -- those two expect an AST_CALL shape (node->call.*) and read
+// garbage/wrong union fields if `node` has already become AST_DEREF by the
+// time they run. So this is a SEPARATE step, applied once after the call is
+// fully resolved, not folded into try_rewrite_index_method itself.
+static void wrap_index_result_deref(ASTNode* node) {
+    if (node->type != AST_CALL || node->call.index_deref_wrapped) return;
+    // try_rewrite_method_call (already run by the caller before this) resolves
+    // target_expr's AST_FIELD to a mangled direct-call symbol and clears
+    // target_expr to NULL (see its own doc comment) -- so by the time this
+    // runs, the method name can only be read off node->call.sym, not
+    // target_expr->field.field_name anymore.
+    Symbol* sym = node->call.sym;
+    // Mangled name is "StructName_" + method name, e.g. "Vector_[i32]___index"
+    // for a generic instantiation -- match the SUFFIX, not an exact/prefix
+    // compare, since the struct-name prefix varies per instantiation.
+    if (!sym || sym->name_len < 7 ||
+        strncmp(sym->name + sym->name_len - 7, "__index", 7) != 0) {
+        return;
+    }
+    Type* rt = Type_Infer(node);
+    if (!rt || rt->cls != TYPE_POINTER) return;
+    // `node` is a live pointer other tree parents already hold -- move its
+    // contents into a fresh node and turn `node` itself into the AST_DEREF
+    // wrapper, so every existing reference to `node` sees the deref.
+    ASTNode* call_copy = (ASTNode*)malloc(sizeof(ASTNode));
+    *call_copy = *node;
+    // A later walk (e.g. the AST_DEREF wrapper's own Typecheck_Tree(node->unary)
+    // recursing into call_copy) will re-enter infer_generic/Type_Infer on THIS
+    // node -- without this flag, that visit's mangled-name check ("does this
+    // resolve to an __index method?") still matches, and it would get wrapped
+    // in a SECOND AST_DEREF (deref of a deref of the actual T*), producing
+    // "cannot dereference non-pointer type 'T'" once the first deref already
+    // reduced it to a plain T.
+    call_copy->call.index_deref_wrapped = true;
+    node->type = AST_DEREF;
+    node->result_type = NULL; // stale T* cache lives on call_copy now; re-infer for the deref
+    node->unary = call_copy;
+}
+
+// !v -> v.__not(), ~v -> v.__bitnot(): same shared core (with arg == NULL, a
+// zero-arg method call), same two call sites and reason as the two above.
+// Unary minus (-x) is NOT handled here -- see s_unary_op_methods' own comment.
+static bool try_rewrite_unary_operator_method(ASTNode* node) {
+    if (node->type >= (ASTNodeType)(sizeof(s_unary_op_methods)/sizeof(s_unary_op_methods[0]))) return false;
+    const char* mname = s_unary_op_methods[node->type];
+    if (!mname) return false;
+    return rewrite_operand_to_method_call(node, node->unary, NULL, mname);
+}
+
 Type* Type_Infer(ASTNode* node) {
     if (!node) return NULL;
     if (node->result_type) return node->result_type;
+
+    // Struct_FindField searches DATA fields (sd->fields[]) -- an impl method is
+    // never in that list (it's resolved by mangled symbol name), which used to
+    // make dispatch permanently false for every struct: a+b (or a[i]) on a
+    // struct silently fell through to built-in lanewise/array handling instead
+    // of ever reaching __add/__index. rewrite_operand_to_method_call uses
+    // Method_Resolve (the real "does this type have this method" query)
+    // instead. The two follow-up calls (try_rewrite_method_call to set .sym/
+    // self_type_args, infer_generic to substitute them into the return type)
+    // are what a NON-generic struct doesn't need but a generic one (Box[T]'s
+    // __add/__index) does -- see rewrite_operand_to_method_call's own comment.
+    if (try_rewrite_operator_method(node) || try_rewrite_index_method(node) ||
+        try_rewrite_unary_operator_method(node)) {
+        try_rewrite_method_call(node);
+        infer_generic(node, NULL);
+        wrap_index_result_deref(node);
+        return Type_Infer(node);
+    }
 
     Type* t = NULL;
     switch (node->type) {
@@ -1035,6 +1314,10 @@ Type* Type_Infer(ASTNode* node) {
                 if (tgt && tgt->cls == TYPE_FUNCTION) t = tgt->function.return_type;
                 else if (tgt && tgt->cls == TYPE_POINTER && tgt->pointer_base && tgt->pointer_base->cls == TYPE_FUNCTION)
                     t = tgt->pointer_base->function.return_type;
+                else if (try_rewrite_call_operator(node, tgt)) {
+                    try_rewrite_method_call(node);
+                    return Type_Infer(node);
+                }
                 else { Error_AtNode(node, "calling non-function", NULL); }
             } else {
                 Type* tgt = node->call.sym ? node->call.sym->type : NULL;
@@ -1196,6 +1479,28 @@ Type* Type_Infer(ASTNode* node) {
             }
             break;
         }
+
+        // A bare type used in value position (`void`, `i32`, a struct/enum name,
+        // a generic type-param) parses to AST_TYPE_EXPR. It has no case above
+        // because it has NO VALUE -- it can't be loaded, stored, added, compared,
+        // or put in a field/element/argument. Every LEGITIMATE consumer (T == i32
+        // and match T { ... } in Typecheck_Tree/parser.c, generic substitution in
+        // clone_ast, const-generic folding in ConstEval) checks node->type ==
+        // AST_TYPE_EXPR directly and branches away BEFORE ever calling Type_Infer
+        // on it -- none of them depend on this function returning NULL for it.
+        // Every OTHER call site, though, treats Type_Infer's NULL as "no type,
+        // handle as void/absent" -- which is wrong here: this NULL doesn't mean
+        // absent, it means "this node should never have reached here as a value."
+        // That conflation is what let a bare type slip through as a value again
+        // and again (declaration init, struct field, array element, unary
+        // operand, ... — the same root cause documented repeatedly in
+        // KNOWN_BUGS.md), because each caller had to remember to guard for
+        // AST_TYPE_EXPR itself instead of trusting Type_Infer's result. Erroring
+        // here, once, at the single function every value-producing path already
+        // calls, closes the whole class instead of chasing one call site at a time.
+        case AST_TYPE_EXPR:
+            Error_AtNode(node, "a type cannot be used as a value here", NULL);
+            return NULL; // unreached (Error_AtNode exits), quiets -Wreturn-type
 
         default:
             t = NULL;
@@ -1439,11 +1744,30 @@ static void pack_expand_call_args(ASTNode* node) {
 void infer_generic(ASTNode* node, Type* target) {
     if (!node) return;
 
+    // An operator over a struct with a matching dunder method (a+b where
+    // Box[T] defines __add, or a[i] where it defines __index) hasn't been
+    // rewritten into AST_CALL yet the FIRST time a top-down caller (e.g.
+    // Typecheck_Tree's AST_DECLARATION) reaches here -- that rewrite normally
+    // happens lazily inside Type_Infer, which hasn't run on this node yet. Do
+    // it now so the AST_CALL branch below (and its self_type_args
+    // substitution) actually sees an AST_CALL this call, instead of only on
+    // some LATER visit after Type_Infer already fired.
+    try_rewrite_operator_method(node) || try_rewrite_index_method(node) ||
+        try_rewrite_unary_operator_method(node);
+
     if (node->type == AST_CALL) {
         pack_expand_call_args(node);
         if (node->call.target_expr && node->call.target_expr->type == AST_FIELD && !node->call.sym) {
             try_rewrite_method_call(node);
         }
+        // Must run BEFORE the early returns below (non-generic callee, no
+        // explicit generic decl, ...) -- this is the only place a v[i] whose
+        // rewrite happened HERE (not lazily inside Type_Infer) gets its
+        // pointer-returning __index wrapped in the auto-deref every other
+        // __index call site already gets. A non-generic Fixed.__index bails
+        // at the very next line (`!generic_decl`), so tucking this after
+        // those checks would silently skip the non-generic case entirely.
+        wrap_index_result_deref(node);
         if (node->call.type_arg_count > 0) return; // already explicit
         if (!node->call.sym || !node->call.sym->generic_decl) return; // not generic
         if (!node->call.sym->type || node->call.sym->type->cls != TYPE_FUNCTION) return;
@@ -1622,7 +1946,21 @@ Type* Type_MakePrim(int primitive_kind) { return make_prim((PrimitiveKind)primit
 //   tier 2 -- a DIRECT untyped literal: coerces into dst if the value fits. int lit ->
 //             any int/float/pointer; float lit -> any float; null -> any pointer.
 // `where` is a short label for the error ("declaration", "assignment", ...).
-static void check_assignable(Type* dst, ASTNode* src, const char* where) {
+// Non-erroring core: same tiers/rules check_assignable has always had, but
+// returns false on mismatch instead of calling Error_AtNode/exiting. Needed so
+// a caller that ISN'T sure this is the final, real assignment (e.g. deciding
+// whether `v = 5` means "call __assign" vs. plain assignment) can ask "would
+// this fit?" without crashing the compiler on a "no" answer. check_assignable
+// itself (below) is the thin, fatal wrapper every existing call site keeps
+// using unchanged -- no dual logic, one real implementation.
+static bool check_assignable_ne(Type* dst, ASTNode* src, const char* where) {
+    // Type_Infer itself now hard-errors on AST_TYPE_EXPR (a bare type used in
+    // value position -- see its case there for the full explanation), so this
+    // is redundant as a SAFETY net; kept only because it fires first and gives
+    // a message with `where` ("...in declaration of v") instead of the generic
+    // one Type_Infer would produce a few lines down.
+    if (src && src->type == AST_TYPE_EXPR) return false;
+
     Type* st = src ? Type_Infer(src) : NULL;
     if (!dst || !st) {
         // Same two-spellings-of-void normalization as Type_Equals' fn_ret_equal /
@@ -1635,12 +1973,7 @@ static void check_assignable(Type* dst, ASTNode* src, const char* where) {
         // hard-erred as "void vs value" the moment `void` was written explicitly
         // -- the one case an explicit `void` return type should behave IDENTICALLY
         // to an omitted one, since REFERENCE.md documents them as interchangeable.
-        if (!(Type_IsVoidLike(dst) && Type_IsVoidLike(st))) {
-            char msg[256];
-            snprintf(msg, sizeof(msg), "type mismatch in %s: void vs value", where);
-            Error_AtNode(src, msg, NULL);
-        }
-        return;
+        return Type_IsVoidLike(dst) && Type_IsVoidLike(st);
     }
 
     // Aggregates: brace literals resolve to dst before reaching here, so Type_Infer
@@ -1649,33 +1982,12 @@ static void check_assignable(Type* dst, ASTNode* src, const char* where) {
     // catches mismatches like Option[u32] = Option[bool].
 
     // tier 2: direct untyped literals adapt to dst if they fit.
-    if (is_null_literal(src)) {
-        if (dst->cls != TYPE_POINTER) {
-            char msg[128];
-            snprintf(msg, sizeof(msg), "null in %s requires a pointer type", where);
-            Error_AtNode(src, msg, NULL);
-        }
-        return;
-    }
+    if (is_null_literal(src)) return dst->cls == TYPE_POINTER;
     if (is_untyped_int_literal(src)) {
-        if (coerce_literal_to_target(src, dst)) return; // int literal -> float slot
-        if (dst->cls == TYPE_PRIMITIVE) {
-            if (!int_fits((int64_t)src->int_value, dst)) {
-                char msg[192];
-                snprintf(msg, sizeof(msg),
-                         "integer literal in %s does not fit the destination type (use a cast to truncate)",
-                         where);
-                Error_AtNode(src, msg, NULL);
-            }
-            return;
-        }
+        if (coerce_literal_to_target(src, dst)) return true; // int literal -> float slot
+        if (dst->cls == TYPE_PRIMITIVE) return int_fits((int64_t)src->int_value, dst);
     }
-    if (is_untyped_float_literal(src)) {
-        if (Type_IsFloat(dst)) return;
-        char msg[160];
-        snprintf(msg, sizeof(msg), "float literal in %s requires a float destination (use a cast)", where);
-        Error_AtNode(src, msg, NULL);
-    }
+    if (is_untyped_float_literal(src)) return Type_IsFloat(dst);
 
     // tier 1: typed value -- must match exactly, else a cast is required.
     // For struct/array assignments: structural compatibility is verified during code gen.
@@ -1689,20 +2001,62 @@ static void check_assignable(Type* dst, ASTNode* src, const char* where) {
     // nominal check below, since THAT position is exactly where identity is
     // supposed to matter.
     Type* cmp_st = (dst->cls != TYPE_FN_LITERAL) ? fn_lit_shape(st) : st;
-    if (!Type_Equals(dst, cmp_st)) {
-        if (dst->cls == TYPE_PRIMITIVE && cmp_st->cls == TYPE_PRIMITIVE) {
-            // User requested to relax the strict assignability check.
-            // Allow implicit primitive coercions (like C).
-            return;
-        }
-        char vt_buf[128], it_buf[128], msg[320];
-        Type_ToString(dst, vt_buf, sizeof(vt_buf));
-        Type_ToString(cmp_st, it_buf, sizeof(it_buf));
-        snprintf(msg, sizeof(msg),
-                 "type mismatch in %s: cannot assign %s to %s without an explicit cast",
-                 where, it_buf, vt_buf);
+    if (Type_Equals(dst, cmp_st)) return true;
+    // User requested to relax the strict assignability check.
+    // Allow implicit primitive coercions (like C).
+    return dst->cls == TYPE_PRIMITIVE && cmp_st->cls == TYPE_PRIMITIVE;
+}
+
+// Thin fatal wrapper every existing call site keeps using unchanged: run the
+// one real check (check_assignable_ne), and if it says no, error out exactly
+// the way this function always has. `dst`/`src` are re-inspected here ONLY to
+// pick which of the existing message templates to print -- no assignability
+// RULE is duplicated (check_assignable_ne already decided pass/fail; this is
+// pure message selection on a known-failing case).
+static void check_assignable(Type* dst, ASTNode* src, const char* where) {
+    if (check_assignable_ne(dst, src, where)) return;
+
+    if (src && src->type == AST_TYPE_EXPR) {
+        char msg[160];
+        snprintf(msg, sizeof(msg), "a type cannot be used as a value in %s", where);
         Error_AtNode(src, msg, NULL);
     }
+    Type* st = src ? Type_Infer(src) : NULL;
+    if (!dst || !st) {
+        char msg[256];
+        snprintf(msg, sizeof(msg), "type mismatch in %s: void vs value", where);
+        Error_AtNode(src, msg, NULL);
+    }
+    if (is_null_literal(src)) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "null in %s requires a pointer type", where);
+        Error_AtNode(src, msg, NULL);
+    }
+    // Same guard check_assignable_ne uses: this message only applies when dst
+    // is a primitive slot the literal could have fit (and didn't) -- a struct
+    // dst (`P p = 5`) falls through to the generic "cannot assign" message
+    // below instead, exactly like the original tier-2 code did.
+    if (is_untyped_int_literal(src) && dst->cls == TYPE_PRIMITIVE &&
+        !coerce_literal_to_target(src, dst)) {
+        char msg[192];
+        snprintf(msg, sizeof(msg),
+                 "integer literal in %s does not fit the destination type (use a cast to truncate)",
+                 where);
+        Error_AtNode(src, msg, NULL);
+    }
+    if (is_untyped_float_literal(src)) {
+        char msg[160];
+        snprintf(msg, sizeof(msg), "float literal in %s requires a float destination (use a cast)", where);
+        Error_AtNode(src, msg, NULL);
+    }
+    Type* cmp_st = (dst->cls != TYPE_FN_LITERAL) ? fn_lit_shape(st) : st;
+    char vt_buf[128], it_buf[128], msg[320];
+    Type_ToString(dst, vt_buf, sizeof(vt_buf));
+    Type_ToString(cmp_st, it_buf, sizeof(it_buf));
+    snprintf(msg, sizeof(msg),
+             "type mismatch in %s: cannot assign %s to %s without an explicit cast",
+             where, it_buf, vt_buf);
+    Error_AtNode(src, msg, NULL);
 }
 
 // Eager typecheck/annotation pass. Walks statements and sub-expressions so every
@@ -1954,6 +2308,15 @@ void Typecheck_Tree(ASTNode* node) {
                         call_tgt = call_tgt->pointer_base;
                     }
                     if (!call_tgt || call_tgt->cls != TYPE_FUNCTION) {
+                        // Call-operator overload: same rewrite as Type_Infer's
+                        // AST_CALL case (see try_rewrite_call_operator) -- this is
+                        // a SEPARATE typecheck pass over the same AST_CALL shape,
+                        // so it needs the identical fallback before erroring.
+                        if (try_rewrite_call_operator(node, call_tgt)) {
+                            try_rewrite_method_call(node);
+                            Typecheck_Tree(node);
+                            return;
+                        }
                         Error_AtNode(node, "calling non-function", NULL);
                     }
                 }
@@ -2076,6 +2439,21 @@ void Typecheck_Tree(ASTNode* node) {
             return;
 
         case AST_ASSIGN:
+            // Assignment-operator overload (v = 5 where Vector defines
+            // __assign(i32)) MUST be tried before check_assignable below --
+            // unlike the other operators, the entire point of __assign is to
+            // accept an RHS that would NOT otherwise fit the lvalue's type
+            // (that's what "v = 5" on a struct means), so if check_assignable
+            // ran first it would reject the RHS as a mismatch before __assign
+            // ever got a chance to run. try_rewrite_operator_method (the SAME
+            // shared core Type_Infer/infer_generic also call -- see its own
+            // AST_ASSIGN branch) already decides whether __assign genuinely
+            // applies here (vs. falling back to plain same-type assignment,
+            // like `b = a`), so this is just the ordering fix, no separate gate.
+            if (try_rewrite_operator_method(node)) {
+                Typecheck_Tree(node);
+                return;
+            }
             Typecheck_Tree(node->binary.left);
             // Generic call or bare generic function name on the RHS, resolved
             // against the lvalue's type, e.g. `f = identity` where f is fn(u32) u32.
@@ -2325,7 +2703,20 @@ void Typecheck_Tree(ASTNode* node) {
                 Type* lt = Type_Infer(node->binary.left);
                 Type* rt = Type_Infer(node->binary.right);
 
-                if (Type_IsAggregate(lt) || Type_IsAggregate(rt)) {
+                // A user-defined operator method (__add, __eq, ...) on the LEFT
+                // operand's struct type takes priority over built-in lanewise
+                // aggregate arithmetic below -- defer entirely to Type_Infer's
+                // own s_op_methods rewrite (a+b -> a.__add(b)) at the bottom of
+                // this function instead of treating the struct as a lanewise
+                // operand here. Without this, a struct with __add still got
+                // silently lanewise-added: this check runs BEFORE Type_Infer(node)
+                // is ever called on the AST_ADD node itself (only on its operands
+                // above), so the rewrite never had a chance to fire first.
+                bool has_op_method = node->type < (ASTNodeType)(sizeof(s_op_methods)/sizeof(s_op_methods[0]))
+                    && s_op_methods[node->type] && lt
+                    && Method_Resolve(lt, s_op_methods[node->type], strlen(s_op_methods[node->type]));
+
+                if (!has_op_method && (Type_IsAggregate(lt) || Type_IsAggregate(rt))) {
                     if (!lt || !rt || !Type_Equals(lt, rt)) {
                         Error_AtNode(node,
                             "binary operator on mismatched operand types "

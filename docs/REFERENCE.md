@@ -598,8 +598,27 @@ pass that file as an ordinary input alongside its consumers.
 =  +=  -=  *=  /=  %=      assignment / compound assignment
 &=  |=  ^=  <<=  >>=       bitwise compound assignment
 ```
-No operator overloading. `/` truncates toward zero, `%` takes dividend's
-sign. Unsigned narrow overflow wraps (defined behavior).
+`/` truncates toward zero, `%` takes dividend's sign. Unsigned narrow
+overflow wraps (defined behavior).
+
+**Operator overloading** (magic method names on a struct's `impl` block,
+dispatched structurally — no interface declared):
+
+```
++ - * / % & | ^ << >> == != < > <= >=   -> __add __sub __mul __div __mod
+                                            __bitand __bitor __bitxor __shl __shr
+                                            __eq __neq __lt __gt __lte __gte
+!a  ~a                                  -> __not()  __bitnot()
+a(x, ...)                               -> __call(x, ...)
+a[i]                                    -> __index(i)   (T* return -> also writable, see below)
+a = b                                   -> __assign(b)  (only when b doesn't already fit a's own type)
+```
+
+`__index(i) T*` (pointer INTO the container, e.g. `&self.data[i]`, not `T`)
+makes `v[i]` both readable and writable — see `std/vector.t`. Known gap:
+`v[i]` as a direct argument to a variadic extern call (`printf`) is unreliable;
+assign to a local first. Not implemented: unary minus overload (desugars to
+`0 - x` before dispatch), `__cast`, destructor hook for `delete`.
 
 ---
 

@@ -584,6 +584,23 @@ static bool ce_lvalue_addr(ASTNode* node, uint32_t* out_addr, Type** out_type) {
         *out_type = Type_Infer(node);
         return true;
     }
+    if (node->type == AST_DEREF) {
+        // *p: a comptime pointer's VALUE already IS an arena offset (same
+        // representation as every other value here — see the AST_IDENT case
+        // above and ce_eval_assign's scalar-store comment), so the pointee's
+        // address is just whatever the pointer operand evaluates to. This is
+        // the same "evaluate the base, then address relative to it" shape as
+        // the AST_INDEX/AST_FIELD cases above, just with no offset to add —
+        // letting *p, *p.field, *p[i], and p.field[i]->... all compose through
+        // ordinary recursion (each level's `base` comes from ConstEval-ing the
+        // inner expression) instead of needing a dedicated chain-walker.
+        int64_t addr; if (!ConstEval(node->unary, &addr)) return false;
+        Type* bt = Type_Infer(node->unary);
+        if (!bt || bt->cls != TYPE_POINTER || !bt->pointer_base) return false;
+        *out_addr = (uint32_t)addr;
+        *out_type = bt->pointer_base;
+        return true;
+    }
     return false;
 }
 
@@ -812,12 +829,15 @@ static bool ce_eval_call(ASTNode* node, int64_t* out) {
 static bool ce_eval_assign(ASTNode* node, int64_t* out) {
             // Mutate an existing comptime local: `x = expr`. The value also
             // becomes the expression's result, matching runtime semantics.
-            // Aggregate-element/field assignment: `a[i] = v` or `s.f = v`. Compute
-            // the target's arena address (offset), then store. Still closed-term —
-            // we're writing into our own comptime arena, no external memory.
+            // Aggregate-element/field/deref assignment: `a[i] = v`, `s.f = v`, or
+            // `*p = v`. Compute the target's arena address (offset), then store.
+            // Still closed-term — we're writing into our own comptime arena, no
+            // external memory (a comptime pointer's value already IS an arena
+            // offset, so *p never touches anything outside this evaluator's own
+            // heap, escaping or not — see ce_lvalue_addr's AST_DEREF case).
             ASTNode* lhs = node->binary.left;
-            if (lhs && (lhs->type == AST_INDEX || lhs->type == AST_FIELD)) {
-                // `a[i] = v` / `s.f = v`: address via the shared lvalue-addr helper,
+            if (lhs && (lhs->type == AST_INDEX || lhs->type == AST_FIELD || lhs->type == AST_DEREF)) {
+                // `a[i] = v` / `s.f = v` / `*p = v`: address via the shared lvalue-addr helper,
                 // then store. (Same machinery as `&lvalue`.) Previously scalar-only
                 // (elemty->cls != TYPE_PRIMITIVE bailed the whole fold); generalized
                 // to pointer and aggregate targets too, since neither the address
@@ -834,12 +854,10 @@ static bool ce_eval_assign(ASTNode* node, int64_t* out) {
                 // resolve first; this is that same requirement at one more site.
                 // Type_Infer on the LHS is a pure type query — no evaluation, so
                 // it doesn't disturb the RHS-before-LHS-address ordering below.
-                if (lhs->type == AST_FIELD || lhs->type == AST_INDEX) {
-                    if (node->binary.right->type == AST_STRUCT_LITERAL ||
-                        node->binary.right->type == AST_ARRAY_LITERAL) {
-                        Type* lhs_t = Type_Infer(lhs);
-                        if (lhs_t) resolve_brace_literal(node->binary.right, lhs_t);
-                    }
+                if (node->binary.right->type == AST_STRUCT_LITERAL ||
+                    node->binary.right->type == AST_ARRAY_LITERAL) {
+                    Type* lhs_t = Type_Infer(lhs);
+                    if (lhs_t) resolve_brace_literal(node->binary.right, lhs_t);
                 }
                 // Evaluation order: RHS first, then the LHS address — matches the
                 // runtime backend's AST_ASSIGN codegen (compile_node_ctx on the RHS

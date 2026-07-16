@@ -530,6 +530,11 @@ typedef struct ASTNode {
             struct Type** self_type_args;
             size_t self_type_arg_count;
             bool pack_rewritten; // prototype: trailing args already bundled into one anon-struct arg
+            bool index_deref_wrapped; // v[i] -> v.__index(i) already wrapped in its AST_DEREF
+                                      // (see wrap_index_result_deref, types.c) -- set on the MOVED
+                                      // call_copy so a later, redundant visit (the wrapper's own
+                                      // Typecheck_Tree(node->unary) walk re-entering infer_generic
+                                      // on this same call_copy) doesn't wrap it a second time.
         } call;
         struct {
             struct ASTNode* base;      // the struct expression (or pointer, auto-derefed once)

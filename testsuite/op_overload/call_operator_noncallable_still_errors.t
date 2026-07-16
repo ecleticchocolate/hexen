@@ -1,0 +1,2 @@
+//@ expect err calling non-function
+fn main() i32 { i32 x = 5  return x(1) }
