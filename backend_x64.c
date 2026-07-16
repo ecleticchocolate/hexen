@@ -1370,7 +1370,7 @@ static void compile_node_ctx(JITBuffer* buf, ASTNode* node, LoopContext* loop) {
         // where the callee's positive [rbp+16], [rbp+24], ... reads expect it.
         for (size_t i = 0; i < node->call.arg_count; i++) {
             compile_node_ctx(buf, node->call.args[i], loop);
-            
+
             if (call_tgt && call_tgt->cls == TYPE_FUNCTION && i < call_tgt->function.param_count) {
                 Type* param_t = call_tgt->function.param_types[i];
                 if (param_t && param_t->cls == TYPE_PRIMITIVE && param_t->primitive == PRIM_F32) {
