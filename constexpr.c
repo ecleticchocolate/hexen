@@ -623,22 +623,7 @@ static bool ce_agg_do_lane(void* ctxp, ASTNodeType op, uint64_t offset, int widt
     uint64_t lv = 0, rv = 0;
     memcpy(&lv, s_ce_mem + c->base_l + offset, width);
     memcpy(&rv, s_ce_mem + c->base_r + offset, width);
-    if (is_eq) {
-        c->eq_diff |= (lv ^ rv);
-        return true;
-    }
-    uint64_t rv_out;
-    switch (op) {
-        case AST_ADD:     rv_out = lv + rv; break;
-        case AST_SUB:     rv_out = lv - rv; break;
-        case AST_MUL:     rv_out = lv * rv; break;
-        case AST_BIT_AND: rv_out = lv & rv; break;
-        case AST_BIT_OR:  rv_out = lv | rv; break;
-        case AST_BIT_XOR: rv_out = lv ^ rv; break;
-        default: return false; // agg_binop_apply already gated the op set; unreachable
-    }
-    if (c->dst + offset + width > CE_MEM_SIZE) return false;
-    memcpy(s_ce_mem + c->dst + offset, &rv_out, width);
+    c->eq_diff |= (lv ^ rv);
     return true;
 }
 
@@ -1254,7 +1239,7 @@ static bool ConstEval_inner(ASTNode* node, int64_t* out) {
     // call target's already-inferred type first -- see that function's own
     // comment.)
     if (try_rewrite_operator_method(node) || try_rewrite_index_method(node) ||
-        try_rewrite_unary_operator_method(node)) {
+        try_rewrite_unary_operator_method(node) || try_rewrite_cast_operator(node)) {
         return ConstEval(node, out);
     }
 

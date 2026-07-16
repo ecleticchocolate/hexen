@@ -1,4 +1,4 @@
-//@ expect err not defined on array operands
+//@ expect err aggregate operands
 fn main() u32 {
     u32[2] a = {10, 20}
     u32[2] b = {2, 4}

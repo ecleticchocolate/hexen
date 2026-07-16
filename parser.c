@@ -4188,16 +4188,26 @@ static ASTNode* parse_top_level(void) {
             node->func_decl.type_param_count = tparam_count;
             if (tparam_count > 0) func_sym->generic_decl = node;
 
-            // Restore to impl-block scope (struct params still active for next method)
-            s_type_params      = impl_sd ? impl_sd->type_params      : prev_impl_tparams;
-            s_param_kinds      = impl_sd ? impl_sd->param_kinds      : prev_impl_pkinds;
-            s_type_param_count = impl_sd ? impl_sd->type_param_count : prev_impl_tparam_count;
-
-            // Parse body
+            // Parse body -- MUST still see the method's own [T]/[U] extension
+            // (tparams/pkinds/tparam_count), not yet the plain impl-block/struct
+            // scope: a cast to the method's own type param inside its body
+            // (`fn get[T]() T { return (T)self.v }`) needs T to still resolve
+            // as a type here, the same way it already does in the signature
+            // just parsed. Restoring to impl-block scope BEFORE the body used
+            // to silently drop the method-level extension one statement too
+            // early, so T read as an undeclared IDENTIFIER instead of a type
+            // the moment it appeared inside a cast/expression in the body
+            // (the signature's own T references worked fine, since those parse
+            // before this restore ever ran) -- confirmed by a real repro.
             if (s_curr.type != TOK_LBRACE) parse_error("Expected '{' for impl method body");
             ASTNode* body = parse_braced_block(false, false);
             node->func_decl.body = body;
             s_symtable = prev_table;
+
+            // NOW restore to impl-block scope (struct params still active for next method).
+            s_type_params      = impl_sd ? impl_sd->type_params      : prev_impl_tparams;
+            s_param_kinds      = impl_sd ? impl_sd->param_kinds      : prev_impl_pkinds;
+            s_type_param_count = impl_sd ? impl_sd->type_param_count : prev_impl_tparam_count;
 
             if (block->block.count >= block->block.capacity) {
                 block->block.capacity *= 2;

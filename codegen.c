@@ -159,22 +159,7 @@ bool agg_binop_apply(ASTNodeType op, Type* lt, Type* rt, const AggBinopSink* sin
     if (!lt || !rt || !Type_Equals(lt, rt)) return false;
 
     bool is_eq = (op == AST_EQ || op == AST_NEQ);
-    if (!is_eq) {
-        switch (op) {
-            case AST_ADD: case AST_SUB: case AST_MUL:
-            case AST_BIT_AND: case AST_BIT_OR: case AST_BIT_XOR:
-                break;
-            default:
-                return false; // not in the aggregate-legal set
-        }
-    }
-
-    // Enums are only ever legal lanewise for ==/!=; reject arithmetic/bitwise
-    // ops up front so Agg_Lanes never has to know which op is in flight.
-    if (!is_eq) {
-        StructDef* lsd = (lt->cls == TYPE_STRUCT) ? Struct_Find(lt->struct_name) : NULL;
-        if (lsd && lsd->is_enum) return false;
-    }
+    if (!is_eq) return false;
 
     uint64_t offs[256], ws[256];
     int nl = Agg_Lanes(lt, 0, offs, ws, 0, 256);

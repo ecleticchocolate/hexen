@@ -1286,6 +1286,53 @@ bool try_rewrite_unary_operator_method(ASTNode* node) {
     return rewrite_operand_to_method_call(node, node->unary, NULL, mname);
 }
 
+// (T)x -> x.__cast[T]() -- the cast-operator overload. Doesn't fit
+// rewrite_operand_to_method_call's shape (a VALUE argument, arity 0 or 1):
+// __cast takes no value argument at all, but one explicit TYPE argument (the
+// cast's own target_type), attached the same way an ordinary explicit
+// generic call (`identity[i32](x)`) already carries node->call.type_args --
+// reuses that exact field/mechanism rather than inventing a second way to
+// pass a type into a call. Not static -- ConstEval needs this too, same
+// reason as the other three rewrites.
+bool try_rewrite_cast_operator(ASTNode* node) {
+    if (node->type != AST_CAST) return false;
+    if (node->cast.expr->type == AST_TYPE_EXPR) return false; // see check_assignable's own guard
+    Type* rt = Type_Infer(node->cast.expr);
+    if (!rt) return false;
+    Symbol* msym = Method_Resolve(rt, "__cast", 6);
+    if (!msym) return false;
+    // A NON-generic __cast() only knows how to produce ONE fixed type (its
+    // declared return type) -- attaching an explicit type arg to a call that
+    // has no type parameter to substitute it into is silently a no-op, which
+    // would let `(i32)m` on a `fn __cast() f64` wrongly "dispatch" and return
+    // f64 bits reinterpreted as i32 instead of erroring or falling back. Only
+    // apply __cast here when it's either generic (the type arg has somewhere
+    // to go) or its fixed return type already matches the cast's own target.
+    if (!msym->generic_decl && msym->type && msym->type->cls == TYPE_FUNCTION &&
+        !Type_Equals(msym->type->function.return_type, node->cast.target_type)) {
+        return false;
+    }
+
+    ASTNode* target = (ASTNode*)calloc(1, sizeof(ASTNode));
+    target->type = AST_FIELD;
+    target->field.base = node->cast.expr;
+    target->field.field_name = "__cast";
+    target->field.field_name_len = 6;
+    target->line = node->line;
+    target->column = node->column;
+
+    Type** targs = (Type**)malloc(sizeof(Type*));
+    targs[0] = node->cast.target_type;
+
+    node->type = AST_CALL;
+    node->call.target_expr = target;
+    node->call.args = NULL;
+    node->call.arg_count = 0;
+    node->call.type_args = targs;
+    node->call.type_arg_count = 1;
+    return true;
+}
+
 Type* Type_Infer(ASTNode* node) {
     if (!node) return NULL;
     if (node->result_type) return node->result_type;
@@ -1301,7 +1348,7 @@ Type* Type_Infer(ASTNode* node) {
     // are what a NON-generic struct doesn't need but a generic one (Box[T]'s
     // __add/__index) does -- see rewrite_operand_to_method_call's own comment.
     if (try_rewrite_operator_method(node) || try_rewrite_index_method(node) ||
-        try_rewrite_unary_operator_method(node)) {
+        try_rewrite_unary_operator_method(node) || try_rewrite_cast_operator(node)) {
         try_rewrite_method_call(node);
         infer_generic(node, NULL);
         wrap_index_result_deref(node);
@@ -1823,7 +1870,7 @@ void infer_generic(ASTNode* node, Type* target) {
     // substitution) actually sees an AST_CALL this call, instead of only on
     // some LATER visit after Type_Infer already fired.
     try_rewrite_operator_method(node) || try_rewrite_index_method(node) ||
-        try_rewrite_unary_operator_method(node);
+        try_rewrite_unary_operator_method(node) || try_rewrite_cast_operator(node);
 
     if (node->type == AST_CALL) {
         pack_expand_call_args(node);
@@ -2344,9 +2391,57 @@ void Typecheck_Tree(ASTNode* node) {
             Type_Infer(node);
             return;
 
-        case AST_DELETE:
+        case AST_DELETE: {
+            // Destructor hook: `delete p` calls p's __delete() (if its pointee
+            // type defines one) before the actual free -- the language's real
+            // free-exit-point (see std/vector.t's Vector[T].__delete for the
+            // reference convention: recurse into owned elements/buffers, THEN
+            // this node's own unconditional free(self.data) releases the raw
+            // storage). Reuses ordinary method-call dispatch (try_rewrite_
+            // method_call, ordinary AST_CALL codegen) for the __delete() call
+            // itself; the actual pointer release stays exactly the existing,
+            // unmodified AST_DELETE codegen (a plain free(), always -- __delete
+            // is cleanup logic, never a replacement for releasing the memory).
             Typecheck_Tree(node->delete_expr.ptr);
+            Type* pt = Type_Infer(node->delete_expr.ptr);
+            Type* pointee = (pt && pt->cls == TYPE_POINTER) ? pt->pointer_base : NULL;
+            if (pointee && pointee->cls == TYPE_STRUCT &&
+                Method_Resolve(pointee, "__delete", 8)) {
+                ASTNode* target = (ASTNode*)calloc(1, sizeof(ASTNode));
+                target->type = AST_FIELD;
+                target->field.base = node->delete_expr.ptr;
+                target->field.field_name = "__delete";
+                target->field.field_name_len = 8;
+                target->line = node->line;
+                target->column = node->column;
+                ASTNode* call = (ASTNode*)calloc(1, sizeof(ASTNode));
+                call->type = AST_CALL;
+                call->call.target_expr = target;
+                call->line = node->line;
+                call->column = node->column;
+                // orig_delete is a COPY of this node, still AST_DELETE,
+                // reusing its exact existing (unmodified) codegen -- it must
+                // NOT be re-typechecked through this same AST_DELETE case
+                // (Typecheck_Tree(node) recursing into it would just find
+                // __delete again and rewrite it again, forever). Its pointer
+                // expression was already typechecked above (same expr,
+                // shared by both this node and the copy); nothing else in
+                // AST_DELETE's codegen needs anything from typecheck.
+                ASTNode* orig_delete = (ASTNode*)calloc(1, sizeof(ASTNode));
+                *orig_delete = *node;
+
+                Typecheck_Tree(call);
+
+                node->type = AST_BLOCK;
+                node->block.capacity = 2;
+                node->block.count = 2;
+                node->block.statements = (ASTNode**)malloc(2 * sizeof(ASTNode*));
+                node->block.transparent = true;
+                node->block.statements[0] = call;
+                node->block.statements[1] = orig_delete;
+            }
             return;
+        }
 
         case AST_DECLARATION:
             // Generic call or bare generic function name, resolved against the
@@ -2575,6 +2670,19 @@ void Typecheck_Tree(ASTNode* node) {
             resolve_brace_literal(node->cast.expr, node->cast.target_type);
             infer_generic(node->cast.expr, node->cast.target_type);
             Typecheck_Tree(node->cast.expr);
+            // Cast-operator overload: `(T)x` where x's type defines a generic
+            // __cast[T]() method. Tried AFTER the operand is fully resolved
+            // above (a literal operand needs a real type before Method_Resolve
+            // can look anything up on it) but BEFORE the built-in struct-
+            // downcast logic below, same "overload takes priority over
+            // built-in aggregate behavior" precedent __add/__eq/etc. already
+            // set against lanewise arithmetic/comparison.
+            if (try_rewrite_cast_operator(node)) {
+                try_rewrite_method_call(node);
+                infer_generic(node, NULL);
+                Typecheck_Tree(node);
+                return;
+            }
             // Casting a bare TYPE used in value position (`(i32)u64`, or `(i32)P`
             // where P is a match-pattern type wildcard) is nonsensical: a type has
             // no value to cast. Without this guard the AST_TYPE_EXPR operand reaches
@@ -2796,28 +2904,16 @@ void Typecheck_Tree(ASTNode* node) {
                     }
                     bool is_eq = (node->type == AST_EQ || node->type == AST_NEQ);
                     if (!is_eq) {
-                        switch (node->type) {
-                            case AST_ADD: case AST_SUB: case AST_MUL:
-                            case AST_BIT_AND: case AST_BIT_OR: case AST_BIT_XOR:
-                                break;
-                            default: {
-                                char msg[192];
-                                snprintf(msg, sizeof(msg),
-                                         "operator not defined on %s operands "
-                                         "(only ==, !=, +, -, *, &, |, ^ apply lanewise to aggregates)",
-                                         lt->cls==TYPE_STRUCT?"struct":"array");
-                                Error_AtNode(node, msg, NULL);
-                            }
+                        const char* overload_name = "an overload method";
+                        if (node->type < (ASTNodeType)(sizeof(s_op_methods)/sizeof(s_op_methods[0])) && s_op_methods[node->type]) {
+                            overload_name = s_op_methods[node->type];
                         }
-                        if (lt->cls == TYPE_STRUCT) {
-                            StructDef* lsd = Struct_Find(lt->struct_name);
-                            if (lsd && lsd->is_enum) {
-                                Error_AtNode(node,
-                                    "operator not defined on struct operands "
-                                    "(only ==, !=, +, -, *, &, |, ^ apply lanewise to aggregates)",
-                                    NULL);
-                            }
-                        }
+                        char msg[256];
+                        snprintf(msg, sizeof(msg),
+                                 "operator not defined on aggregate operands "
+                                 "(implicit lanewise arithmetic has been removed; implement %s instead)",
+                                 overload_name);
+                        Error_AtNode(node, msg, NULL);
                     }
                     uint64_t dummy_offs[256], dummy_ws[256];
                     int nl = Agg_Lanes(lt, 0, dummy_offs, dummy_ws, 0, 256);
@@ -2825,7 +2921,7 @@ void Typecheck_Tree(ASTNode* node) {
                         char msg[192];
                         snprintf(msg, sizeof(msg),
                                  "operator not defined on %s operands "
-                                 "(only ==, !=, +, -, *, &, |, ^ apply lanewise to aggregates)",
+                                 "(lanewise comparison failed: aggregate contains unsupported types like pointers)",
                                  lt->cls==TYPE_STRUCT?"struct":"array");
                         Error_AtNode(node, msg, NULL);
                     }

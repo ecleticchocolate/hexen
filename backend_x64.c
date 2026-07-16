@@ -367,29 +367,6 @@ static bool x64_agg_do_lane(void* ctxp, ASTNodeType op, uint64_t offset, int wid
         emit_byte(buf,0x48);emit_byte(buf,0x09);emit_byte(buf,0xf2);          // or rdx, rsi
         return true;
     }
-    uint8_t opb = 0;
-    switch (op) {
-        case AST_ADD: opb=0x01; break; case AST_SUB: opb=0x29; break;
-        case AST_BIT_AND: opb=0x21; break; case AST_BIT_OR: opb=0x09; break;
-        case AST_BIT_XOR: opb=0x31; break; case AST_MUL: opb=0xaf; break; // imul special-cased
-        default: return false; // agg_binop_apply already gated the op set; unreachable
-    }
-    // load L lane -> rsi (zero-extended), R lane -> rdi
-    if (w==8)      { emit_byte(buf,0x48);emit_byte(buf,0x8b);emit_byte(buf,0xb0);emit_u32(buf,o);
-                     emit_byte(buf,0x48);emit_byte(buf,0x8b);emit_byte(buf,0xb9);emit_u32(buf,o); }
-    else if (w==4) { emit_byte(buf,0x8b);emit_byte(buf,0xb0);emit_u32(buf,o);
-                     emit_byte(buf,0x8b);emit_byte(buf,0xb9);emit_u32(buf,o); }
-    else if (w==2) { emit_byte(buf,0x48);emit_byte(buf,0x0f);emit_byte(buf,0xb7);emit_byte(buf,0xb0);emit_u32(buf,o);
-                     emit_byte(buf,0x48);emit_byte(buf,0x0f);emit_byte(buf,0xb7);emit_byte(buf,0xb9);emit_u32(buf,o); }
-    else           { emit_byte(buf,0x48);emit_byte(buf,0x0f);emit_byte(buf,0xb6);emit_byte(buf,0xb0);emit_u32(buf,o);
-                     emit_byte(buf,0x48);emit_byte(buf,0x0f);emit_byte(buf,0xb6);emit_byte(buf,0xb9);emit_u32(buf,o); }
-    if (op == AST_MUL) { emit_byte(buf,0x48);emit_byte(buf,0x0f);emit_byte(buf,0xaf);emit_byte(buf,0xf7); } // imul rsi,rdi
-    else                { emit_byte(buf,0x48);emit_byte(buf,opb);emit_byte(buf,0xfe); }                      // op rsi,rdi
-    // store rsi -> [rdx+o] at lane width (truncation = correct per-lane wrap)
-    if (w==8)      { emit_byte(buf,0x48);emit_byte(buf,0x89);emit_byte(buf,0xb2);emit_u32(buf,o); }
-    else if (w==4) { emit_byte(buf,0x89);emit_byte(buf,0xb2);emit_u32(buf,o); }
-    else if (w==2) { emit_byte(buf,0x66);emit_byte(buf,0x89);emit_byte(buf,0xb2);emit_u32(buf,o); }
-    else           { emit_byte(buf,0x40);emit_byte(buf,0x88);emit_byte(buf,0xb2);emit_u32(buf,o); }
     return true;
 }
 

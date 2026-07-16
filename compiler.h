@@ -705,6 +705,7 @@ bool try_rewrite_operator_method(struct ASTNode* node);
 bool try_rewrite_index_method(struct ASTNode* node);
 bool try_rewrite_unary_operator_method(struct ASTNode* node);
 bool try_rewrite_call_operator(struct ASTNode* node, struct Type* tgt);
+bool try_rewrite_cast_operator(struct ASTNode* node);
 
 // --- Type helpers ---
 
