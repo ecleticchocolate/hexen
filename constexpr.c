@@ -712,6 +712,14 @@ static bool ce_eval_call(ASTNode* node, int64_t* out) {
                         struct Symbol* candidate = (struct Symbol*)(intptr_t)fv;
                         if (candidate->kind == SYM_FUNCTION) fsym = candidate;
                     }
+                } else if (try_rewrite_call_operator(node, tt)) {
+                    // Call-operator overload (`a(x)` where `a` is a struct
+                    // value defining __call, not a function) -- same
+                    // Type_Infer/ConstEval split every other operator dispatch
+                    // needs here: the rewrite mutates `node` into a real
+                    // method-call AST_CALL, so re-run this same function on it.
+                    try_rewrite_method_call(node);
+                    return ce_eval_call(node, out);
                 }
             }
             if (!fsym || fsym->kind != SYM_FUNCTION) return false;
@@ -899,12 +907,28 @@ static bool ce_eval_assign(ASTNode* node, int64_t* out) {
                 return true;
             }
             if (!node->binary.left || node->binary.left->type != AST_IDENT) return false;
+            struct Symbol* tsym = node->binary.left->ident.sym;
+            Type* tt = tsym ? tsym->type : NULL;
+            // A bare aggregate literal RHS (`p = {.a=1, .b=2}`) may still be
+            // fully unresolved here (sdef/elem_type NULL) -- ConstEval's own
+            // AST_STRUCT_LITERAL/AST_ARRAY_LITERAL cases refuse to fold an
+            // unresolved literal ("not a closed-term value here") rather than
+            // resolving it themselves. ce_build_aggregate already does this
+            // exact resolve-then-build for a DECLARATION's literal initializer
+            // (see its own comment: "const is evaluated at PARSE time, before
+            // typecheck runs resolve_brace_literal"); a plain assignment's
+            // literal RHS needs the identical treatment, idempotently, since
+            // `TYPE name = EXPR` is now sugar over `TYPE name` + `name = EXPR`
+            // (parser.c, make_decl_stmt) and no longer resolves the literal at
+            // its own dedicated declaration site.
+            if (tt && (node->binary.right->type == AST_STRUCT_LITERAL ||
+                       node->binary.right->type == AST_ARRAY_LITERAL)) {
+                resolve_brace_literal(node->binary.right, tt);
+            }
             int64_t v;
             if (!ConstEval(node->binary.right, &v)) return false;
             bool isf = s_ce_isfloat;
             bool rhs_agg = s_ce_isagg;
-            struct Symbol* tsym = node->binary.left->ident.sym;
-            Type* tt = tsym ? tsym->type : NULL;
             // Whole-aggregate assignment (`b = a`, plain ident target — the
             // AST_FIELD/AST_INDEX case above already copies correctly). This
             // must copy INTO b's existing storage, not repoint b's address at
@@ -1206,6 +1230,33 @@ static bool ce_eval_new(ASTNode* node, int64_t* out) {
 }
 
 static bool ConstEval_inner(ASTNode* node, int64_t* out) {
+    // Operator-overload dispatch: `a op b` / `v[i]` / `!v` / `~v`, where a's
+    // (or v's) type defines the matching dunder method, must call THAT, not
+    // fall through to the lanewise/scalar/array fold each op's own case below
+    // would otherwise do -- exactly like Type_Infer's own dispatch (which
+    // ConstEval does NOT go through: ConstEval is a second, independent
+    // interpreter that walks the raw AST directly, and Const_ResolvePending
+    // runs BEFORE Typecheck_Program, so the lazy AST_ADD -> AST_CALL rewrite
+    // Type_Infer does on first visit may never have happened yet for this
+    // node when ConstEval gets to it first). MUST run before the switch
+    // below, not merely before its `default` -- AST_INDEX (among others) has
+    // its own explicit case there and would return from it directly,
+    // skipping a check placed only at the switch's fallback. Confirmed by a
+    // real bug: placing this check after the switch's `default: break;`
+    // fixed __add/__eq (which have no case of their own, so they DO fall to
+    // `default`) but silently left __index broken (v[0] still read raw array
+    // bytes, wrong element type and all, instead of calling __index) until
+    // moved here. Each rewrite mutates `node` in place into an AST_CALL when
+    // it applies; re-dispatch on the same node so the existing AST_CALL case
+    // below (already how `const R = build()` folds an ordinary function
+    // call) does the rest -- no new call-folding logic needed here. (__call
+    // is hooked separately, inside ce_eval_call itself, since it needs the
+    // call target's already-inferred type first -- see that function's own
+    // comment.)
+    if (try_rewrite_operator_method(node) || try_rewrite_index_method(node) ||
+        try_rewrite_unary_operator_method(node)) {
+        return ConstEval(node, out);
+    }
 
     switch (node->type) {
         case AST_INT_LITERAL:
