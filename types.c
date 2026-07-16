@@ -391,6 +391,7 @@ static bool is_untyped_float_literal(ASTNode* n);
 static bool is_null_literal(ASTNode* n);
 static bool int_fits(int64_t v, const Type* dst);
 static bool check_assignable_ne(Type* dst, ASTNode* src, const char* where);
+static bool unify_types(Type* concrete, Type* generic, const char** type_params, Type** inferred_args, size_t param_count);
 
 // Usual-arithmetic-conversion (lite, for v1 integers):
 // result is the operand with the larger width; on a tie, unsigned wins.
@@ -689,7 +690,7 @@ void resolve_brace_literal(ASTNode* node, Type* target) {
         // Inferred size `u32[]`: write the literal's element count back into the
         // (shared) declared type, so sizeof/allocation see the real size. (Was the
         // crash: count stayed 0 -> 0-byte alloc, then writing elements overran it.)
-        if (target->array.count == 0)
+        if (target->array.count == 0 && !target->array.count_expr)
             target->array.count = node->array_lit.count;
         // Recurse: an element may itself be a bare `{...}` of the element type,
         // or a generic function name that should monomorphize to the element type.
@@ -706,7 +707,15 @@ void resolve_brace_literal(ASTNode* node, Type* target) {
                 check_assignable(elem, ev, "array element");
             }
         }
-        node->result_type = target;
+        if (target->array.count_expr) {
+            Type* concrete = (Type*)malloc(sizeof(Type));
+            *concrete = *target;
+            concrete->array.count_expr = NULL;
+            concrete->array.count = node->array_lit.count;
+            node->result_type = concrete;
+        } else {
+            node->result_type = target;
+        }
         return;
     }
     // Already-resolved literal or any other node: nothing to do.
@@ -946,7 +955,9 @@ Symbol* Method_Resolve(const Type* t, const char* mname, size_t mlen) {
 // must re-run its own type-inference/typecheck on `node` afterward); false
 // (no-op) if `tgt` isn't a struct or has no __call method, so the caller falls
 // through to its ordinary "calling non-function" error unchanged.
-static bool try_rewrite_call_operator(ASTNode* node, Type* tgt) {
+// Not static -- ConstEval needs this too, same reason as
+// try_rewrite_operator_method (see that function's own comment).
+bool try_rewrite_call_operator(ASTNode* node, Type* tgt) {
     // Method_Resolve (not Struct_FindField -- see the s_op_methods dispatch
     // fix above for the full story) already unwraps pointer-to-struct and
     // resolves through a generic base, so no manual unwrap is needed here.
@@ -1105,7 +1116,58 @@ static bool rewrite_operand_to_method_call(ASTNode* node, ASTNode* recv, ASTNode
                                           rt_sd->type_args, rt_sd->type_arg_count);
             }
         }
-        if (!check_assignable_ne(param_t, arg, "__assign argument")) return false;
+        // A bare brace literal (`v = {1,2,3}` or `v = {.x=1,.y=2}`) is ambiguous
+        // BEFORE anything resolves it: it could be ordinary construction of the
+        // struct's OWN shape (ALWAYS legal, __assign or not -- see
+        // assign_operator_ordinary_still_works.t) or an argument meant for
+        // __assign's declared parameter (the whole point of __assign existing).
+        // Must disambiguate BEFORE resolving against either target, since
+        // resolve_brace_literal mutates the node in place and there's no
+        // "try, then undo" once that runs.
+        //  - Designated (`{.field=..}`, already AST_STRUCT_LITERAL at parse
+        //    time): if every named field genuinely exists on rt, it's
+        //    construction -- __assign does not apply, full stop.
+        //  - Positional (`{a,b,..}`, still AST_ARRAY_LITERAL -- the parser
+        //    doesn't know yet whether a bare `{...}` is a struct or array):
+        //    if rt is a struct and the value count is <= rt's own field
+        //    count, treat it as construction too (the same rule
+        //    resolve_brace_literal's own positional-struct-literal branch
+        //    uses to accept/reject a positional literal against a struct).
+        // Only past both of those does this literal get a chance to mean
+        // "argument to __assign" -- resolved against __assign's parameter
+        // type instead of rt's own shape.
+        if (rt->cls == TYPE_STRUCT) {
+            StructDef* rt_sd_for_check = Struct_Find(rt->struct_name);
+            if (rt_sd_for_check) {
+                if (arg->type == AST_STRUCT_LITERAL && !arg->struct_lit.sdef) {
+                    bool all_fields_exist = true;
+                    for (size_t i = 0; i < arg->struct_lit.count; i++) {
+                        if (!Struct_FindField(rt_sd_for_check, arg->struct_lit.field_names[i],
+                                              arg->struct_lit.field_name_lens[i])) {
+                            all_fields_exist = false;
+                            break;
+                        }
+                    }
+                    if (all_fields_exist && arg->struct_lit.count > 0) return false;
+                } else if (arg->type == AST_ARRAY_LITERAL && !arg->array_lit.elem_type &&
+                           arg->array_lit.count <= rt_sd_for_check->field_count) {
+                    return false;
+                }
+            }
+        }
+        resolve_brace_literal(arg, param_t);
+        bool matches = false;
+        if (msym->generic_decl && msym->generic_decl->func_decl.type_param_count > 0) {
+            ASTNode* func = msym->generic_decl;
+            size_t pc = func->func_decl.type_param_count;
+            Type** inferred = (Type**)calloc(pc, sizeof(Type*));
+            Type* arg_t = Type_Infer(arg);
+            matches = unify_types(arg_t, param_t, func->func_decl.type_params, inferred, pc);
+            free(inferred);
+        } else {
+            matches = check_assignable_ne(param_t, arg, "__assign argument");
+        }
+        if (!matches) return false;
     }
 
     ASTNode* target = (ASTNode*)calloc(1, sizeof(ASTNode));
@@ -1135,7 +1197,11 @@ static bool rewrite_operand_to_method_call(ASTNode* node, ASTNode* recv, ASTNode
 // node) -- see infer_generic's call site for why a generic struct's
 // overloaded operator (Box[T]'s __add) needs the earlier hook too, not just
 // the lazy one Type_Infer would otherwise rely on alone.
-static bool try_rewrite_operator_method(ASTNode* node) {
+// Not static: ConstEval (constexpr.c) needs this too -- see its own binary-op
+// case for why. Same rewrite, same one implementation, used by Type_Infer,
+// infer_generic, AND ConstEval now instead of ConstEval growing a second,
+// independent "does this operator have an overload" check of its own.
+bool try_rewrite_operator_method(ASTNode* node) {
     if (node->type >= (ASTNodeType)(sizeof(s_op_methods)/sizeof(s_op_methods[0]))) return false;
     const char* mname = s_op_methods[node->type];
     if (!mname) return false;
@@ -1147,7 +1213,9 @@ static bool try_rewrite_operator_method(ASTNode* node) {
 // AST_CALL-shaped BEFORE Type_Infer's lazy rewrite would otherwise fire, or a
 // generic struct's __index return type never gets its self_type_args
 // substituted (identical failure mode s_op_methods had for Box[T]'s __add).
-static bool try_rewrite_index_method(ASTNode* node) {
+// Not static -- ConstEval needs this too, same reason as
+// try_rewrite_operator_method (see that function's own comment).
+bool try_rewrite_index_method(ASTNode* node) {
     if (node->type != AST_INDEX) return false;
     return rewrite_operand_to_method_call(node, node->index.base, node->index.index, "__index");
 }
@@ -1209,7 +1277,9 @@ static void wrap_index_result_deref(ASTNode* node) {
 // !v -> v.__not(), ~v -> v.__bitnot(): same shared core (with arg == NULL, a
 // zero-arg method call), same two call sites and reason as the two above.
 // Unary minus (-x) is NOT handled here -- see s_unary_op_methods' own comment.
-static bool try_rewrite_unary_operator_method(ASTNode* node) {
+// Not static -- ConstEval needs this too, same reason as
+// try_rewrite_operator_method (see that function's own comment).
+bool try_rewrite_unary_operator_method(ASTNode* node) {
     if (node->type >= (ASTNodeType)(sizeof(s_unary_op_methods)/sizeof(s_unary_op_methods[0]))) return false;
     const char* mname = s_unary_op_methods[node->type];
     if (!mname) return false;

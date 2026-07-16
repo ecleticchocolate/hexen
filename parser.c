@@ -582,6 +582,43 @@ static ASTNode* make_int_literal(uint64_t value, int lit_kind) {
     return node;
 }
 
+// `TYPE name = init_expr` as sugar over `TYPE name` (bare, zero-init)
+// immediately followed by a REAL `name = init_expr` AST_ASSIGN, wrapped in a
+// `transparent` AST_BLOCK (not a real scope -- see the for-loop init wrapper
+// and parse_unpack for the same flag/reasoning: `name` must stay visible to
+// whatever follows in the REAL enclosing block, and ConstEval must not unwind
+// its comptime binding when this synthetic wrapper ends).
+//
+// STAGED ROLLOUT: only parse_decl_or_expr_statement (ordinary `TYPE name =
+// expr` statements) uses this so far. for-loops, unpack, match-arm bindings,
+// and generic-const declarations still build AST_DECLARATION with init_expr
+// set directly, and AST_DECLARATION's own typecheck/codegen still handles
+// that shape unchanged -- migrating this incrementally, one caller at a time
+// with a full test run after each, rather than deleting the old path before
+// every caller is confirmed moved off it.
+static ASTNode* make_decl_stmt(Type* var_type, const char* name, size_t name_len,
+                                Symbol* sym, ASTNode* init_expr) {
+    ASTNode* decl = new_node(AST_DECLARATION);
+    decl->decl.var_type = var_type;
+    decl->decl.name = name;
+    decl->decl.name_len = name_len;
+    decl->decl.sym = sym;
+    if (!init_expr) return decl;
+
+    ASTNode* assign = new_node(AST_ASSIGN);
+    assign->binary.left = make_ident_node(name, name_len, sym);
+    assign->binary.right = init_expr;
+
+    ASTNode* blk = new_node(AST_BLOCK);
+    blk->block.capacity = 2;
+    blk->block.count = 2;
+    blk->block.statements = (ASTNode**)malloc(2 * sizeof(ASTNode*));
+    blk->block.transparent = true;
+    blk->block.statements[0] = decl;
+    blk->block.statements[1] = assign;
+    return blk;
+}
+
 static Type* make_primitive_type(PrimitiveKind kind) {
     Type* t = (Type*)calloc(1, sizeof(Type));
     t->cls = TYPE_PRIMITIVE;
@@ -2161,6 +2198,69 @@ static ASTNode* parse_postfix(void) {
             fnode->field.field = NULL;
             fnode->field.sdef = NULL;
             node = fnode;
+
+            // `.method[TypeArgs](...)`: explicit generic type arguments on a
+            // METHOD call (as opposed to a bare `identity[i32](...)` call,
+            // whose own explicit-generic-call parsing lives in
+            // parse_explicit_generic_call and requires a resolvable Symbol*
+            // at PARSE time -- impossible here, since impl methods aren't
+            // resolved to a symbol until typecheck, by mangled-name lookup,
+            // long after the parser has moved on). So this can't reuse that
+            // path; instead it speculatively parses `[...]` as a type-argument
+            // list only when it's immediately followed by `(` -- the same
+            // "does the shape that follows disambiguate it" trick used
+            // elsewhere in this file (e.g. the cast-vs-parenthesized-expr
+            // check above) -- and defers all validation (does this method
+            // even take generics, right arity, etc.) to Typecheck_Tree, which
+            // already knows how to resolve a method's real symbol.
+            if (s_curr.type == TOK_LBRACKET && !s_curr_newline_before) {
+                LexerState ta_save;
+                Lexer_Save(&ta_save);
+                Token lb_tok = s_curr;
+                advance(); // consume '['
+                Type** targs = NULL;
+                size_t tcount = 0, tcap = 0;
+                bool ok = true;
+                while (s_curr.type != TOK_RBRACKET) {
+                    Type* ta = parse_type();
+                    if (!ta) { ok = false; break; }
+                    if (tcount >= tcap) {
+                        tcap = tcap ? tcap * 2 : 4;
+                        targs = (Type**)realloc(targs, tcap * sizeof(Type*));
+                    }
+                    targs[tcount++] = ta;
+                    if (s_curr.type == TOK_COMMA) { advance(); continue; }
+                    break;
+                }
+                if (ok && s_curr.type == TOK_RBRACKET) {
+                    advance(); // consume ']'
+                    if (s_curr.type == TOK_LPAREN) {
+                        // Genuine explicit-generic method call: build the
+                        // AST_CALL directly here (skipping the ordinary
+                        // TOK_LPAREN branch below, which doesn't know about
+                        // type_args) so type_args/type_arg_count land on the
+                        // call node try_rewrite_method_call/infer_generic
+                        // already read for a top-level generic call -- same
+                        // fields, same downstream handling, no new machinery.
+                        advance(); // consume '('
+                        ASTNode* call_node = new_node(AST_CALL);
+                        call_node->call.target_name = NULL;
+                        call_node->call.target_expr = node; // the AST_FIELD
+                        call_node->call.args = parse_call_arg_list(&call_node->call.arg_count);
+                        call_node->call.type_args = targs;
+                        call_node->call.type_arg_count = tcount;
+                        node = call_node;
+                        continue; // re-enter the while loop; this `[...]  (` is consumed
+                    }
+                }
+                // Not `[TypeArgs](` after all (plain indexing, or malformed) --
+                // rewind completely and let the ordinary TOK_LBRACKET branch
+                // below parse it as indexing, unchanged.
+                free(targs);
+                Lexer_Restore(&ta_save);
+                s_curr = lb_tok;
+                s_curr_newline_before = false; // conservative, mirrors the cast-disambiguation rewind above
+            }
         } else if (s_curr.type == TOK_LBRACKET) { // TOK_LBRACKET — indexing
             advance();
             ASTNode* idx = parse_expr_prec(0);
@@ -2291,13 +2391,8 @@ static void compile_pattern(ASTNode* pat, ASTNode* scrut, Type* scrut_type, ASTN
     if (pat->type == AST_IDENT) {
         SymbolKind kind = s_symtable->is_function_scope ? SYM_LOCAL : SYM_GLOBAL;
         Symbol* sym = SymTable_Add(s_symtable, pat->ident.name, pat->ident.name_len, scrut_type, kind);
-        ASTNode* decl = new_node(AST_DECLARATION);
-        decl->decl.var_type = scrut_type;
-        decl->decl.name = pat->ident.name;
-        decl->decl.name_len = pat->ident.name_len;
-        decl->decl.init_expr = scrut;
-        decl->decl.sym = sym;
-        
+        ASTNode* decl = make_decl_stmt(scrut_type, pat->ident.name, pat->ident.name_len, sym, scrut);
+
         if (*decl_count >= *decl_cap) {
             *decl_cap = (*decl_cap == 0) ? 4 : (*decl_cap * 2);
             *out_decls = realloc(*out_decls, *decl_cap * sizeof(ASTNode*));
@@ -2480,9 +2575,7 @@ static ASTNode* parse_match_value(ASTNode* scrut, Type* st) {
     MatchChain mc = matchchain_begin();
     ASTNode* outer = mc.outer;
 
-    ASTNode* mdecl = new_node(AST_DECLARATION);
-    mdecl->decl.var_type = st; mdecl->decl.name = mname; mdecl->decl.name_len = mn;
-    mdecl->decl.init_expr = scrut; mdecl->decl.sym = msym;
+    ASTNode* mdecl = make_decl_stmt(st, mname, mn, msym, scrut);
     matchchain_push_stmt(&mc, mdecl);
 
     #define MREF() ({ ASTNode* r = new_node(AST_IDENT); r->ident.name = mname; \
@@ -2992,9 +3085,7 @@ static ASTNode* parse_unpack(void) {
     char* mname = malloc(32); int mn = snprintf(mname, 32, "$u%d", s_unpack_ctr++);
     Symbol* msym = SymTable_Add(s_symtable, mname, mn, st, kind);
 
-    ASTNode* mdecl = new_node(AST_DECLARATION);
-    mdecl->decl.var_type = st; mdecl->decl.name = mname; mdecl->decl.name_len = mn;
-    mdecl->decl.init_expr = scrut; mdecl->decl.sym = msym;
+    ASTNode* mdecl = make_decl_stmt(st, mname, mn, msym, scrut);
     UPUSH(mdecl);
 
     ASTNode* mref = new_node(AST_IDENT);
@@ -3121,20 +3212,9 @@ static ASTNode* parse_for_statement(void) {
     #define SREF() ({ ASTNode* r = new_node(AST_IDENT); r->ident.name = step_name; \
                       r->ident.name_len = step_name_len; r->ident.sym = step_sym; r; })
 
-    ASTNode* ivar_decl = new_node(AST_DECLARATION);
-    ivar_decl->decl.var_type = ivtype;
-    ivar_decl->decl.name = ivar.start; ivar_decl->decl.name_len = ivar.length;
-    ivar_decl->decl.init_expr = start; ivar_decl->decl.sym = isym;
-
-    ASTNode* end_decl = new_node(AST_DECLARATION);
-    end_decl->decl.var_type = ivtype;
-    end_decl->decl.name = end_name; end_decl->decl.name_len = end_name_len;
-    end_decl->decl.init_expr = end; end_decl->decl.sym = end_sym;
-
-    ASTNode* step_decl = new_node(AST_DECLARATION);
-    step_decl->decl.var_type = ivtype;
-    step_decl->decl.name = step_name; step_decl->decl.name_len = step_name_len;
-    step_decl->decl.init_expr = step; step_decl->decl.sym = step_sym;
+    ASTNode* ivar_decl = make_decl_stmt(ivtype, ivar.start, ivar.length, isym, start);
+    ASTNode* end_decl = make_decl_stmt(ivtype, end_name, end_name_len, end_sym, end);
+    ASTNode* step_decl = make_decl_stmt(ivtype, step_name, step_name_len, step_sym, step);
 
     // This wrapper only exists because for_stmt.init is a single node slot --
     // it is NOT a real scope (ivar/end/step must be visible to cond/incr/body,
@@ -3302,14 +3382,10 @@ static ASTNode* parse_decl_or_expr_statement(void) {
             }
         }
 
-        ASTNode* node = new_node(AST_DECLARATION);
-        node->decl.var_type = type;
-        node->decl.name = id_tok.start;
-        node->decl.name_len = id_tok.length;
-        node->decl.init_expr = init_expr;
-        node->decl.sym = sym;
-
-        return node;
+        // init_expr is NULL here for a global with a real value (the const-fold
+        // branch above bakes it into the static image instead -- a global never
+        // gets runtime init code, so it must never become a synthesized assignment).
+        return make_decl_stmt(type, id_tok.start, id_tok.length, sym, init_expr);
     }
 
     ASTNode* expr = parse_expr_prec(0);

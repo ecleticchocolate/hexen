@@ -1763,6 +1763,18 @@ static void compile_node_ctx(JITBuffer* buf, ASTNode* node, LoopContext* loop) {
     }
     
     if (node->type == AST_DECLARATION) {
+        // `TYPE name = init_expr` is parsed as sugar (parser.c, make_decl_stmt):
+        // a bare `TYPE name` (this node, zero-init only) immediately followed by
+        // a real `name = init_expr` AST_ASSIGN in the same synthesized transparent
+        // block -- reusing AST_ASSIGN's own complete codegen (struct/array/scalar,
+        // generics, __assign dispatch) instead of a second, hand-written copy of
+        // that logic here. The ONE remaining case that still sets init_expr
+        // directly on this node is `is_generic_const` (a `const` inside a generic
+        // body whose value depends on the instantiation's own type params, e.g.
+        // `const u32 c = N` -- see parse_const_decl/clone_ast): that value is
+        // ALWAYS folded to a plain scalar AST_INT_LITERAL by clone_ast before
+        // codegen ever sees it (never a struct/array), so only the scalar branch
+        // below still needs to handle init_expr at all.
         Symbol* sym = node->decl.sym;
         if (!sym) exit(1);
         Type* vt = sym->type;
@@ -1779,9 +1791,8 @@ static void compile_node_ctx(JITBuffer* buf, ASTNode* node, LoopContext* loop) {
             sym->offset = s_func->current_local_offset;
         }
 
-        // Struct-typed declaration.
+        // Struct-typed declaration: zero-init only (unspecified fields zero-init, C99).
         if (vt && vt->cls == TYPE_STRUCT) {
-            // Zero the storage first (unspecified fields zero-init, C99).
             uint64_t sz = Type_SizeOf(vt);
             emit_var_addr(buf, sym);                                  // rax = &var
             emit_byte(buf, 0x49); emit_byte(buf, 0x89); emit_byte(buf, 0xc0); // mov r8, rax (save base)
@@ -1791,56 +1802,17 @@ static void compile_node_ctx(JITBuffer* buf, ASTNode* node, LoopContext* loop) {
                 emit_u32(buf, (uint32_t)b);
                 emit_u32(buf, 0);
             }
-            if (node->decl.init_expr && node->decl.init_expr->type == AST_STRUCT_LITERAL) {
-                // Fill via the shared materializer (handles nested aggregate fields).
-                emit_var_addr(buf, sym);
-                emit_byte(buf, 0x50); // push dest base
-                emit_fill_literal(buf, node->decl.init_expr, loop);
-                emit_byte(buf, 0x58); // pop dest base
-            } else if (node->decl.init_expr) {
-                // Struct copy: init yields the source struct's address. The init may be
-                // a call (clobbers r8), so recompute the dest after evaluating source.
-                Type* it = Type_Infer(node->decl.init_expr);
-                if (!it || it->cls != TYPE_STRUCT || !Type_Equals(it, vt)) {
-                    Error_AtNode(node, "compiler bug: struct initializer type mismatch reached backend", NULL);
-                }
-                compile_node_ctx(buf, node->decl.init_expr, loop); // rax = &source
-                emit_byte(buf, 0x50);                              // push src addr
-                emit_var_addr(buf, sym);                           // rax = &dest (fresh)
-                emit_byte(buf, 0x48); emit_byte(buf, 0x89); emit_byte(buf, 0xc7); // mov rdi, rax (dst)
-                emit_byte(buf, 0x5e);                              // pop rsi (src)
-                emit_memcpy_rdi_rsi(buf, sz);
-            }
             return;
         }
 
-        // Array-typed declaration.
+        // Array-typed declaration: zero-init only.
         if (vt && vt->cls == TYPE_ARRAY) {
             uint64_t sz = Type_SizeOf(vt);
-            // Zero storage first (unspecified elements zero-init).
             emit_var_addr(buf, sym);
             emit_byte(buf, 0x49); emit_byte(buf, 0x89); emit_byte(buf, 0xc0); // mov r8, rax
             for (uint64_t b = 0; b < sz; b += 8) {
                 emit_byte(buf, 0x49); emit_byte(buf, 0xc7); emit_byte(buf, 0x80);
                 emit_u32(buf, (uint32_t)b); emit_u32(buf, 0);
-            }
-            if (node->decl.init_expr && node->decl.init_expr->type == AST_ARRAY_LITERAL) {
-                emit_var_addr(buf, sym);
-                emit_byte(buf, 0x50); // push dest base
-                emit_fill_literal(buf, node->decl.init_expr, loop);
-                emit_byte(buf, 0x58); // pop dest base
-            } else if (node->decl.init_expr) {
-                // Array copy from another array value (address in rax).
-                Type* it = Type_Infer(node->decl.init_expr);
-                if (!it || it->cls != TYPE_ARRAY || !Type_Equals(it, vt)) {
-                    Error_AtNode(node, "compiler bug: array initializer type mismatch reached backend", NULL);
-                }
-                compile_node_ctx(buf, node->decl.init_expr, loop);
-                emit_byte(buf, 0x50);
-                emit_var_addr(buf, sym);
-                emit_byte(buf, 0x48); emit_byte(buf, 0x89); emit_byte(buf, 0xc7); // mov rdi, rax
-                emit_byte(buf, 0x5e);                                            // pop rsi
-                emit_memcpy_rdi_rsi(buf, sz);
             }
             return;
         }
@@ -1853,14 +1825,16 @@ static void compile_node_ctx(JITBuffer* buf, ASTNode* node, LoopContext* loop) {
             return;
         }
         if (node->decl.init_expr) {
+            // is_generic_const's folded literal (see the case comment above) --
+            // the only shape that still reaches here.
             compile_node_ctx(buf, node->decl.init_expr, loop);
         } else {
-            emit_byte(buf, 0x48); emit_byte(buf, 0x31); emit_byte(buf, 0xc0);
+            emit_byte(buf, 0x48); emit_byte(buf, 0x31); emit_byte(buf, 0xc0); // xor rax, rax
         }
         emit_byte(buf, 0x50); // push rax (value)
         emit_var_addr(buf, sym); // rax = dest address
         emit_byte(buf, 0x59); // pop rcx (value)
-        
+
         Type* it = node->decl.init_expr ? Type_Infer(node->decl.init_expr) : NULL;
         emit_coerce_rcx_int_to_float(buf, sym->type, it);
         if (!emit_store_scalar_float(buf, sym->type)) {

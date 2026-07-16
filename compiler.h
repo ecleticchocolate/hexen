@@ -695,6 +695,17 @@ void try_rewrite_method_call(struct ASTNode* node); // rewrite expr.method(args)
 char*          Method_Mangle(const struct Type* t, const char* mname, size_t mlen, size_t* out_len);
 struct Symbol* Method_Resolve(const struct Type* t, const char* mname, size_t mlen);
 
+// Operator-overload rewrites (types.c): `a op b` -> `a.__op(b)` (binary),
+// `v[i] -> v.__index(i)`, `!v/~v -> v.__not()/__bitnot()`, and `a(x) ->
+// a.__call(x)` (the last needs the caller to have already inferred the call
+// target's type, `tgt`) -- each mutates its node in place when it applies.
+// Shared by Type_Infer, infer_generic, and ConstEval (constexpr.c) -- one
+// implementation each, not one per consumer of the AST.
+bool try_rewrite_operator_method(struct ASTNode* node);
+bool try_rewrite_index_method(struct ASTNode* node);
+bool try_rewrite_unary_operator_method(struct ASTNode* node);
+bool try_rewrite_call_operator(struct ASTNode* node, struct Type* tgt);
+
 // --- Type helpers ---
 
 bool Type_Equals(const Type* a, const Type* b); // structural equality (recurses through pointers/arrays)
