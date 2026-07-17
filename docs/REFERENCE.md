@@ -499,6 +499,8 @@ if cond { ... } else if cond2 { ... } else { ... }
 while cond { ... }
 for i32 i = 0 to 10 { ... }              // exclusive end, step +1
 for i32 i = 10 to 0 by (0 - 1) { ... }   // explicit step
+for TYPE val in iterable { ... }         // iteration over arrays, __index/len structs, or begin/next cursor structs
+for unpack PATTERN in iterable { ... }   // destructure directly in the loop header
 break
 continue
 return expr
@@ -600,6 +602,8 @@ pass that file as an ordinary input alongside its consumers.
 ```
 `/` truncates toward zero, `%` takes dividend's sign. Unsigned narrow
 overflow wraps (defined behavior).
+
+**Assignments are addressable places (lvalues)**: `(a = b)` writes to `a` and yields `a` as an addressable place. `&(a = b)` is legal, and chained assignments like `(a = b) = c` write `c` to `a` after evaluating `b`.
 
 **Operator overloading** (magic method names on a struct's `impl` block,
 dispatched structurally — no interface declared):
