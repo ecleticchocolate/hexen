@@ -230,6 +230,10 @@ static bool ca_memo_lookup(ASTNode* node, int* out_slot) {
     return false;
 }
 
+static void emit_store_to_rax(JITBuffer* buf, int w);
+static bool emit_store_scalar_float(JITBuffer* buf, Type* t);
+static void emit_coerce_rcx_int_to_float(JITBuffer* buf, Type* dst, Type* src);
+
 static void compile_lvalue(JITBuffer* buf, ASTNode* node, LoopContext* loop) {
     int memo_slot;
     if (ca_memo_lookup(node, &memo_slot)) {
@@ -241,6 +245,30 @@ static void compile_lvalue(JITBuffer* buf, ASTNode* node, LoopContext* loop) {
         emit_u32(buf, (uint32_t)(-memo_slot));
         return;
     }
+    if (node->type == AST_ASSIGN) {
+        // [PLACE-RETURN] `&(lvalue = rvalue)` : perform the scalar store, then
+        // yield the ADDRESS of the destination (not the value). This is the
+        // language's ephemeral lvalue-reference: an assignment used in place
+        // position returns a pointer to where it just wrote, reusing the dest
+        // address compile_lvalue already computes for the store. Scoped to
+        // scalar, plain (non-compound) assignment for now.
+        Type* lt = Type_Infer(node->binary.left);
+        if (!Type_IsAggregate(lt) && !node->binary.is_compound) {
+            compile_node_ctx(buf, node->binary.right, loop); // value in rax
+            emit_byte(buf, 0x50); // push value
+            compile_lvalue(buf, node->binary.left, loop);    // rax = dest address
+            emit_byte(buf, 0x59); // pop rcx (value)
+            emit_coerce_rcx_int_to_float(buf, lt, Type_Infer(node->binary.right));
+            // store rcx -> [rax]; rax (dest address) is left intact afterwards.
+            if (!emit_store_scalar_float(buf, lt)) {
+                emit_store_to_rax(buf, Type_Width(lt));
+            }
+            // rax still holds the dest address -> that's our place-return value.
+            return;
+        }
+        // Aggregate/compound in place position: fall through to error for now.
+    }
+
     if (node->type == AST_IDENT) {
         Symbol* sym = node->ident.sym;
         if (!sym) {

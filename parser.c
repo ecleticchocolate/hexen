@@ -827,13 +827,30 @@ static bool parse_anonymous_aggregate_type(Type* base_t) {
             advance();
         }
         
-        if (s_curr.type != TOK_IDENTIFIER) parse_error("Expected field/variant name in anonymous aggregate");
+        // A field name is optional. If omitted, synthesize "_N" -- same scheme
+        // Struct_MakeAnon already uses internally for call-site pack bundles, so
+        // an unnamed hand-written field and a pack-expanded one land on the same
+        // name. If GIVEN, it's kept and fully meaningful (ordinary anon structs
+        // are used as real value types with real `.field` access all over the
+        // codebase -- e.g. a function returning `struct { i32 q  i32 r }` and
+        // callers doing `.q`/`.r` -- so an explicit name must never be discarded).
+        // enum payload variants are different: the variant name IS identity, so
+        // it stays required there.
+        if (anon_is_enum) {
+            if (s_curr.type != TOK_IDENTIFIER) parse_error("Expected variant name in anonymous enum");
+        }
         if (fcount >= 64) parse_error("too many fields in anonymous aggregate");
         ftypes[fcount] = ft;
-        fnames[fcount] = strndup(s_curr.start, s_curr.length);
+        if (s_curr.type == TOK_IDENTIFIER) {
+            fnames[fcount] = strndup(s_curr.start, s_curr.length);
+            advance(); // field/variant name
+        } else {
+            char fnbuf[16];
+            snprintf(fnbuf, sizeof(fnbuf), "_%zu", fcount);
+            fnames[fcount] = strdup(fnbuf);
+        }
         fcount++;
-        advance(); // field name
-        
+
         if (s_curr.type == TOK_EQ) {
             parse_error("anonymous struct fields cannot have defaults "
                         "(anonymous struct identity is its field types; use a named struct for defaults)");
@@ -2374,6 +2391,10 @@ static ASTNode* parse_expr_prec(int min_prec) {
 // bare identifier would be, since neither can ever fail to match.
 static bool pattern_covers_all(ASTNode* pat) {
     if (pat->type == AST_IDENT) return true;
+    // [GENERALIZE-LEAF] An lvalue-access leaf (`*x`, `x[i]`, `x.f`) is a total
+    // target -- assigning the projection into an existing place can never
+    // reject, exactly like a fresh bind can't. So it "covers all" too.
+    if (pat->type == AST_DEREF || pat->type == AST_INDEX || pat->type == AST_FIELD) return true;
     if (pat->type == AST_STRUCT_LITERAL && !pat->struct_lit.is_enum_variant) {
         for (size_t i = 0; i < pat->struct_lit.count; i++)
             if (!pattern_covers_all(pat->struct_lit.values[i])) return false;
@@ -2389,6 +2410,24 @@ static bool pattern_covers_all(ASTNode* pat) {
 
 static void compile_pattern(ASTNode* pat, ASTNode* scrut, Type* scrut_type, ASTNode** out_cond, ASTNode*** out_decls, size_t* decl_count, size_t* decl_cap) {
     if (pat->type == AST_IDENT) {
+        // [GENERALIZE-LEAF] If the name ALREADY exists in scope, this is a
+        // destructuring-ASSIGNMENT into it, not a re-declaration (which would be
+        // an "already declared" error). Only a fresh name declares. This makes
+        // `unpack { a, b } = t` swap into existing a,b, and lets a bare existing
+        // var appear as a leaf alongside `*x`/`x[i]`/`x.f`.
+        Symbol* existing = SymTable_Find(s_symtable, pat->ident.name, pat->ident.name_len);
+        if (existing) {
+            ASTNode* asn = new_node(AST_ASSIGN);
+            pat->ident.sym = existing;
+            asn->binary.left = pat;
+            asn->binary.right = scrut;
+            if (*decl_count >= *decl_cap) {
+                *decl_cap = (*decl_cap == 0) ? 4 : (*decl_cap * 2);
+                *out_decls = realloc(*out_decls, *decl_cap * sizeof(ASTNode*));
+            }
+            (*out_decls)[(*decl_count)++] = asn;
+            return;
+        }
         SymbolKind kind = s_symtable->is_function_scope ? SYM_LOCAL : SYM_GLOBAL;
         Symbol* sym = SymTable_Add(s_symtable, pat->ident.name, pat->ident.name_len, scrut_type, kind);
         ASTNode* decl = make_decl_stmt(scrut_type, pat->ident.name, pat->ident.name_len, sym, scrut);
@@ -2398,6 +2437,26 @@ static void compile_pattern(ASTNode* pat, ASTNode* scrut, Type* scrut_type, ASTN
             *out_decls = realloc(*out_decls, *decl_cap * sizeof(ASTNode*));
         }
         (*out_decls)[(*decl_count)++] = decl;
+        return;
+    }
+
+    // [GENERALIZE-LEAF] A pattern leaf that is an LVALUE ACCESS (`*x`, `x[i]`,
+    // `x.f`) rather than a fresh binder: instead of declaring a new name, ASSIGN
+    // the projected scrutinee into that existing place. This is destructuring-
+    // ASSIGNMENT (vs the AST_IDENT case's destructuring-DECLARATION). The leaf
+    // expression is used verbatim as the assign target -- it's already a valid
+    // lvalue by the same rules any `*x = e` / `a[i] = e` / `a.f = e` statement
+    // uses, so no new lvalue concept is introduced. Emitted as an AST_ASSIGN
+    // pushed onto the same decl list; the backend already lowers it.
+    if (pat->type == AST_DEREF || pat->type == AST_INDEX || pat->type == AST_FIELD) {
+        ASTNode* asn = new_node(AST_ASSIGN);
+        asn->binary.left = pat;      // the lvalue access, verbatim
+        asn->binary.right = scrut;   // the projected scrutinee value
+        if (*decl_count >= *decl_cap) {
+            *decl_cap = (*decl_cap == 0) ? 4 : (*decl_cap * 2);
+            *out_decls = realloc(*out_decls, *decl_cap * sizeof(ASTNode*));
+        }
+        (*out_decls)[(*decl_count)++] = asn;
         return;
     }
     
@@ -3052,9 +3111,26 @@ static ASTNode* parse_unpack(void) {
     if (!k.is_aggregate && !k.is_primitive && !k.is_ptr_or_fn)
         parse_error("unpack scrutinee must be a struct, array, primitive, pointer, or function value");
 
+    // [GENERALIZE] Auto-deref a pointer-to-aggregate when the pattern is a
+    // destructure (brace/array), not a bare bind. `unpack {..} = pp` then means
+    // "descend through the pointer, then project" -- deref is just the first
+    // access step, same story structs already tell for .field / [i]. A bare
+    // `unpack w = pp` still binds the whole pointer (pat is AST_IDENT -> skipped).
+    bool auto_deref = false;
+    Type* proj_type = st;
+    if (k.is_ptr_or_fn && st->cls == TYPE_POINTER && st->pointer_base &&
+        pat->type != AST_IDENT) {
+        ScrutKind pk = classify_scrutinee_type(st->pointer_base);
+        if (pk.is_aggregate) {
+            auto_deref = true;
+            proj_type = st->pointer_base;
+            k = pk;  // reclassify against the pointee
+        }
+    }
+
     // Positional `{a, b}` patterns need field names filled in the same way a
     // positional struct/array LITERAL does -- reuse the exact same pass.
-    if (k.is_aggregate) resolve_brace_literal(pat, st);
+    if (k.is_aggregate) resolve_brace_literal(pat, proj_type);
 
     if (!pattern_covers_all(pat))
         parse_error("unpack pattern must always match -- no literal-pinned fields "
@@ -3091,13 +3167,21 @@ static ASTNode* parse_unpack(void) {
     ASTNode* mref = new_node(AST_IDENT);
     mref->ident.name = mname; mref->ident.name_len = mn; mref->ident.sym = msym;
 
+    // [GENERALIZE] If we auto-deref'd, the projection scrutinee is *mref, and
+    // the type handed to compile_pattern is the pointee type.
+    ASTNode* proj_scrut = mref;
+    if (auto_deref) {
+        ASTNode* d = new_node(AST_DEREF); d->unary = mref;
+        proj_scrut = d;
+    }
+
     // No child scope here (unlike match arms): compile_pattern's SymTable_Add
     // calls land directly in s_symtable, i.e. the scope unpack was written in,
     // so the bound names are visible to every statement after this one.
     ASTNode* cond = NULL;
     ASTNode** decls = NULL;
     size_t decl_count = 0, decl_cap = 0;
-    compile_pattern(pat, mref, st, &cond, &decls, &decl_count, &decl_cap);
+    compile_pattern(pat, proj_scrut, proj_type, &cond, &decls, &decl_count, &decl_cap);
     // cond is always NULL here: pattern_covers_all rejected anything that would
     // set it (literals, enum variants). Nothing to check at runtime.
 
@@ -3122,7 +3206,461 @@ static ASTNode* parse_while_statement(void) {
     return node;
 }
 
+static ASTNode* parse_forin_statement(void); // fwd
+
+// [FOR-IN] Two forms, both requiring an explicit leading keyword/type:
+//   for TYPE name in ITERABLE { body }        -- single typed binding
+//   for unpack PATTERN in ITERABLE { body }   -- explicit destructure
+// Both desugar to a counting loop over 0..len(ITERABLE), binding at the top
+// of each body iteration from ITERABLE[idx]. The TYPE form produces one
+// plain typed declaration, exactly like the counting `for`'s own `TYPE i`.
+// The `unpack` form runs the *same* compile_pattern walk the standalone
+// `unpack` statement uses, so `{.x=px,.y=py}`, `{a,b}` positional, nested,
+// and array patterns all work here identically to `unpack ... = expr`.
+// There is no bare/untyped form and no un-keyworded brace form: `for x in
+// arr` and `for {a,b} in arr` are both parse errors.
+// ITERABLE is anything indexable: a built-in array, or an op-overloaded
+// container exposing `__index` + a `len()` method. The element fetch is
+// `ITERABLE[idx]`, which already dispatches through __index for overloaded
+// containers, so overloading composes for free.
+static ASTNode* parse_forin_statement(void) {
+    advance(); // past 'for'
+
+    bool is_unpack_form = (s_curr.type == TOK_UNPACK);
+    Type* decl_type = NULL;
+    Token ivar = {0};
+    ASTNode* pat = NULL;
+
+    if (is_unpack_form) {
+        advance(); // past 'unpack'
+        pat = parse_expr_prec(2); // pattern grammar, same as standalone unpack
+    } else {
+        // TYPE name -- mandatory, same grammar as any other declaration.
+        if (!curr_begins_type())
+            parse_error("Expected 'unpack' or a loop variable type after 'for' "
+                        "(e.g. `for u32 x in arr` or `for unpack {a,b} in arr`)");
+        decl_type = parse_type();
+        if (!decl_type) parse_error("Expected loop variable type after 'for'");
+        if (s_curr.type != TOK_IDENTIFIER)
+            parse_error("Expected loop variable name after type in 'for-in'");
+        ivar = s_curr; advance();
+    }
+
+    // 'in'
+    if (!(s_curr.type == TOK_IDENTIFIER && s_curr.length == 2 &&
+          strncmp(s_curr.start, "in", 2) == 0))
+        parse_error("Expected 'in' after for-in loop variable/pattern");
+    advance(); // past 'in'
+
+    // The ITERABLE expression.
+    ASTNode* iter = parse_expr_prec(0);
+    Typecheck_Tree(iter);
+    Type* itype = Type_Infer(iter);
+
+
+    // Determine length + element type.
+    // Built-in array: length is itype->array.count, element itype->array.element.
+    // Overloaded container: require a `len()` method returning an integer, and
+    // element type is __index's pointee return.
+    bool is_array = (itype && itype->cls == TYPE_ARRAY);
+    bool is_container = false;
+    // [CURSOR] O(1)-per-step protocol: iterable exposes `begin() Cursor`, and the
+    // returned Cursor exposes `next() Option[Elem]` where Option is any 2-variant
+    // enum with exactly one payload-carrying variant (the "some") and one
+    // payloadless variant (the "none"). This is the path a linked list wants: the
+    // __index/len protocol above forces O(n) random access per step (O(n^2) total)
+    // on a list, whereas next() advances a cursor in O(1). We detect this by name
+    // (`begin`, `next`) but classify the Option variants structurally, so the user
+    // can call their enum anything as long as its shape is {payload Some, None}.
+    bool is_cursor = false;
+    Type* cur_type = NULL;          // Cursor struct type (begin's return)
+    Type* opt_type = NULL;          // Option enum instance (next's return)
+    StructDef* opt_sd = NULL;       // its StructDef (is_enum)
+    int some_idx = -1, none_idx = -1;
+    Symbol* begin_fn = NULL;
+    Type* elem_type = NULL;
+    uint64_t count = 0;          // static count (arrays)
+    StructDef* csd = NULL;
+    if (is_array) {
+        count = itype->array.count;
+        elem_type = itype->array.element;
+    } else if (itype && itype->cls == TYPE_STRUCT) {
+        csd = Struct_Find(itype->struct_name);
+        // Cursor protocol takes priority when begin()->Cursor->next()->Option resolves.
+        // Use Method_Mangle (not a raw "%s_begin"-on-struct_name snprintf) so this
+        // resolves through generic_base for instantiated generics -- Vector[i32]'s
+        // `begin` lives under the mangled name `Vector_begin`, not `Vector_i32_begin`.
+        size_t bn = 0;
+        char* bmangled = Method_Mangle(itype, "begin", 5, &bn);
+        begin_fn = bmangled ? SymTable_Find(s_symtable, bmangled, bn) : NULL;
+        free(bmangled);
+        if (begin_fn && begin_fn->type && begin_fn->type->cls == TYPE_FUNCTION) {
+            cur_type = begin_fn->type->function.return_type;
+            if (cur_type && cur_type->cls == TYPE_STRUCT) {
+                size_t nn = 0;
+                char* nmangled = Method_Mangle(cur_type, "next", 4, &nn);
+                Symbol* next_fn = nmangled ? SymTable_Find(s_symtable, nmangled, nn) : NULL;
+                free(nmangled);
+                if (next_fn && next_fn->type && next_fn->type->cls == TYPE_FUNCTION) {
+                    opt_type = next_fn->type->function.return_type;
+                    opt_sd = (opt_type && opt_type->cls == TYPE_STRUCT)
+                                 ? Struct_Find(opt_type->struct_name) : NULL;
+                    if (opt_sd && opt_sd->is_enum && opt_sd->field_count == 2) {
+                        // classify: the payload-carrying variant is "some", the
+                        // payloadless one is "none". Exactly one of each required.
+                        for (size_t vi = 0; vi < 2; vi++) {
+                            if (opt_sd->fields[vi].type) { if (some_idx < 0) some_idx = (int)vi; }
+                            else                          { if (none_idx < 0) none_idx = (int)vi; }
+                        }
+                        if (some_idx >= 0 && none_idx >= 0 && some_idx != none_idx) {
+                            Type* pay = opt_sd->fields[some_idx].type;
+                            // Writable-leaf convention, same as __index: a pointer
+                            // payload binds the loop var to the pointee.
+                            elem_type = (pay && pay->cls == TYPE_POINTER) ? pay->pointer_base : pay;
+                            is_cursor = true;
+                        }
+                    }
+                }
+            }
+        }
+        if (!is_cursor) {
+            // Require both __index and len as methods (mangled free fns T___index / T_len).
+            // Element type = pointee of __index's return (writable-index convention),
+            // or its return directly if it returns a value.
+            size_t mn = 0;
+            char* imangled = Method_Mangle(itype, "__index", 7, &mn);
+            Symbol* idx_fn = imangled ? SymTable_Find(s_symtable, imangled, mn) : NULL;
+            free(imangled);
+            size_t ln = 0;
+            char* lmangled = Method_Mangle(itype, "len", 3, &ln);
+            Symbol* len_fn = lmangled ? SymTable_Find(s_symtable, lmangled, ln) : NULL;
+            free(lmangled);
+            if (idx_fn && len_fn && idx_fn->type && idx_fn->type->cls == TYPE_FUNCTION) {
+                Type* ret = idx_fn->type->function.return_type;
+                elem_type = (ret && ret->cls == TYPE_POINTER) ? ret->pointer_base : ret;
+                is_container = true;
+            }
+        }
+    }
+    if (!is_array && !is_container && !is_cursor)
+        parse_error("for-in iterable must be an array, a struct exposing "
+                    "`__index`+`len()`, or a struct exposing `begin()` returning a "
+                    "cursor with `next()` returning a 2-variant Option enum");
+
+    // [CURSOR DESUGAR] Distinct lowering:
+    //   { $it = ITERABLE; $cur = $it.begin();
+    //     while true {
+    //         Opt $o = $cur.next();
+    //         if tag($o) == none_idx { break }
+    //         <bind loopvar/pattern from $o.<some>>   // auto-deref if payload is ptr
+    //         <user body>
+    //     } }
+    // Wrapped in an outer transparent block so $it/$cur/$o stay loop-local.
+    if (is_cursor) {
+        SymbolTable* prev_table = s_symtable;
+        s_symtable = SymTable_Create(prev_table);
+        s_symtable->is_function_scope = prev_table->is_function_scope;
+        SymbolKind kind = s_symtable->is_function_scope ? SYM_LOCAL : SYM_GLOBAL;
+        static int s_cur_ctr = 0; int id = s_cur_ctr++;
+
+        char* itname = malloc(32); int itlen = snprintf(itname, 32, "$ci_it%d", id);
+        Symbol* itsym = SymTable_Add(s_symtable, itname, itlen, itype, kind);
+        char* cname = malloc(32); int clen = snprintf(cname, 32, "$ci_cur%d", id);
+        Symbol* csym = SymTable_Add(s_symtable, cname, clen, cur_type, kind);
+
+        // $it = ITERABLE
+        ASTNode* it_decl = make_decl_stmt(itype, itname, itlen, itsym, iter);
+        // $cur = $it.begin()
+        ASTNode* itref = make_ident_node(itname, itlen, itsym);
+        ASTNode* bfield = new_node(AST_FIELD);
+        bfield->field.base = itref;
+        bfield->field.field_name = "begin"; bfield->field.field_name_len = 5;
+        ASTNode* bcall = new_node(AST_CALL);
+        bcall->call.target_name = NULL; bcall->call.target_expr = bfield;
+        bcall->call.args = NULL; bcall->call.arg_count = 0;
+        ASTNode* cur_decl = make_decl_stmt(cur_type, cname, clen, csym, bcall);
+
+        // ---- loop body ----
+        s_loop_depth++;
+        if (s_curr.type != TOK_LBRACE) parse_error("Expected '{' for for-in body");
+        SymbolTable* body_prev = s_symtable;
+        s_symtable = SymTable_Create(body_prev);
+        s_symtable->is_function_scope = body_prev->is_function_scope;
+        SymbolKind bkind = s_symtable->is_function_scope ? SYM_LOCAL : SYM_GLOBAL;
+
+        // Opt $o = $cur.next()
+        char* oname = malloc(32); int olen = snprintf(oname, 32, "$ci_o%d", id);
+        Symbol* osym = SymTable_Add(s_symtable, oname, olen, opt_type, bkind);
+        ASTNode* curref = make_ident_node(cname, clen, csym);
+        ASTNode* nfield = new_node(AST_FIELD);
+        nfield->field.base = curref;
+        nfield->field.field_name = "next"; nfield->field.field_name_len = 4;
+        ASTNode* ncall = new_node(AST_CALL);
+        ncall->call.target_name = NULL; ncall->call.target_expr = nfield;
+        ncall->call.args = NULL; ncall->call.arg_count = 0;
+        ASTNode* o_decl = make_decl_stmt(opt_type, oname, olen, osym, ncall);
+
+        // if tag($o) == none_idx { break }   -- tag read = *(u32*)&$o
+        ASTNode* oref = make_ident_node(oname, olen, osym);
+        ASTNode* addr = new_node(AST_ADDR); addr->unary = oref;
+        Type* u32t = (Type*)calloc(1, sizeof(Type)); u32t->cls = TYPE_PRIMITIVE; u32t->primitive = PRIM_U32;
+        Type* u32p = (Type*)calloc(1, sizeof(Type)); u32p->cls = TYPE_POINTER; u32p->pointer_base = u32t;
+        ASTNode* c = new_node(AST_CAST); c->cast.target_type = u32p; c->cast.expr = addr;
+        ASTNode* tagread = new_node(AST_DEREF); tagread->unary = c;
+        ASTNode* nlit = new_node(AST_INT_LITERAL); nlit->lit_kind = LIT_INT; nlit->int_value = (uint64_t)none_idx;
+        ASTNode* eqn = new_node(AST_EQ); eqn->binary.left = tagread; eqn->binary.right = nlit;
+        ASTNode* brk = new_node(AST_BREAK);
+        ASTNode* brk_blk = new_node(AST_BLOCK);
+        brk_blk->block.capacity = 1; brk_blk->block.count = 1;
+        brk_blk->block.statements = malloc(sizeof(ASTNode*));
+        brk_blk->block.statements[0] = brk;
+        ASTNode* if_none = new_node(AST_IF);
+        if_none->if_stmt.condition = eqn;
+        if_none->if_stmt.true_block = brk_blk;
+        if_none->if_stmt.false_block = NULL;
+
+        // payload access: $o.<some-variant-name>  (an enum field read, same shape
+        // the match payload branch produces). If payload was a pointer, deref it
+        // so the loop var binds the pointee (writable leaf).
+        ASTNode* oref2 = make_ident_node(oname, olen, osym);
+        ASTNode* pfield = new_node(AST_FIELD);
+        pfield->field.base = oref2;
+        pfield->field.field_name = opt_sd->fields[some_idx].name;
+        pfield->field.field_name_len = strlen(opt_sd->fields[some_idx].name);
+        Type* pay = opt_sd->fields[some_idx].type;
+        ASTNode* elem_access = pfield;
+        // Writable-leaf / manual-reference rule: the payload is `T*`. If the user
+        // declared the loop var as `T` (the pointee), auto-deref so they bind a
+        // copy of the value. If they declared it as `T*` (matching the payload),
+        // bind the pointer as-is -- assignment copies the pointer, and `*p = ...`
+        // in the body writes through to the real element. No special write-back
+        // machinery: manual referencing is the idiom, and it just falls out.
+        // (Only the TYPE form can spell a pointer; the unpack form always derefs
+        // to destructure the pointee aggregate.)
+        bool user_wants_ptr = (!is_unpack_form && decl_type &&
+                               pay && pay->cls == TYPE_POINTER &&
+                               Type_Equals(decl_type, pay));
+        if (pay && pay->cls == TYPE_POINTER && !user_wants_ptr) {
+            ASTNode* d = new_node(AST_DEREF); d->unary = pfield; elem_access = d;
+        }
+
+        // bind: TYPE form -> one decl; unpack form -> compile_pattern walk
+        ASTNode** bind_decls = NULL; size_t bind_count = 0;
+        if (is_unpack_form) {
+            if (Type_IsAggregate(elem_type)) resolve_brace_literal(pat, elem_type);
+            if (!pattern_covers_all(pat))
+                parse_error("for-in unpack pattern must always match");
+            ASTNode* cond2 = NULL; ASTNode** pdecls = NULL; size_t pdc = 0, pdcap = 0;
+            compile_pattern(pat, elem_access, elem_type, &cond2, &pdecls, &pdc, &pdcap);
+            bind_decls = pdecls; bind_count = pdc;
+        } else {
+            Symbol* ivsym = SymTable_Add(s_symtable, ivar.start, ivar.length, decl_type, bkind);
+            ASTNode* ivdecl = make_decl_stmt(decl_type, ivar.start, ivar.length, ivsym, elem_access);
+            Typecheck_Tree(ivdecl);
+            bind_decls = malloc(sizeof(ASTNode*)); bind_decls[0] = ivdecl; bind_count = 1;
+        }
+
+        ASTNode* user_body = parse_block_body();
+        s_loop_depth--;
+
+        // while-body block = [ $o decl, if-none-break, bind..., user stmts ]
+        ASTNode* wbody = new_node(AST_BLOCK);
+        size_t total = 2 + bind_count + user_body->block.count;
+        wbody->block.capacity = total; wbody->block.count = 0;
+        wbody->block.statements = malloc(total * sizeof(ASTNode*));
+        wbody->block.statements[wbody->block.count++] = o_decl;
+        wbody->block.statements[wbody->block.count++] = if_none;
+        for (size_t i = 0; i < bind_count; i++) wbody->block.statements[wbody->block.count++] = bind_decls[i];
+        for (size_t i = 0; i < user_body->block.count; i++)
+            wbody->block.statements[wbody->block.count++] = user_body->block.statements[i];
+        if (bind_decls) free(bind_decls);
+
+        ASTNode* tru = make_int_literal(1, LIT_BOOL);
+        ASTNode* wloop = new_node(AST_WHILE);
+        wloop->while_stmt.condition = tru;
+        wloop->while_stmt.body = wbody;
+
+        s_symtable = prev_table;
+
+        // outer transparent block holding $it/$cur + the while loop
+        ASTNode* outer = new_node(AST_BLOCK);
+        outer->block.capacity = 3; outer->block.count = 0;
+        outer->block.statements = malloc(3 * sizeof(ASTNode*));
+        outer->block.transparent = true;
+        outer->block.statements[outer->block.count++] = it_decl;
+        outer->block.statements[outer->block.count++] = cur_decl;
+        outer->block.statements[outer->block.count++] = wloop;
+        if (s_curr.type == TOK_SEMI) advance();
+        return outer;
+    }
+
+    SymbolTable* prev_table = s_symtable;
+    s_symtable = SymTable_Create(prev_table);
+    s_symtable->is_function_scope = prev_table->is_function_scope;
+    SymbolKind kind = s_symtable->is_function_scope ? SYM_LOCAL : SYM_GLOBAL;
+
+    static int s_forin_ctr = 0;
+    int id = s_forin_ctr++;
+
+    // Materialize the iterable into a temp (evaluate once).
+    char* itname = malloc(32); int itlen = snprintf(itname, 32, "$fi_it%d", id);
+    Symbol* itsym = SymTable_Add(s_symtable, itname, itlen, itype, kind);
+
+    // Index counter.
+    Type* u64t = (Type*)calloc(1, sizeof(Type)); u64t->cls = TYPE_PRIMITIVE; u64t->primitive = PRIM_U64;
+    char* ixname = malloc(32); int ixlen = snprintf(ixname, 32, "$fi_ix%d", id);
+    Symbol* ixsym = SymTable_Add(s_symtable, ixname, ixlen, u64t, kind);
+
+    #define ITREF() ({ ASTNode* r = new_node(AST_IDENT); r->ident.name = itname; \
+                       r->ident.name_len = itlen; r->ident.sym = itsym; r; })
+    #define IXREF() ({ ASTNode* r = new_node(AST_IDENT); r->ident.name = ixname; \
+                       r->ident.name_len = ixlen; r->ident.sym = ixsym; r; })
+
+    // init block: $fi_it = iter ; $fi_ix = 0
+    ASTNode* it_decl = make_decl_stmt(itype, itname, itlen, itsym, iter);
+    ASTNode* zero = new_node(AST_INT_LITERAL); zero->lit_kind = LIT_INT; zero->int_value = 0;
+    ASTNode* ix_decl = make_decl_stmt(u64t, ixname, ixlen, ixsym, zero);
+
+    ASTNode* init = new_node(AST_BLOCK);
+    init->block.capacity = 2; init->block.count = 0;
+    init->block.statements = malloc(init->block.capacity * sizeof(ASTNode*));
+    init->block.transparent = true;
+    init->block.statements[init->block.count++] = it_decl;
+    init->block.statements[init->block.count++] = ix_decl;
+
+    // cond: $fi_ix < len.  For arrays len is a static literal; for containers we
+    // hoist a one-time len() call into $fi_len (evaluated once in init).
+    ASTNode* len_ref = NULL;
+    if (is_array) {
+        ASTNode* cnt = new_node(AST_INT_LITERAL); cnt->lit_kind = LIT_INT; cnt->int_value = count;
+        len_ref = cnt;
+    } else {
+        // $fi_len = $fi_it.len()
+        char* lname = malloc(32); int llen = snprintf(lname, 32, "$fi_len%d", id);
+        Symbol* lsym = SymTable_Add(s_symtable, lname, llen, u64t, kind);
+        ASTNode* lfield = new_node(AST_FIELD);
+        lfield->field.base = ITREF();
+        lfield->field.field_name = "len"; lfield->field.field_name_len = 3;
+        ASTNode* lcall = new_node(AST_CALL);
+        lcall->call.target_name = NULL; lcall->call.target_expr = lfield;
+        lcall->call.args = NULL; lcall->call.arg_count = 0;
+        ASTNode* ldecl = make_decl_stmt(u64t, lname, llen, lsym, lcall);
+        // append to init block (grow)
+        if (init->block.count >= init->block.capacity) {
+            init->block.capacity *= 2;
+            init->block.statements = realloc(init->block.statements, init->block.capacity*sizeof(ASTNode*));
+        }
+        init->block.statements[init->block.count++] = ldecl;
+        ASTNode* lr = new_node(AST_IDENT); lr->ident.name = lname; lr->ident.name_len = llen; lr->ident.sym = lsym;
+        len_ref = lr;
+    }
+    ASTNode* cond = new_node(AST_LT); cond->binary.left = IXREF(); cond->binary.right = len_ref;
+
+    // incr: $fi_ix = $fi_ix + 1
+    ASTNode* one = new_node(AST_INT_LITERAL); one->lit_kind = LIT_INT; one->int_value = 1;
+    ASTNode* add = new_node(AST_ADD); add->binary.left = IXREF(); add->binary.right = one;
+    ASTNode* incr = new_node(AST_ASSIGN); incr->binary.left = IXREF(); incr->binary.right = add;
+
+    // Body: bind from $fi_it[$fi_ix], either as one plain typed decl (TYPE
+    // form -- exactly like any other `TYPE name = expr`) or via the same
+    // compile_pattern walk the standalone `unpack` statement uses (unpack
+    // form -- destructure spliced at the top of the body, one decl/assign
+    // per bound name, same as `unpack PATTERN = expr` produces).
+    s_loop_depth++;
+    if (s_curr.type != TOK_LBRACE) parse_error("Expected '{' for for-in body");
+    SymbolTable* body_prev = s_symtable;
+    s_symtable = SymTable_Create(body_prev);
+    s_symtable->is_function_scope = body_prev->is_function_scope;
+
+    ASTNode* elem_access = new_node(AST_INDEX);
+    elem_access->index.base = ITREF();
+    elem_access->index.index = IXREF();
+
+    ASTNode** bind_decls = NULL;
+    size_t bind_count = 0;
+
+    if (is_unpack_form) {
+        // Positional `{a, b}` patterns need field names filled in first,
+        // same pass the standalone unpack statement runs.
+        if (Type_IsAggregate(elem_type)) resolve_brace_literal(pat, elem_type);
+        if (!pattern_covers_all(pat))
+            parse_error("for-in unpack pattern must always match -- no literal-pinned "
+                        "fields or enum-variant patterns are allowed here; use `match` "
+                        "inside the body for anything refutable");
+        ASTNode* cond2 = NULL;
+        ASTNode** pdecls = NULL; size_t pdc = 0, pdcap = 0;
+        compile_pattern(pat, elem_access, elem_type, &cond2, &pdecls, &pdc, &pdcap);
+        bind_decls = pdecls;
+        bind_count = pdc;
+    } else {
+        SymbolKind ivkind = s_symtable->is_function_scope ? SYM_LOCAL : SYM_GLOBAL;
+        Symbol* ivsym = SymTable_Add(s_symtable, ivar.start, ivar.length, decl_type, ivkind);
+        ASTNode* ivdecl = make_decl_stmt(decl_type, ivar.start, ivar.length, ivsym, elem_access);
+        Typecheck_Tree(ivdecl);
+        bind_decls = malloc(sizeof(ASTNode*));
+        bind_decls[0] = ivdecl;
+        bind_count = 1;
+    }
+
+    ASTNode* user_body = parse_block_body();
+    s_loop_depth--;
+
+    // Merge: new block = bind_decls[...] ++ user_body.statements
+    ASTNode* body = new_node(AST_BLOCK);
+    size_t total = bind_count + user_body->block.count;
+    body->block.capacity = total < 1 ? 1 : total;
+    body->block.count = 0;
+    body->block.statements = malloc(body->block.capacity * sizeof(ASTNode*));
+    for (size_t i = 0; i < bind_count; i++) body->block.statements[body->block.count++] = bind_decls[i];
+    for (size_t i = 0; i < user_body->block.count; i++)
+        body->block.statements[body->block.count++] = user_body->block.statements[i];
+    if (bind_decls) free(bind_decls);
+
+    s_symtable = prev_table;
+
+    ASTNode* node = new_node(AST_FOR);
+    node->for_stmt.init = init;
+    node->for_stmt.cond = cond;
+    node->for_stmt.incr = incr;
+    node->for_stmt.body = body;
+    #undef ITREF
+    #undef IXREF
+    return node;
+}
+
 static ASTNode* parse_for_statement(void) {
+    // [FOR-IN] Two, and only two, legal for-in header spellings, both
+    // requiring an explicit keyword up front so neither is ever silently
+    // inferred -- matching C++'s rule that the binding slot in a range-for
+    // always names something (a type, or `auto`), never bare:
+    //   for TYPE name in EXPR { ... }        -- single typed binding
+    //   for unpack PATTERN in EXPR { ... }   -- explicit destructure
+    // A bare `for x in arr` or an un-keyworded `for {a,b} in arr` are both
+    // parse errors -- there is no implicit/untyped for-in form.
+    //
+    // Disambiguate from the counting `for TYPE i = A to B`, which is also
+    // type-first: speculatively parse `TYPE name` and peek for `in` (for-in)
+    // vs `=` (counting-for). `unpack` as the very next token after `for` is
+    // unambiguous on its own -- counting-for can never start with `unpack`.
+    {
+        LexerState save; Lexer_Save(&save); Token save_cur = s_curr;
+        advance(); // past 'for', to look at what follows
+        bool is_forin = false;
+        if (s_curr.type == TOK_UNPACK) {
+            is_forin = true;
+        } else if (curr_begins_type()) {
+            parse_type(); // consumes the type; result unused, this is a peek
+            if (s_curr.type == TOK_IDENTIFIER) {
+                advance(); // consume the name
+                if (s_curr.type == TOK_IDENTIFIER && s_curr.length == 2 &&
+                    strncmp(s_curr.start, "in", 2) == 0) {
+                    is_forin = true;
+                }
+            }
+        }
+        Lexer_Restore(&save); s_curr = save_cur;
+        if (is_forin) return parse_forin_statement();
+    }
     // Range for: `for TYPE i = A to B [by S] { body }`, exclusive end.
     //   init: TYPE i = A
     //   cond: i < B  (S>=0)  or  i > B  (S<0)

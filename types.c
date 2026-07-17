@@ -3776,6 +3776,11 @@ bool base_is_lvalue(ASTNode* node) {
                                 (Type_Infer(node->field.base) &&
                                  Type_Infer(node->field.base)->cls == TYPE_POINTER);
         case AST_INDEX:  return true; // a[i] is always addressable (array or ptr base)
+        // [PLACE-RETURN] A scalar assignment is an addressable place: it writes
+        // to (and yields the address of) its destination. `&(a=b)` and further
+        // access through the result are lvalues, mirroring compile_lvalue's
+        // AST_ASSIGN case.
+        case AST_ASSIGN: return base_is_lvalue(node->binary.left);
         default:         return false;
     }
 }
