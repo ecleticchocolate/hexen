@@ -4,9 +4,27 @@
 #include <string.h>
 #include <setjmp.h>
 
+// Generic dynamic-array push: grows `arr` (realloc, doubling) when `count`
+// reaches `cap`, then appends `item`. Handles cap==0 (initial allocation).
+#define DA_PUSH(arr, count, cap, item) do { \
+    if ((count) >= (cap)) { (cap) = (cap) ? (cap)*2 : 4; \
+        (arr) = realloc((arr), (cap)*sizeof(*(arr))); } \
+    (arr)[(count)++] = (item); \
+} while (0)
+
 static ASTNode* parse_statement(void);
 static ASTNode* parse_top_level(void);
-static ASTNode* parse_fn_decl(bool is_pub, bool is_extern);
+static ASTNode* parse_impl_block(bool is_pub);
+// impl_type_name/impl_type_len/impl_sd are non-NULL/non-zero only when parsing
+// a method inside an `impl TYPE { ... }` block: the parsed fn is then mangled
+// to `TYPE_method`, gets an injected `TYPE* self` first parameter, and its
+// generic scope is seeded from the struct's own type params before its own
+// (optional) `[...]` extension is parsed. impl_type_name must outlive the
+// call (it's stored on the AST and on self's Type) -- callers pass the
+// original, non-freed token text.
+static ASTNode* parse_fn_decl(bool is_pub, bool is_extern,
+                              const char* impl_type_name, size_t impl_type_len,
+                              StructDef* impl_sd);
 static ASTNode* parse_expr_prec(int min_prec);
 static ASTNode* parse_block_body(void);
 static ASTNode* parse_alias_decl(void);
@@ -1717,6 +1735,25 @@ static ASTNode* parse_if_expr(void) {
     return NULL;
 }
 
+// Bare, payload-less enum-variant node shell: `.Variant` with the type still
+// inferred from context (resolved from target in typecheck). Shared by every
+// `.Variant` / `.Variant{payload}` parse site; callers that allow a payload
+// fill node->struct_lit.values[0]/count themselves after checking for one --
+// what differs between sites is how (or whether) a following '{' is read as
+// a payload wrapper, not how the bare node is built.
+static ASTNode* make_enum_variant_node(Token vtok) {
+    ASTNode* node = new_node(AST_STRUCT_LITERAL);
+    node->struct_lit.sdef = NULL;            // resolved from target in typecheck
+    node->struct_lit.is_enum_variant = true;
+    node->struct_lit.field_names = malloc(sizeof(char*));
+    node->struct_lit.field_name_lens = malloc(sizeof(size_t));
+    node->struct_lit.values = malloc(sizeof(ASTNode*));
+    node->struct_lit.field_names[0] = vtok.start;
+    node->struct_lit.field_name_lens[0] = vtok.length;
+    node->struct_lit.count = 0;              // payload count: 0 or 1
+    return node;
+}
+
 // `.Variant` / `.Variant{payload}` -- an enum literal with the type inferred from
 // context. Split out of parse_primary.
 static ASTNode* parse_enum_literal(void) {
@@ -1731,15 +1768,7 @@ static ASTNode* parse_enum_literal(void) {
         advance();
         if (s_curr.type != TOK_IDENTIFIER) parse_error("Expected variant name after '.'");
         Token vtok = s_curr; advance();
-        ASTNode* node = new_node(AST_STRUCT_LITERAL);
-        node->struct_lit.sdef = NULL;            // resolved from target in typecheck
-        node->struct_lit.is_enum_variant = true;
-        node->struct_lit.field_names = malloc(sizeof(char*));
-        node->struct_lit.field_name_lens = malloc(sizeof(size_t));
-        node->struct_lit.values = malloc(sizeof(ASTNode*));
-        node->struct_lit.field_names[0] = vtok.start;
-        node->struct_lit.field_name_lens[0] = vtok.length;
-        node->struct_lit.count = 0;              // payload count: 0 or 1
+        ASTNode* node = make_enum_variant_node(vtok);
         if (s_curr.type == TOK_LBRACE) {
             advance();
             if (s_curr.type != TOK_RBRACE) {
@@ -2408,6 +2437,25 @@ static bool pattern_covers_all(ASTNode* pat) {
     return false;
 }
 
+// Read an enum's tag out of `scrut`: *(u32*)&scrut. Both compile_pattern's
+// `.Variant` case and the cursor for-in desugar build this same read to
+// compare against a variant index.
+static ASTNode* make_tag_read(ASTNode* scrut) {
+    ASTNode* addr = new_node(AST_ADDR); addr->unary = scrut;
+    Type* u32t = (Type*)calloc(1, sizeof(Type)); u32t->cls = TYPE_PRIMITIVE; u32t->primitive = PRIM_U32;
+    Type* u32p = (Type*)calloc(1, sizeof(Type)); u32p->cls = TYPE_POINTER; u32p->pointer_base = u32t;
+    ASTNode* c = new_node(AST_CAST); c->cast.target_type = u32p; c->cast.expr = addr;
+    ASTNode* d = new_node(AST_DEREF); d->unary = c;
+    return d;
+}
+// Build `tag(scrut) == idx`.
+static ASTNode* make_tag_eq(ASTNode* scrut, int idx) {
+    ASTNode* tag = make_tag_read(scrut);
+    ASTNode* lit = new_node(AST_INT_LITERAL); lit->lit_kind = LIT_INT; lit->int_value = (uint64_t)idx;
+    ASTNode* eq = new_node(AST_EQ); eq->binary.left = tag; eq->binary.right = lit;
+    return eq;
+}
+
 static void compile_pattern(ASTNode* pat, ASTNode* scrut, Type* scrut_type, ASTNode** out_cond, ASTNode*** out_decls, size_t* decl_count, size_t* decl_cap) {
     if (pat->type == AST_IDENT) {
         // [GENERALIZE-LEAF] If the name ALREADY exists in scope, this is a
@@ -2421,22 +2469,13 @@ static void compile_pattern(ASTNode* pat, ASTNode* scrut, Type* scrut_type, ASTN
             pat->ident.sym = existing;
             asn->binary.left = pat;
             asn->binary.right = scrut;
-            if (*decl_count >= *decl_cap) {
-                *decl_cap = (*decl_cap == 0) ? 4 : (*decl_cap * 2);
-                *out_decls = realloc(*out_decls, *decl_cap * sizeof(ASTNode*));
-            }
-            (*out_decls)[(*decl_count)++] = asn;
+            DA_PUSH(*out_decls, *decl_count, *decl_cap, asn);
             return;
         }
         SymbolKind kind = s_symtable->is_function_scope ? SYM_LOCAL : SYM_GLOBAL;
         Symbol* sym = SymTable_Add(s_symtable, pat->ident.name, pat->ident.name_len, scrut_type, kind);
         ASTNode* decl = make_decl_stmt(scrut_type, pat->ident.name, pat->ident.name_len, sym, scrut);
-
-        if (*decl_count >= *decl_cap) {
-            *decl_cap = (*decl_cap == 0) ? 4 : (*decl_cap * 2);
-            *out_decls = realloc(*out_decls, *decl_cap * sizeof(ASTNode*));
-        }
-        (*out_decls)[(*decl_count)++] = decl;
+        DA_PUSH(*out_decls, *decl_count, *decl_cap, decl);
         return;
     }
 
@@ -2452,11 +2491,7 @@ static void compile_pattern(ASTNode* pat, ASTNode* scrut, Type* scrut_type, ASTN
         ASTNode* asn = new_node(AST_ASSIGN);
         asn->binary.left = pat;      // the lvalue access, verbatim
         asn->binary.right = scrut;   // the projected scrutinee value
-        if (*decl_count >= *decl_cap) {
-            *decl_cap = (*decl_cap == 0) ? 4 : (*decl_cap * 2);
-            *out_decls = realloc(*out_decls, *decl_cap * sizeof(ASTNode*));
-        }
-        (*out_decls)[(*decl_count)++] = asn;
+        DA_PUSH(*out_decls, *decl_count, *decl_cap, asn);
         return;
     }
     
@@ -2481,15 +2516,7 @@ static void compile_pattern(ASTNode* pat, ASTNode* scrut, Type* scrut_type, ASTN
         int vidx = Enum_VariantIndex(sd, pat->struct_lit.field_names[0], pat->struct_lit.field_name_lens[0]);
         if (vidx < 0) parse_error("match arm names a variant this enum does not have");
 
-        // tag read: *(u32*)&scrut
-        ASTNode* addr = new_node(AST_ADDR); addr->unary = scrut;
-        Type* u32t = (Type*)calloc(1, sizeof(Type)); u32t->cls = TYPE_PRIMITIVE; u32t->primitive = PRIM_U32;
-        Type* u32p = (Type*)calloc(1, sizeof(Type)); u32p->cls = TYPE_POINTER; u32p->pointer_base = u32t;
-        ASTNode* c = new_node(AST_CAST); c->cast.target_type = u32p; c->cast.expr = addr;
-        ASTNode* tagread = new_node(AST_DEREF); tagread->unary = c;
-
-        ASTNode* idxlit = new_node(AST_INT_LITERAL); idxlit->lit_kind = LIT_INT; idxlit->int_value = (uint64_t)vidx;
-        ASTNode* eq = new_node(AST_EQ); eq->binary.left = tagread; eq->binary.right = idxlit;
+        ASTNode* eq = make_tag_eq(scrut, vidx);
 
         if (*out_cond == NULL) {
             *out_cond = eq;
@@ -2592,12 +2619,7 @@ static MatchChain matchchain_begin(void) {
 }
 
 static void matchchain_push_stmt(MatchChain* mc, ASTNode* stmt) {
-    ASTNode* blk = mc->outer;
-    if (blk->block.count >= blk->block.capacity) {
-        blk->block.capacity *= 2;
-        blk->block.statements = realloc(blk->block.statements, blk->block.capacity * sizeof(ASTNode*));
-    }
-    blk->block.statements[blk->block.count++] = stmt;
+    append_block_statement(mc->outer, stmt);
 }
 
 // Attach one arm to the chain. `armblk` is the arm's already-parsed body.
@@ -2674,15 +2696,7 @@ static ASTNode* parse_match_value(ASTNode* scrut, Type* st) {
             advance(); // '.'
             if (s_curr.type != TOK_IDENTIFIER) parse_error("Expected variant name after '.'");
             Token vtok = s_curr; advance();
-            ASTNode* node = new_node(AST_STRUCT_LITERAL);
-            node->struct_lit.sdef = NULL;
-            node->struct_lit.is_enum_variant = true;
-            node->struct_lit.field_names = malloc(sizeof(char*));
-            node->struct_lit.field_name_lens = malloc(sizeof(size_t));
-            node->struct_lit.values = malloc(sizeof(ASTNode*));
-            node->struct_lit.field_names[0] = vtok.start;
-            node->struct_lit.field_name_lens[0] = vtok.length;
-            node->struct_lit.count = 0;
+            ASTNode* node = make_enum_variant_node(vtok);
 
             if (s_curr.type == TOK_LBRACE) {
                 LexerState psave; Lexer_Save(&psave); Token pcur_save = s_curr;
@@ -3147,10 +3161,6 @@ static ASTNode* parse_unpack(void) {
     // AST_BLOCK case scopes every block it sees unless told otherwise -- mark
     // this one transparent so comptime folding matches runtime semantics.
     outer->block.transparent = true;
-    #define UPUSH(s) do { if (outer->block.count >= outer->block.capacity) { \
-        outer->block.capacity *= 2; outer->block.statements = realloc(outer->block.statements, \
-        outer->block.capacity * sizeof(ASTNode*)); } \
-        outer->block.statements[outer->block.count++] = (s); } while(0)
 
     // Materialize the scrutinee into a temp first, exactly like match does --
     // so a scrutinee with side effects (a call, an index into something
@@ -3162,7 +3172,7 @@ static ASTNode* parse_unpack(void) {
     Symbol* msym = SymTable_Add(s_symtable, mname, mn, st, kind);
 
     ASTNode* mdecl = make_decl_stmt(st, mname, mn, msym, scrut);
-    UPUSH(mdecl);
+    append_block_statement(outer, mdecl);
 
     ASTNode* mref = new_node(AST_IDENT);
     mref->ident.name = mname; mref->ident.name_len = mn; mref->ident.sym = msym;
@@ -3185,9 +3195,8 @@ static ASTNode* parse_unpack(void) {
     // cond is always NULL here: pattern_covers_all rejected anything that would
     // set it (literals, enum variants). Nothing to check at runtime.
 
-    for (size_t i = 0; i < decl_count; i++) UPUSH(decls[i]);
+    for (size_t i = 0; i < decl_count; i++) append_block_statement(outer, decls[i]);
     if (decls) free(decls);
-    #undef UPUSH
 
     if (s_curr.type == TOK_SEMI) advance(); // optional separator
 
@@ -3223,6 +3232,18 @@ static ASTNode* parse_forin_statement(void); // fwd
 // container exposing `__index` + a `len()` method. The element fetch is
 // `ITERABLE[idx]`, which already dispatches through __index for overloaded
 // containers, so overloading composes for free.
+
+// A method resolved through its receiver's generic base (Method_Mangle) still
+// has that base's own declared type as its return type. If `recv_sd` is a
+// concrete instantiation, substitute its args into `ret` so the result names
+// the actual instantiated type instead of the base's bare type-param symbol.
+static Type* specialize_return(Type* ret, StructDef* recv_sd) {
+    if (ret && recv_sd && recv_sd->generic_base && recv_sd->type_arg_count > 0) {
+        return Type_Substitute(ret, recv_sd->generic_base->type_params,
+                               recv_sd->type_args, recv_sd->type_arg_count);
+    }
+    return ret;
+}
 static ASTNode* parse_forin_statement(void) {
     advance(); // past 'for'
 
@@ -3258,18 +3279,10 @@ static ASTNode* parse_forin_statement(void) {
     Type* itype = Type_Infer(iter);
 
 
-    // Determine length + element type.
-    // Built-in array: length is itype->array.count, element itype->array.element.
-    // Overloaded container: require a `len()` method returning an integer, and
-    // element type is __index's pointee return.
-    bool is_array = (itype && itype->cls == TYPE_ARRAY);
-    bool is_container = false;
     // [CURSOR] O(1)-per-step protocol: iterable exposes `begin() Cursor`, and the
     // returned Cursor exposes `next() Option[Elem]` where Option is any 2-variant
     // enum with exactly one payload-carrying variant (the "some") and one
-    // payloadless variant (the "none"). This is the path a linked list wants: the
-    // __index/len protocol above forces O(n) random access per step (O(n^2) total)
-    // on a list, whereas next() advances a cursor in O(1). We detect this by name
+    // payloadless variant (the "none"). We detect this by name
     // (`begin`, `next`) but classify the Option variants structurally, so the user
     // can call their enum anything as long as its shape is {payload Some, None}.
     bool is_cursor = false;
@@ -3279,12 +3292,8 @@ static ASTNode* parse_forin_statement(void) {
     int some_idx = -1, none_idx = -1;
     Symbol* begin_fn = NULL;
     Type* elem_type = NULL;
-    uint64_t count = 0;          // static count (arrays)
     StructDef* csd = NULL;
-    if (is_array) {
-        count = itype->array.count;
-        elem_type = itype->array.element;
-    } else if (itype && itype->cls == TYPE_STRUCT) {
+    if (itype && itype->cls == TYPE_STRUCT) {
         csd = Struct_Find(itype->struct_name);
         // Cursor protocol takes priority when begin()->Cursor->next()->Option resolves.
         // Use Method_Mangle (not a raw "%s_begin"-on-struct_name snprintf) so this
@@ -3295,14 +3304,23 @@ static ASTNode* parse_forin_statement(void) {
         begin_fn = bmangled ? SymTable_Find(s_symtable, bmangled, bn) : NULL;
         free(bmangled);
         if (begin_fn && begin_fn->type && begin_fn->type->cls == TYPE_FUNCTION) {
-            cur_type = begin_fn->type->function.return_type;
+            // A method found through the GENERIC BASE (comment above) has its
+            // return type still in terms of THAT struct's own type params (e.g.
+            // `Cur[T, N]` verbatim), even when its receiver was a concrete
+            // instantiation. Substitute using the receiver's actual args so a
+            // generic Cursor (and its generic next()) resolve to concrete types
+            // instead of the bare param symbol -- else the loop var typechecks
+            // as `T` itself. Applied once for begin()'s receiver (itype/csd) and
+            // again for next()'s receiver (cur_type, once known).
+            cur_type = specialize_return(begin_fn->type->function.return_type, csd);
             if (cur_type && cur_type->cls == TYPE_STRUCT) {
                 size_t nn = 0;
                 char* nmangled = Method_Mangle(cur_type, "next", 4, &nn);
                 Symbol* next_fn = nmangled ? SymTable_Find(s_symtable, nmangled, nn) : NULL;
                 free(nmangled);
                 if (next_fn && next_fn->type && next_fn->type->cls == TYPE_FUNCTION) {
-                    opt_type = next_fn->type->function.return_type;
+                    StructDef* cur_sd_concrete = Struct_Find(cur_type->struct_name);
+                    opt_type = specialize_return(next_fn->type->function.return_type, cur_sd_concrete);
                     opt_sd = (opt_type && opt_type->cls == TYPE_STRUCT)
                                  ? Struct_Find(opt_type->struct_name) : NULL;
                     if (opt_sd && opt_sd->is_enum && opt_sd->field_count == 2) {
@@ -3323,28 +3341,9 @@ static ASTNode* parse_forin_statement(void) {
                 }
             }
         }
-        if (!is_cursor) {
-            // Require both __index and len as methods (mangled free fns T___index / T_len).
-            // Element type = pointee of __index's return (writable-index convention),
-            // or its return directly if it returns a value.
-            size_t mn = 0;
-            char* imangled = Method_Mangle(itype, "__index", 7, &mn);
-            Symbol* idx_fn = imangled ? SymTable_Find(s_symtable, imangled, mn) : NULL;
-            free(imangled);
-            size_t ln = 0;
-            char* lmangled = Method_Mangle(itype, "len", 3, &ln);
-            Symbol* len_fn = lmangled ? SymTable_Find(s_symtable, lmangled, ln) : NULL;
-            free(lmangled);
-            if (idx_fn && len_fn && idx_fn->type && idx_fn->type->cls == TYPE_FUNCTION) {
-                Type* ret = idx_fn->type->function.return_type;
-                elem_type = (ret && ret->cls == TYPE_POINTER) ? ret->pointer_base : ret;
-                is_container = true;
-            }
-        }
     }
-    if (!is_array && !is_container && !is_cursor)
-        parse_error("for-in iterable must be an array, a struct exposing "
-                    "`__index`+`len()`, or a struct exposing `begin()` returning a "
+    if (!is_cursor)
+        parse_error("for-in iterable must be a struct exposing `begin()` returning a "
                     "cursor with `next()` returning a 2-variant Option enum");
 
     // [CURSOR DESUGAR] Distinct lowering:
@@ -3356,276 +3355,137 @@ static ASTNode* parse_forin_statement(void) {
     //         <user body>
     //     } }
     // Wrapped in an outer transparent block so $it/$cur/$o stay loop-local.
-    if (is_cursor) {
-        SymbolTable* prev_table = s_symtable;
-        s_symtable = SymTable_Create(prev_table);
-        s_symtable->is_function_scope = prev_table->is_function_scope;
-        SymbolKind kind = s_symtable->is_function_scope ? SYM_LOCAL : SYM_GLOBAL;
-        static int s_cur_ctr = 0; int id = s_cur_ctr++;
-
-        char* itname = malloc(32); int itlen = snprintf(itname, 32, "$ci_it%d", id);
-        Symbol* itsym = SymTable_Add(s_symtable, itname, itlen, itype, kind);
-        char* cname = malloc(32); int clen = snprintf(cname, 32, "$ci_cur%d", id);
-        Symbol* csym = SymTable_Add(s_symtable, cname, clen, cur_type, kind);
-
-        // $it = ITERABLE
-        ASTNode* it_decl = make_decl_stmt(itype, itname, itlen, itsym, iter);
-        // $cur = $it.begin()
-        ASTNode* itref = make_ident_node(itname, itlen, itsym);
-        ASTNode* bfield = new_node(AST_FIELD);
-        bfield->field.base = itref;
-        bfield->field.field_name = "begin"; bfield->field.field_name_len = 5;
-        ASTNode* bcall = new_node(AST_CALL);
-        bcall->call.target_name = NULL; bcall->call.target_expr = bfield;
-        bcall->call.args = NULL; bcall->call.arg_count = 0;
-        ASTNode* cur_decl = make_decl_stmt(cur_type, cname, clen, csym, bcall);
-
-        // ---- loop body ----
-        s_loop_depth++;
-        if (s_curr.type != TOK_LBRACE) parse_error("Expected '{' for for-in body");
-        SymbolTable* body_prev = s_symtable;
-        s_symtable = SymTable_Create(body_prev);
-        s_symtable->is_function_scope = body_prev->is_function_scope;
-        SymbolKind bkind = s_symtable->is_function_scope ? SYM_LOCAL : SYM_GLOBAL;
-
-        // Opt $o = $cur.next()
-        char* oname = malloc(32); int olen = snprintf(oname, 32, "$ci_o%d", id);
-        Symbol* osym = SymTable_Add(s_symtable, oname, olen, opt_type, bkind);
-        ASTNode* curref = make_ident_node(cname, clen, csym);
-        ASTNode* nfield = new_node(AST_FIELD);
-        nfield->field.base = curref;
-        nfield->field.field_name = "next"; nfield->field.field_name_len = 4;
-        ASTNode* ncall = new_node(AST_CALL);
-        ncall->call.target_name = NULL; ncall->call.target_expr = nfield;
-        ncall->call.args = NULL; ncall->call.arg_count = 0;
-        ASTNode* o_decl = make_decl_stmt(opt_type, oname, olen, osym, ncall);
-
-        // if tag($o) == none_idx { break }   -- tag read = *(u32*)&$o
-        ASTNode* oref = make_ident_node(oname, olen, osym);
-        ASTNode* addr = new_node(AST_ADDR); addr->unary = oref;
-        Type* u32t = (Type*)calloc(1, sizeof(Type)); u32t->cls = TYPE_PRIMITIVE; u32t->primitive = PRIM_U32;
-        Type* u32p = (Type*)calloc(1, sizeof(Type)); u32p->cls = TYPE_POINTER; u32p->pointer_base = u32t;
-        ASTNode* c = new_node(AST_CAST); c->cast.target_type = u32p; c->cast.expr = addr;
-        ASTNode* tagread = new_node(AST_DEREF); tagread->unary = c;
-        ASTNode* nlit = new_node(AST_INT_LITERAL); nlit->lit_kind = LIT_INT; nlit->int_value = (uint64_t)none_idx;
-        ASTNode* eqn = new_node(AST_EQ); eqn->binary.left = tagread; eqn->binary.right = nlit;
-        ASTNode* brk = new_node(AST_BREAK);
-        ASTNode* brk_blk = new_node(AST_BLOCK);
-        brk_blk->block.capacity = 1; brk_blk->block.count = 1;
-        brk_blk->block.statements = malloc(sizeof(ASTNode*));
-        brk_blk->block.statements[0] = brk;
-        ASTNode* if_none = new_node(AST_IF);
-        if_none->if_stmt.condition = eqn;
-        if_none->if_stmt.true_block = brk_blk;
-        if_none->if_stmt.false_block = NULL;
-
-        // payload access: $o.<some-variant-name>  (an enum field read, same shape
-        // the match payload branch produces). If payload was a pointer, deref it
-        // so the loop var binds the pointee (writable leaf).
-        ASTNode* oref2 = make_ident_node(oname, olen, osym);
-        ASTNode* pfield = new_node(AST_FIELD);
-        pfield->field.base = oref2;
-        pfield->field.field_name = opt_sd->fields[some_idx].name;
-        pfield->field.field_name_len = strlen(opt_sd->fields[some_idx].name);
-        Type* pay = opt_sd->fields[some_idx].type;
-        ASTNode* elem_access = pfield;
-        // Writable-leaf / manual-reference rule: the payload is `T*`. If the user
-        // declared the loop var as `T` (the pointee), auto-deref so they bind a
-        // copy of the value. If they declared it as `T*` (matching the payload),
-        // bind the pointer as-is -- assignment copies the pointer, and `*p = ...`
-        // in the body writes through to the real element. No special write-back
-        // machinery: manual referencing is the idiom, and it just falls out.
-        // (Only the TYPE form can spell a pointer; the unpack form always derefs
-        // to destructure the pointee aggregate.)
-        bool user_wants_ptr = (!is_unpack_form && decl_type &&
-                               pay && pay->cls == TYPE_POINTER &&
-                               Type_Equals(decl_type, pay));
-        if (pay && pay->cls == TYPE_POINTER && !user_wants_ptr) {
-            ASTNode* d = new_node(AST_DEREF); d->unary = pfield; elem_access = d;
-        }
-
-        // bind: TYPE form -> one decl; unpack form -> compile_pattern walk
-        ASTNode** bind_decls = NULL; size_t bind_count = 0;
-        if (is_unpack_form) {
-            if (Type_IsAggregate(elem_type)) resolve_brace_literal(pat, elem_type);
-            if (!pattern_covers_all(pat))
-                parse_error("for-in unpack pattern must always match");
-            ASTNode* cond2 = NULL; ASTNode** pdecls = NULL; size_t pdc = 0, pdcap = 0;
-            compile_pattern(pat, elem_access, elem_type, &cond2, &pdecls, &pdc, &pdcap);
-            bind_decls = pdecls; bind_count = pdc;
-        } else {
-            Symbol* ivsym = SymTable_Add(s_symtable, ivar.start, ivar.length, decl_type, bkind);
-            ASTNode* ivdecl = make_decl_stmt(decl_type, ivar.start, ivar.length, ivsym, elem_access);
-            Typecheck_Tree(ivdecl);
-            bind_decls = malloc(sizeof(ASTNode*)); bind_decls[0] = ivdecl; bind_count = 1;
-        }
-
-        ASTNode* user_body = parse_block_body();
-        s_loop_depth--;
-
-        // while-body block = [ $o decl, if-none-break, bind..., user stmts ]
-        ASTNode* wbody = new_node(AST_BLOCK);
-        size_t total = 2 + bind_count + user_body->block.count;
-        wbody->block.capacity = total; wbody->block.count = 0;
-        wbody->block.statements = malloc(total * sizeof(ASTNode*));
-        wbody->block.statements[wbody->block.count++] = o_decl;
-        wbody->block.statements[wbody->block.count++] = if_none;
-        for (size_t i = 0; i < bind_count; i++) wbody->block.statements[wbody->block.count++] = bind_decls[i];
-        for (size_t i = 0; i < user_body->block.count; i++)
-            wbody->block.statements[wbody->block.count++] = user_body->block.statements[i];
-        if (bind_decls) free(bind_decls);
-
-        ASTNode* tru = make_int_literal(1, LIT_BOOL);
-        ASTNode* wloop = new_node(AST_WHILE);
-        wloop->while_stmt.condition = tru;
-        wloop->while_stmt.body = wbody;
-
-        s_symtable = prev_table;
-
-        // outer transparent block holding $it/$cur + the while loop
-        ASTNode* outer = new_node(AST_BLOCK);
-        outer->block.capacity = 3; outer->block.count = 0;
-        outer->block.statements = malloc(3 * sizeof(ASTNode*));
-        outer->block.transparent = true;
-        outer->block.statements[outer->block.count++] = it_decl;
-        outer->block.statements[outer->block.count++] = cur_decl;
-        outer->block.statements[outer->block.count++] = wloop;
-        if (s_curr.type == TOK_SEMI) advance();
-        return outer;
-    }
-
     SymbolTable* prev_table = s_symtable;
     s_symtable = SymTable_Create(prev_table);
     s_symtable->is_function_scope = prev_table->is_function_scope;
     SymbolKind kind = s_symtable->is_function_scope ? SYM_LOCAL : SYM_GLOBAL;
+    static int s_cur_ctr = 0; int id = s_cur_ctr++;
 
-    static int s_forin_ctr = 0;
-    int id = s_forin_ctr++;
-
-    // Materialize the iterable into a temp (evaluate once).
-    char* itname = malloc(32); int itlen = snprintf(itname, 32, "$fi_it%d", id);
+    char* itname = malloc(32); int itlen = snprintf(itname, 32, "$ci_it%d", id);
     Symbol* itsym = SymTable_Add(s_symtable, itname, itlen, itype, kind);
+    char* cname = malloc(32); int clen = snprintf(cname, 32, "$ci_cur%d", id);
+    Symbol* csym = SymTable_Add(s_symtable, cname, clen, cur_type, kind);
 
-    // Index counter.
-    Type* u64t = (Type*)calloc(1, sizeof(Type)); u64t->cls = TYPE_PRIMITIVE; u64t->primitive = PRIM_U64;
-    char* ixname = malloc(32); int ixlen = snprintf(ixname, 32, "$fi_ix%d", id);
-    Symbol* ixsym = SymTable_Add(s_symtable, ixname, ixlen, u64t, kind);
-
-    #define ITREF() ({ ASTNode* r = new_node(AST_IDENT); r->ident.name = itname; \
-                       r->ident.name_len = itlen; r->ident.sym = itsym; r; })
-    #define IXREF() ({ ASTNode* r = new_node(AST_IDENT); r->ident.name = ixname; \
-                       r->ident.name_len = ixlen; r->ident.sym = ixsym; r; })
-
-    // init block: $fi_it = iter ; $fi_ix = 0
+    // $it = ITERABLE
     ASTNode* it_decl = make_decl_stmt(itype, itname, itlen, itsym, iter);
-    ASTNode* zero = new_node(AST_INT_LITERAL); zero->lit_kind = LIT_INT; zero->int_value = 0;
-    ASTNode* ix_decl = make_decl_stmt(u64t, ixname, ixlen, ixsym, zero);
+    // $cur = $it.begin()
+    ASTNode* itref = make_ident_node(itname, itlen, itsym);
+    ASTNode* bfield = new_node(AST_FIELD);
+    bfield->field.base = itref;
+    bfield->field.field_name = "begin"; bfield->field.field_name_len = 5;
+    ASTNode* bcall = new_node(AST_CALL);
+    bcall->call.target_name = NULL; bcall->call.target_expr = bfield;
+    bcall->call.args = NULL; bcall->call.arg_count = 0;
+    ASTNode* cur_decl = make_decl_stmt(cur_type, cname, clen, csym, bcall);
 
-    ASTNode* init = new_node(AST_BLOCK);
-    init->block.capacity = 2; init->block.count = 0;
-    init->block.statements = malloc(init->block.capacity * sizeof(ASTNode*));
-    init->block.transparent = true;
-    init->block.statements[init->block.count++] = it_decl;
-    init->block.statements[init->block.count++] = ix_decl;
-
-    // cond: $fi_ix < len.  For arrays len is a static literal; for containers we
-    // hoist a one-time len() call into $fi_len (evaluated once in init).
-    ASTNode* len_ref = NULL;
-    if (is_array) {
-        ASTNode* cnt = new_node(AST_INT_LITERAL); cnt->lit_kind = LIT_INT; cnt->int_value = count;
-        len_ref = cnt;
-    } else {
-        // $fi_len = $fi_it.len()
-        char* lname = malloc(32); int llen = snprintf(lname, 32, "$fi_len%d", id);
-        Symbol* lsym = SymTable_Add(s_symtable, lname, llen, u64t, kind);
-        ASTNode* lfield = new_node(AST_FIELD);
-        lfield->field.base = ITREF();
-        lfield->field.field_name = "len"; lfield->field.field_name_len = 3;
-        ASTNode* lcall = new_node(AST_CALL);
-        lcall->call.target_name = NULL; lcall->call.target_expr = lfield;
-        lcall->call.args = NULL; lcall->call.arg_count = 0;
-        ASTNode* ldecl = make_decl_stmt(u64t, lname, llen, lsym, lcall);
-        // append to init block (grow)
-        if (init->block.count >= init->block.capacity) {
-            init->block.capacity *= 2;
-            init->block.statements = realloc(init->block.statements, init->block.capacity*sizeof(ASTNode*));
-        }
-        init->block.statements[init->block.count++] = ldecl;
-        ASTNode* lr = new_node(AST_IDENT); lr->ident.name = lname; lr->ident.name_len = llen; lr->ident.sym = lsym;
-        len_ref = lr;
-    }
-    ASTNode* cond = new_node(AST_LT); cond->binary.left = IXREF(); cond->binary.right = len_ref;
-
-    // incr: $fi_ix = $fi_ix + 1
-    ASTNode* one = new_node(AST_INT_LITERAL); one->lit_kind = LIT_INT; one->int_value = 1;
-    ASTNode* add = new_node(AST_ADD); add->binary.left = IXREF(); add->binary.right = one;
-    ASTNode* incr = new_node(AST_ASSIGN); incr->binary.left = IXREF(); incr->binary.right = add;
-
-    // Body: bind from $fi_it[$fi_ix], either as one plain typed decl (TYPE
-    // form -- exactly like any other `TYPE name = expr`) or via the same
-    // compile_pattern walk the standalone `unpack` statement uses (unpack
-    // form -- destructure spliced at the top of the body, one decl/assign
-    // per bound name, same as `unpack PATTERN = expr` produces).
+    // ---- loop body ----
     s_loop_depth++;
     if (s_curr.type != TOK_LBRACE) parse_error("Expected '{' for for-in body");
     SymbolTable* body_prev = s_symtable;
     s_symtable = SymTable_Create(body_prev);
     s_symtable->is_function_scope = body_prev->is_function_scope;
+    SymbolKind bkind = s_symtable->is_function_scope ? SYM_LOCAL : SYM_GLOBAL;
 
-    ASTNode* elem_access = new_node(AST_INDEX);
-    elem_access->index.base = ITREF();
-    elem_access->index.index = IXREF();
+    // Opt $o = $cur.next()
+    char* oname = malloc(32); int olen = snprintf(oname, 32, "$ci_o%d", id);
+    Symbol* osym = SymTable_Add(s_symtable, oname, olen, opt_type, bkind);
+    ASTNode* curref = make_ident_node(cname, clen, csym);
+    ASTNode* nfield = new_node(AST_FIELD);
+    nfield->field.base = curref;
+    nfield->field.field_name = "next"; nfield->field.field_name_len = 4;
+    ASTNode* ncall = new_node(AST_CALL);
+    ncall->call.target_name = NULL; ncall->call.target_expr = nfield;
+    ncall->call.args = NULL; ncall->call.arg_count = 0;
+    ASTNode* o_decl = make_decl_stmt(opt_type, oname, olen, osym, ncall);
 
-    ASTNode** bind_decls = NULL;
-    size_t bind_count = 0;
+    // if tag($o) == none_idx { break }
+    ASTNode* oref = make_ident_node(oname, olen, osym);
+    ASTNode* eqn = make_tag_eq(oref, none_idx);
+    ASTNode* brk = new_node(AST_BREAK);
+    ASTNode* brk_blk = new_node(AST_BLOCK);
+    brk_blk->block.capacity = 1; brk_blk->block.count = 1;
+    brk_blk->block.statements = malloc(sizeof(ASTNode*));
+    brk_blk->block.statements[0] = brk;
+    ASTNode* if_none = new_node(AST_IF);
+    if_none->if_stmt.condition = eqn;
+    if_none->if_stmt.true_block = brk_blk;
+    if_none->if_stmt.false_block = NULL;
 
+    // payload access: $o.<some-variant-name>  (an enum field read, same shape
+    // the match payload branch produces). If payload was a pointer, deref it
+    // so the loop var binds the pointee (writable leaf).
+    ASTNode* oref2 = make_ident_node(oname, olen, osym);
+    ASTNode* pfield = new_node(AST_FIELD);
+    pfield->field.base = oref2;
+    pfield->field.field_name = opt_sd->fields[some_idx].name;
+    pfield->field.field_name_len = strlen(opt_sd->fields[some_idx].name);
+    Type* pay = opt_sd->fields[some_idx].type;
+    ASTNode* elem_access = pfield;
+    // Writable-leaf / manual-reference rule: the payload is `T*`. If the user
+    // declared the loop var as `T` (the pointee), auto-deref so they bind a
+    // copy of the value. If they declared it as `T*` (matching the payload),
+    // bind the pointer as-is -- assignment copies the pointer, and `*p = ...`
+    // in the body writes through to the real element. No special write-back
+    // machinery: manual referencing is the idiom, and it just falls out.
+    // (Only the TYPE form can spell a pointer; the unpack form always derefs
+    // to destructure the pointee aggregate.)
+    bool user_wants_ptr = (!is_unpack_form && decl_type &&
+                           pay && pay->cls == TYPE_POINTER &&
+                           Type_Equals(decl_type, pay));
+    if (pay && pay->cls == TYPE_POINTER && !user_wants_ptr) {
+        ASTNode* d = new_node(AST_DEREF); d->unary = pfield; elem_access = d;
+    }
+
+    // bind: TYPE form -> one decl; unpack form -> compile_pattern walk
+    ASTNode** bind_decls = NULL; size_t bind_count = 0;
     if (is_unpack_form) {
-        // Positional `{a, b}` patterns need field names filled in first,
-        // same pass the standalone unpack statement runs.
         if (Type_IsAggregate(elem_type)) resolve_brace_literal(pat, elem_type);
         if (!pattern_covers_all(pat))
-            parse_error("for-in unpack pattern must always match -- no literal-pinned "
-                        "fields or enum-variant patterns are allowed here; use `match` "
-                        "inside the body for anything refutable");
-        ASTNode* cond2 = NULL;
-        ASTNode** pdecls = NULL; size_t pdc = 0, pdcap = 0;
+            parse_error("for-in unpack pattern must always match");
+        ASTNode* cond2 = NULL; ASTNode** pdecls = NULL; size_t pdc = 0, pdcap = 0;
         compile_pattern(pat, elem_access, elem_type, &cond2, &pdecls, &pdc, &pdcap);
-        bind_decls = pdecls;
-        bind_count = pdc;
+        bind_decls = pdecls; bind_count = pdc;
     } else {
-        SymbolKind ivkind = s_symtable->is_function_scope ? SYM_LOCAL : SYM_GLOBAL;
-        Symbol* ivsym = SymTable_Add(s_symtable, ivar.start, ivar.length, decl_type, ivkind);
+        Symbol* ivsym = SymTable_Add(s_symtable, ivar.start, ivar.length, decl_type, bkind);
         ASTNode* ivdecl = make_decl_stmt(decl_type, ivar.start, ivar.length, ivsym, elem_access);
         Typecheck_Tree(ivdecl);
-        bind_decls = malloc(sizeof(ASTNode*));
-        bind_decls[0] = ivdecl;
-        bind_count = 1;
+        bind_decls = malloc(sizeof(ASTNode*)); bind_decls[0] = ivdecl; bind_count = 1;
     }
 
     ASTNode* user_body = parse_block_body();
     s_loop_depth--;
 
-    // Merge: new block = bind_decls[...] ++ user_body.statements
-    ASTNode* body = new_node(AST_BLOCK);
-    size_t total = bind_count + user_body->block.count;
-    body->block.capacity = total < 1 ? 1 : total;
-    body->block.count = 0;
-    body->block.statements = malloc(body->block.capacity * sizeof(ASTNode*));
-    for (size_t i = 0; i < bind_count; i++) body->block.statements[body->block.count++] = bind_decls[i];
+    // while-body block = [ $o decl, if-none-break, bind..., user stmts ]
+    ASTNode* wbody = new_node(AST_BLOCK);
+    size_t total = 2 + bind_count + user_body->block.count;
+    wbody->block.capacity = total; wbody->block.count = 0;
+    wbody->block.statements = malloc(total * sizeof(ASTNode*));
+    wbody->block.statements[wbody->block.count++] = o_decl;
+    wbody->block.statements[wbody->block.count++] = if_none;
+    for (size_t i = 0; i < bind_count; i++) wbody->block.statements[wbody->block.count++] = bind_decls[i];
     for (size_t i = 0; i < user_body->block.count; i++)
-        body->block.statements[body->block.count++] = user_body->block.statements[i];
+        wbody->block.statements[wbody->block.count++] = user_body->block.statements[i];
     if (bind_decls) free(bind_decls);
+
+    ASTNode* tru = make_int_literal(1, LIT_BOOL);
+    ASTNode* wloop = new_node(AST_WHILE);
+    wloop->while_stmt.condition = tru;
+    wloop->while_stmt.body = wbody;
 
     s_symtable = prev_table;
 
-    ASTNode* node = new_node(AST_FOR);
-    node->for_stmt.init = init;
-    node->for_stmt.cond = cond;
-    node->for_stmt.incr = incr;
-    node->for_stmt.body = body;
-    #undef ITREF
-    #undef IXREF
-    return node;
+    // outer transparent block holding $it/$cur + the while loop
+    ASTNode* outer = new_node(AST_BLOCK);
+    outer->block.capacity = 3; outer->block.count = 0;
+    outer->block.statements = malloc(3 * sizeof(ASTNode*));
+    outer->block.transparent = true;
+    outer->block.statements[outer->block.count++] = it_decl;
+    outer->block.statements[outer->block.count++] = cur_decl;
+    outer->block.statements[outer->block.count++] = wloop;
+    if (s_curr.type == TOK_SEMI) advance();
+    return outer;
+
+
 }
 
 static ASTNode* parse_for_statement(void) {
@@ -4376,75 +4236,70 @@ static ASTNode* parse_alias_decl(void) {
     return empty;
 }
 
-static ASTNode* parse_top_level(void) {
-    // `with PREFIX... { body }` — declaration grouping. Desugars each newline-
-    // delimited entry in body by prepending the prefix tokens and re-parsing as
-    // a normal top-level declaration. Pure token-replay: no new semantics, the
-    // parser functions downstream never know `with` existed.
-    if (s_curr.type == TOK_WITH) {
-        advance(); // consume 'with'
+// `with PREFIX... { body }` — declaration grouping. Desugars each newline-
+// delimited entry in body by prepending the prefix tokens and re-parsing as
+// a normal top-level declaration. Pure token-replay: no new semantics, the
+// parser functions downstream never know `with` existed.
+static ASTNode* parse_with_block(void) {
+    advance(); // consume 'with'
 
-        // Collect prefix tokens (everything before '{').
-        // We store each token's (LexerState-before, token) so we can replay.
-        typedef struct { LexerState st; Token tok; bool nl; } PrefixTok;
-        size_t pcap = 8, pcount = 0;
-        PrefixTok* ptoks = (PrefixTok*)malloc(pcap * sizeof(PrefixTok));
-        while (s_curr.type != TOK_LBRACE && s_curr.type != TOK_EOF) {
-            if (pcount >= pcap) { pcap *= 2; ptoks = realloc(ptoks, pcap * sizeof(PrefixTok)); }
-            Lexer_Save(&ptoks[pcount].st);
-            ptoks[pcount].tok = s_curr;
-            ptoks[pcount].nl  = s_curr_newline_before;
-            pcount++;
-            advance();
-        }
-        if (s_curr.type != TOK_LBRACE) parse_error("Expected '{' after 'with' prefix");
-        if (pcount == 0) parse_error("'with' requires at least one prefix token before '{'");
-        advance(); // consume '{'
-
-        ASTNode* block = new_node(AST_BLOCK);
-        block->block.capacity = 16;
-        block->block.statements = (ASTNode**)malloc(block->block.capacity * sizeof(ASTNode*));
-        block->block.count = 0;
-
-        while (s_curr.type != TOK_RBRACE && s_curr.type != TOK_EOF) {
-            if (s_curr.type == TOK_SEMI) { advance(); continue; }
-
-            // s_curr = entry's first token; lexer points at entry's second token.
-            Token entry_tok = s_curr;
-            bool  entry_nl  = s_curr_newline_before;
-            LexerState after_entry_tok;
-            Lexer_Save(&after_entry_tok);
-
-            // Set up prefix replay: s_curr = ptoks[0], lexer at ptoks[0].st so
-            // advance() naturally re-lexes ptoks[1..N-1] from the prefix source.
-            // After pcount-1 advances, the switch fires: lexer jumps to
-            // after_entry_tok and s_curr becomes entry_tok.
-            s_curr                = ptoks[0].tok;
-            s_curr_newline_before = ptoks[0].nl;
-            Lexer_Restore(&ptoks[0].st);
-
-            s_with_switch_after  = (int)pcount - 1;
-            s_with_switch_st     = after_entry_tok;
-            s_with_switch_tok    = entry_tok;
-            s_with_switch_nl     = entry_nl;
-            s_with_switch_active = true;
-
-            ASTNode* decl = parse_top_level();
-            s_with_switch_active = false;
-            if (decl) {
-                if (block->block.count >= block->block.capacity) {
-                    block->block.capacity *= 2;
-                    block->block.statements = (ASTNode**)realloc(
-                        block->block.statements, block->block.capacity * sizeof(ASTNode*));
-                }
-                block->block.statements[block->block.count++] = decl;
-            }
-        }
-        if (s_curr.type != TOK_RBRACE) parse_error("Expected '}' to close 'with' block");
-        advance(); // consume '}'
-        free(ptoks);
-        return block;
+    // Collect prefix tokens (everything before '{').
+    // We store each token's (LexerState-before, token) so we can replay.
+    typedef struct { LexerState st; Token tok; bool nl; } PrefixTok;
+    size_t pcap = 8, pcount = 0;
+    PrefixTok* ptoks = (PrefixTok*)malloc(pcap * sizeof(PrefixTok));
+    while (s_curr.type != TOK_LBRACE && s_curr.type != TOK_EOF) {
+        if (pcount >= pcap) { pcap *= 2; ptoks = realloc(ptoks, pcap * sizeof(PrefixTok)); }
+        Lexer_Save(&ptoks[pcount].st);
+        ptoks[pcount].tok = s_curr;
+        ptoks[pcount].nl  = s_curr_newline_before;
+        pcount++;
+        advance();
     }
+    if (s_curr.type != TOK_LBRACE) parse_error("Expected '{' after 'with' prefix");
+    if (pcount == 0) parse_error("'with' requires at least one prefix token before '{'");
+    advance(); // consume '{'
+
+    ASTNode* block = new_node(AST_BLOCK);
+    block->block.capacity = 16;
+    block->block.statements = (ASTNode**)malloc(block->block.capacity * sizeof(ASTNode*));
+    block->block.count = 0;
+
+    while (s_curr.type != TOK_RBRACE && s_curr.type != TOK_EOF) {
+        if (s_curr.type == TOK_SEMI) { advance(); continue; }
+
+        // s_curr = entry's first token; lexer points at entry's second token.
+        Token entry_tok = s_curr;
+        bool  entry_nl  = s_curr_newline_before;
+        LexerState after_entry_tok;
+        Lexer_Save(&after_entry_tok);
+
+        // Set up prefix replay: s_curr = ptoks[0], lexer at ptoks[0].st so
+        // advance() naturally re-lexes ptoks[1..N-1] from the prefix source.
+        // After pcount-1 advances, the switch fires: lexer jumps to
+        // after_entry_tok and s_curr becomes entry_tok.
+        s_curr                = ptoks[0].tok;
+        s_curr_newline_before = ptoks[0].nl;
+        Lexer_Restore(&ptoks[0].st);
+
+        s_with_switch_after  = (int)pcount - 1;
+        s_with_switch_st     = after_entry_tok;
+        s_with_switch_tok    = entry_tok;
+        s_with_switch_nl     = entry_nl;
+        s_with_switch_active = true;
+
+        ASTNode* decl = parse_top_level();
+        s_with_switch_active = false;
+        if (decl) append_block_statement(block, decl);
+    }
+    if (s_curr.type != TOK_RBRACE) parse_error("Expected '}' to close 'with' block");
+    advance(); // consume '}'
+    free(ptoks);
+    return block;
+}
+
+static ASTNode* parse_top_level(void) {
+    if (s_curr.type == TOK_WITH) return parse_with_block();
 
     bool is_pub = false;
     if (s_curr.type == TOK_PUB) {
@@ -4469,297 +4324,7 @@ static ASTNode* parse_top_level(void) {
         return parse_alias_decl();
     }
     // impl TypeName { fn method(...) RT { ... } ... }
-    // Desugars each method: prepends `Foo* self` as first param, mangles name to Foo_method.
-    // Produces a block of normal AST_FUNC_DECL nodes — no new AST node type needed.
-    if (s_curr.type == TOK_IMPL) {
-        advance(); // consume 'impl'
-        if (s_curr.type != TOK_IDENTIFIER) parse_error("Expected type name after 'impl'");
-        const char* impl_type = strndup(s_curr.start, s_curr.length);
-        size_t impl_type_len  = s_curr.length;
-        advance(); // consume type name
-
-        // `impl` is a type site, and an alias is interchangeable with what it names
-        // (§24). It cannot simply call parse_type(): the bracket after the name here
-        // *declares* the generic params (`impl Vector[T]`) rather than instantiating
-        // them, so the common path would try to resolve `T` and fail. It resolves the
-        // alias directly instead -- which is all the common path would have done for a
-        // bare name anyway.
-        //
-        //   alias S = Raw          ->  `impl S` attaches to Raw.
-        //   alias S = Vector[u8]   ->  `impl S` attaches to the INSTANTIATED
-        //                              StructDef, whose registry name is literally
-        //                              "Vector[u8]" -- exactly the name a call site
-        //                              mangles with, so `s.method()` resolves.
-        //
-        // Without this, impl_type stayed the raw token text ("S"), Struct_Find missed,
-        // and `self` was built as a struct nobody had ever declared -- surfacing much
-        // later as "field access on a non-struct value". This is the failure mode
-        // docs/type_grammar.md warns about: a call site that stopped trusting the
-        // common path.
-        {
-            AliasDef* impl_al = alias_lookup(impl_type, impl_type_len);
-            if (impl_al && impl_al->param_count == 0 &&
-                impl_al->body && impl_al->body->cls == TYPE_STRUCT) {
-                StructDef* target = Struct_Find(impl_al->body->struct_name);
-                // An alias to a generic INSTANTIATION (`alias String = Vector[u8]`) is
-                // the same specialization request as `impl Vector[u8]`, arriving under a
-                // different name -- and the call site cannot reach it either, because it
-                // mangles with the generic base (`Vector_f`, not `Vector[u8]_f`). Left
-                // alone it would register a symbol nothing can ever call: the method
-                // would simply not exist, with no diagnostic. Say so instead.
-                if (target && target->generic_base) {
-                    char buf[256];
-                    snprintf(buf, sizeof(buf),
-                             "cannot impl on `%.*s`: it aliases the generic instantiation "
-                             "`%s`, and a method on one instantiation (specialization) is "
-                             "not supported -- impl the generic base (`impl %s[T]`) instead",
-                             (int)impl_type_len, impl_type, target->name,
-                             target->generic_base->name);
-                    parse_error(buf);
-                }
-                free((void*)impl_type);                       // drop the strndup'd token text
-                impl_type     = impl_al->body->struct_name;   // stable: owned by the struct registry
-                impl_type_len = strlen(impl_type);
-            }
-        }
-
-        // Optional [T, U] — consume (just for syntax), then read type_params from the
-        // StructDef itself (single source of truth). All methods in this block share them.
-        //
-        // The bracket here DECLARES the generic parameters; it does not instantiate
-        // them. `impl Vector[T]` and `impl Vector[u8]` would otherwise both register one
-        // symbol on the generic base (`Vector_f`), because the call site mangles with the
-        // base name (types.c, try_rewrite_method_call) and monomorphizes per
-        // instantiation. So `impl Vector[u8]` used to READ as "a method only on
-        // Vector[u8]", compile clean, and then answer calls on Vector[u32] as well --
-        // silent wrongness, which §1 rejects outright. Specialization on a concrete
-        // instantiation is a real feature and a real design decision (it is where
-        // coherence rules come from); an ignored bracket should not grant it by accident.
-        //
-        // A slot is a PARAMETER DECLARATION iff it ENDS in a name that is not already a
-        // type -- which covers both forms uniformly and needs no lookahead:
-        //
-        //     T              ends in `T`  -- unknown identifier   -> type param    OK
-        //     u32 N          ends in `N`  -- unknown identifier   -> value param   OK
-        //     u32[4] W       ends in `W`  -- unknown identifier   -> value param   OK
-        //     u8             ends in `u8` -- a primitive keyword  -> SPECIALIZATION
-        //     Foo            ends in `Foo`-- a registered type    -> SPECIALIZATION
-        //
-        // (The last token of a slot is the one sitting before the `,` or the closing `]`,
-        // so this is decided by remembering the previous token rather than by parsing.)
-        if (s_curr.type == TOK_LBRACKET) {
-            int depth = 1; advance();
-            Token prev = s_curr;
-            while (depth > 0 && s_curr.type != TOK_EOF) {
-                if (s_curr.type == TOK_LBRACKET) depth++;
-                else if (s_curr.type == TOK_RBRACKET) depth--;
-
-                bool slot_ends_here = (depth == 1 && s_curr.type == TOK_COMMA) || depth == 0;
-                if (slot_ends_here && prev.type != TOK_LBRACKET) {
-                    bool is_param_name = (prev.type == TOK_IDENTIFIER) &&
-                                         !token_begins_type(prev);
-                    if (!is_param_name) {
-                        char buf[320];
-                        snprintf(buf, sizeof(buf),
-                                 "impl on a concrete generic instantiation is not supported "
-                                 "(specialization): `%.*s` in `impl %.*s[...]` names a TYPE, not a "
-                                 "parameter. A method declared in an impl block applies to every "
-                                 "instantiation, so write `impl %.*s[T]` and match on T inside if "
-                                 "the behavior must differ",
-                                 (int)prev.length, prev.start,
-                                 (int)impl_type_len, impl_type,
-                                 (int)impl_type_len, impl_type);
-                        parse_error(buf);
-                    }
-                }
-                if (depth > 0) { prev = s_curr; advance(); } else advance();
-            }
-        }
-
-        // Install struct's type params into scope for all methods in this block.
-        const char** prev_impl_tparams = s_type_params;
-        Type**       prev_impl_pkinds  = s_param_kinds;
-        size_t prev_impl_tparam_count  = s_type_param_count;
-        char* impl_type_nul = strndup(impl_type, impl_type_len);
-        StructDef* impl_sd = Struct_Find(impl_type_nul);
-        free(impl_type_nul);
-        if (impl_sd && impl_sd->type_param_count > 0) {
-            s_type_params      = impl_sd->type_params;
-            s_param_kinds      = impl_sd->param_kinds;
-            s_type_param_count = impl_sd->type_param_count;
-        }
-
-        if (s_curr.type != TOK_LBRACE) parse_error("Expected '{' after impl type name");
-        advance(); // consume '{'
-
-        ASTNode* block = new_node(AST_BLOCK);
-        block->block.capacity = 8;
-        block->block.statements = (ASTNode**)malloc(block->block.capacity * sizeof(ASTNode*));
-        block->block.count = 0;
-
-        while (s_curr.type != TOK_RBRACE && s_curr.type != TOK_EOF) {
-            if (s_curr.type != TOK_FN) parse_error("Expected 'fn' inside impl block");
-            advance(); // consume 'fn'
-            if (s_curr.type != TOK_IDENTIFIER) parse_error("Expected method name");
-
-            // Mangle: Foo_method
-            size_t mname_len = impl_type_len + 1 + s_curr.length;
-            char* mname = (char*)malloc(mname_len + 1);
-            memcpy(mname, impl_type, impl_type_len);
-            mname[impl_type_len] = '_';
-            memcpy(mname + impl_type_len + 1, s_curr.start, s_curr.length);
-            mname[mname_len] = '\0';
-
-            // Temporarily replace the method token with the mangled name so the
-            // normal fn parser registers the right symbol. We do this by injecting
-            // a fake identifier token and then calling the fn parse path directly.
-            Token method_tok = s_curr; // save original (for error msgs)
-            (void)method_tok;
-            advance(); // consume method name — now s_curr = '[' or '('
-
-            // Build self param type: Foo*
-            Type* self_base = (Type*)calloc(1, sizeof(Type));
-            self_base->cls = TYPE_STRUCT;
-            self_base->struct_name = impl_type; // stable (strndup'd above)
-
-            Type* self_type = (Type*)calloc(1, sizeof(Type));
-            self_type->cls = TYPE_POINTER;
-            self_type->pointer_base = self_base;
-
-            // Type params for this method = struct's type params (already in s_type_params
-            // from the impl-block scope). Methods may also declare extra [U] params;
-            // merge them. tparams is what gets stored on the func_decl.
-            size_t struct_tparam_count = impl_sd ? impl_sd->type_param_count : 0;
-            const char** tparams = NULL;
-            Type**       pkinds  = NULL;
-            size_t tparam_count = 0;
-            // Start with struct params (names + kinds)
-            if (struct_tparam_count > 0) {
-                tparams = (const char**)malloc(struct_tparam_count * sizeof(char*));
-                pkinds  = (Type**)malloc(struct_tparam_count * sizeof(Type*));
-                for (size_t i = 0; i < struct_tparam_count; i++) {
-                    tparams[i] = impl_sd->type_params[i];
-                    pkinds[i]  = impl_sd->param_kinds ? impl_sd->param_kinds[i] : NULL;
-                }
-                tparam_count = struct_tparam_count;
-            }
-            // Append any extra method-level [U, u32 K] params (type or value)
-            if (s_curr.type == TOK_LBRACKET) {
-                const char** extra_names = NULL;
-                Type** extra_kinds = NULL;
-                size_t extra_count = 0;
-                parse_generic_param_list_with_prefix(tparams, pkinds, tparam_count,
-                                                    &extra_names, &extra_kinds, &extra_count);
-                tparams = extra_names;
-                pkinds = extra_kinds;
-                tparam_count = extra_count;
-                s_type_params = tparams;
-                s_param_kinds = pkinds;
-                s_type_param_count = tparam_count;
-            }
-
-            if (s_curr.type != TOK_LPAREN) parse_error("Expected '(' in impl method");
-            advance(); // consume '('
-
-            ASTNode* node = new_node(AST_FUNC_DECL);
-            node->func_decl.name = mname;
-            node->func_decl.name_len = mname_len;
-            node->func_decl.param_count = 0;
-            node->func_decl.pack_param_index = -1; // packs not supported on impl methods yet
-            size_t param_cap = 8;
-            node->func_decl.param_syms = (Symbol**)calloc(param_cap, sizeof(Symbol*));
-
-            SymbolTable* prev_table = s_symtable;
-            s_symtable = SymTable_Create(prev_table);
-            s_symtable->is_function_scope = true;
-
-            // Inject self as first param (name "self")
-            Symbol* self_sym = SymTable_Add(s_symtable, "self", 4, self_type, SYM_LOCAL);
-            node->func_decl.param_syms[node->func_decl.param_count++] = self_sym;
-
-            // Parse remaining params
-            if (s_curr.type != TOK_RPAREN) {
-                while (1) {
-                    if (node->func_decl.param_count >= param_cap) {
-                        param_cap *= 2;
-                        node->func_decl.param_syms = (Symbol**)realloc(node->func_decl.param_syms, param_cap * sizeof(Symbol*));
-                    }
-                    Type* ptype = parse_type();
-                    if (!ptype) parse_error("Expected parameter type in impl method");
-                    if (s_curr.type != TOK_IDENTIFIER) parse_error("Expected parameter name in impl method");
-                    Token pname = s_curr;
-                    advance();
-                    Symbol* psym = SymTable_Add(s_symtable, pname.start, pname.length, ptype, SYM_LOCAL);
-                    node->func_decl.param_syms[node->func_decl.param_count++] = psym;
-                    if (s_curr.type == TOK_COMMA) advance();
-                    else break;
-                }
-            }
-            if (s_curr.type != TOK_RPAREN) parse_error("Expected ')' in impl method");
-            advance(); // consume ')'
-
-            // Return type: present iff next token is not '{'
-            Type* ret_type = NULL;
-            if (s_curr.type != TOK_LBRACE) {
-                ret_type = parse_type();
-                if (!ret_type) parse_error("Expected return type or '{' in impl method");
-            }
-            node->func_decl.return_type = ret_type;
-
-            // Register symbol
-            Type* ftype = (Type*)calloc(1, sizeof(Type));
-            ftype->cls = TYPE_FUNCTION;
-            ftype->function.param_count = node->func_decl.param_count;
-            ftype->function.param_types = (Type**)malloc(node->func_decl.param_count * sizeof(Type*));
-            for (size_t i = 0; i < node->func_decl.param_count; i++)
-                ftype->function.param_types[i] = node->func_decl.param_syms[i]->type;
-            ftype->function.return_type = ret_type;
-            ftype->function.is_vararg = false;
-
-            Symbol* func_sym = SymTable_Add(prev_table, mname, mname_len, ftype, SYM_FUNCTION);
-            node->func_decl.sym = func_sym;
-            if (is_pub) func_sym->is_pub = true;
-            func_sym->has_init = true;
-            func_sym->func_decl = node;
-            node->func_decl.type_params = tparams;
-            node->func_decl.param_kinds = pkinds;
-            node->func_decl.type_param_count = tparam_count;
-            if (tparam_count > 0) func_sym->generic_decl = node;
-
-            // Parse body -- MUST still see the method's own [T]/[U] extension
-            // (tparams/pkinds/tparam_count), not yet the plain impl-block/struct
-            // scope: a cast to the method's own type param inside its body
-            // (`fn get[T]() T { return (T)self.v }`) needs T to still resolve
-            // as a type here, the same way it already does in the signature
-            // just parsed. Restoring to impl-block scope BEFORE the body used
-            // to silently drop the method-level extension one statement too
-            // early, so T read as an undeclared IDENTIFIER instead of a type
-            // the moment it appeared inside a cast/expression in the body
-            // (the signature's own T references worked fine, since those parse
-            // before this restore ever ran) -- confirmed by a real repro.
-            if (s_curr.type != TOK_LBRACE) parse_error("Expected '{' for impl method body");
-            ASTNode* body = parse_braced_block(false, false);
-            node->func_decl.body = body;
-            s_symtable = prev_table;
-
-            // NOW restore to impl-block scope (struct params still active for next method).
-            s_type_params      = impl_sd ? impl_sd->type_params      : prev_impl_tparams;
-            s_param_kinds      = impl_sd ? impl_sd->param_kinds      : prev_impl_pkinds;
-            s_type_param_count = impl_sd ? impl_sd->type_param_count : prev_impl_tparam_count;
-
-            if (block->block.count >= block->block.capacity) {
-                block->block.capacity *= 2;
-                block->block.statements = (ASTNode**)realloc(block->block.statements, block->block.capacity * sizeof(ASTNode*));
-            }
-            block->block.statements[block->block.count++] = node;
-        }
-        if (s_curr.type != TOK_RBRACE) parse_error("Expected '}' to close impl block");
-        advance();
-        s_type_params      = prev_impl_tparams;
-        s_param_kinds      = prev_impl_pkinds;
-        s_type_param_count = prev_impl_tparam_count;
-        return block;
-    }
+    if (s_curr.type == TOK_IMPL) return parse_impl_block(is_pub);
 
     bool is_extern = false;
     if (s_curr.type == TOK_EXTERN) {
@@ -4768,7 +4333,161 @@ static ASTNode* parse_top_level(void) {
         if (s_curr.type != TOK_FN) parse_error("Expected 'fn' after 'extern'");
     }
 
-    { ASTNode* r = parse_fn_decl(is_pub, is_extern); if (r) return r; }
+    { ASTNode* r = parse_fn_decl(is_pub, is_extern, NULL, 0, NULL); if (r) return r; }
+}
+
+// impl TypeName { fn method(...) RT { ... } ... }
+// Desugars each method: prepends `Foo* self` as first param, mangles name to Foo_method.
+// Produces a block of normal AST_FUNC_DECL nodes — no new AST node type needed.
+static ASTNode* parse_impl_block(bool is_pub) {
+    advance(); // consume 'impl'
+    if (s_curr.type != TOK_IDENTIFIER) parse_error("Expected type name after 'impl'");
+    const char* impl_type = strndup(s_curr.start, s_curr.length);
+    size_t impl_type_len  = s_curr.length;
+    advance(); // consume type name
+
+    // `impl` is a type site, and an alias is interchangeable with what it names
+    // (§24). It cannot simply call parse_type(): the bracket after the name here
+    // *declares* the generic params (`impl Vector[T]`) rather than instantiating
+    // them, so the common path would try to resolve `T` and fail. It resolves the
+    // alias directly instead -- which is all the common path would have done for a
+    // bare name anyway.
+    //
+    //   alias S = Raw          ->  `impl S` attaches to Raw.
+    //   alias S = Vector[u8]   ->  `impl S` attaches to the INSTANTIATED
+    //                              StructDef, whose registry name is literally
+    //                              "Vector[u8]" -- exactly the name a call site
+    //                              mangles with, so `s.method()` resolves.
+    //
+    // Without this, impl_type stayed the raw token text ("S"), Struct_Find missed,
+    // and `self` was built as a struct nobody had ever declared -- surfacing much
+    // later as "field access on a non-struct value". This is the failure mode
+    // docs/type_grammar.md warns about: a call site that stopped trusting the
+    // common path.
+    {
+        AliasDef* impl_al = alias_lookup(impl_type, impl_type_len);
+        if (impl_al && impl_al->param_count == 0 &&
+            impl_al->body && impl_al->body->cls == TYPE_STRUCT) {
+            StructDef* target = Struct_Find(impl_al->body->struct_name);
+            // An alias to a generic INSTANTIATION (`alias String = Vector[u8]`) is
+            // the same specialization request as `impl Vector[u8]`, arriving under a
+            // different name -- and the call site cannot reach it either, because it
+            // mangles with the generic base (`Vector_f`, not `Vector[u8]_f`). Left
+            // alone it would register a symbol nothing can ever call: the method
+            // would simply not exist, with no diagnostic. Say so instead.
+            if (target && target->generic_base) {
+                char buf[256];
+                snprintf(buf, sizeof(buf),
+                         "cannot impl on `%.*s`: it aliases the generic instantiation "
+                         "`%s`, and a method on one instantiation (specialization) is "
+                         "not supported -- impl the generic base (`impl %s[T]`) instead",
+                         (int)impl_type_len, impl_type, target->name,
+                         target->generic_base->name);
+                parse_error(buf);
+            }
+            free((void*)impl_type);                       // drop the strndup'd token text
+            impl_type     = impl_al->body->struct_name;   // stable: owned by the struct registry
+            impl_type_len = strlen(impl_type);
+        }
+    }
+
+    // Optional [T, U] — consume (just for syntax), then read type_params from the
+    // StructDef itself (single source of truth). All methods in this block share them.
+    //
+    // The bracket here DECLARES the generic parameters; it does not instantiate
+    // them. `impl Vector[T]` and `impl Vector[u8]` would otherwise both register one
+    // symbol on the generic base (`Vector_f`), because the call site mangles with the
+    // base name (types.c, try_rewrite_method_call) and monomorphizes per
+    // instantiation. So `impl Vector[u8]` used to READ as "a method only on
+    // Vector[u8]", compile clean, and then answer calls on Vector[u32] as well --
+    // silent wrongness, which §1 rejects outright. Specialization on a concrete
+    // instantiation is a real feature and a real design decision (it is where
+    // coherence rules come from); an ignored bracket should not grant it by accident.
+    //
+    // A slot is a PARAMETER DECLARATION iff it ENDS in a name that is not already a
+    // type -- which covers both forms uniformly and needs no lookahead:
+    //
+    //     T              ends in `T`  -- unknown identifier   -> type param    OK
+    //     u32 N          ends in `N`  -- unknown identifier   -> value param   OK
+    //     u32[4] W       ends in `W`  -- unknown identifier   -> value param   OK
+    //     u8             ends in `u8` -- a primitive keyword  -> SPECIALIZATION
+    //     Foo            ends in `Foo`-- a registered type    -> SPECIALIZATION
+    //
+    // (The last token of a slot is the one sitting before the `,` or the closing `]`,
+    // so this is decided by remembering the previous token rather than by parsing.)
+    if (s_curr.type == TOK_LBRACKET) {
+        int depth = 1; advance();
+        Token prev = s_curr;
+        while (depth > 0 && s_curr.type != TOK_EOF) {
+            if (s_curr.type == TOK_LBRACKET) depth++;
+            else if (s_curr.type == TOK_RBRACKET) depth--;
+
+            bool slot_ends_here = (depth == 1 && s_curr.type == TOK_COMMA) || depth == 0;
+            if (slot_ends_here && prev.type != TOK_LBRACKET) {
+                bool is_param_name = (prev.type == TOK_IDENTIFIER) &&
+                                     !token_begins_type(prev);
+                if (!is_param_name) {
+                    char buf[320];
+                    snprintf(buf, sizeof(buf),
+                             "impl on a concrete generic instantiation is not supported "
+                             "(specialization): `%.*s` in `impl %.*s[...]` names a TYPE, not a "
+                             "parameter. A method declared in an impl block applies to every "
+                             "instantiation, so write `impl %.*s[T]` and match on T inside if "
+                             "the behavior must differ",
+                             (int)prev.length, prev.start,
+                             (int)impl_type_len, impl_type,
+                             (int)impl_type_len, impl_type);
+                    parse_error(buf);
+                }
+            }
+            if (depth > 0) { prev = s_curr; advance(); } else advance();
+        }
+    }
+
+    // Install struct's type params into scope for all methods in this block.
+    const char** prev_impl_tparams = s_type_params;
+    Type**       prev_impl_pkinds  = s_param_kinds;
+    size_t prev_impl_tparam_count  = s_type_param_count;
+    char* impl_type_nul = strndup(impl_type, impl_type_len);
+    StructDef* impl_sd = Struct_Find(impl_type_nul);
+    free(impl_type_nul);
+    if (impl_sd && impl_sd->type_param_count > 0) {
+        s_type_params      = impl_sd->type_params;
+        s_param_kinds      = impl_sd->param_kinds;
+        s_type_param_count = impl_sd->type_param_count;
+    }
+
+    if (s_curr.type != TOK_LBRACE) parse_error("Expected '{' after impl type name");
+    advance(); // consume '{'
+
+    ASTNode* block = new_node(AST_BLOCK);
+    block->block.capacity = 8;
+    block->block.statements = (ASTNode**)malloc(block->block.capacity * sizeof(ASTNode*));
+    block->block.count = 0;
+
+    while (s_curr.type != TOK_RBRACE && s_curr.type != TOK_EOF) {
+        if (s_curr.type != TOK_FN) parse_error("Expected 'fn' inside impl block");
+        // parse_fn_decl handles the whole method: name mangling, self
+        // injection, generic-param merge with the struct's own, body.
+        ASTNode* node = parse_fn_decl(is_pub, false, impl_type, impl_type_len, impl_sd);
+
+        // parse_fn_decl restores s_type_params to whatever was active on
+        // entry -- which for a method with no [U] extension already is the
+        // struct's params (untouched), but a method WITH one leaves the
+        // merged copy active. Re-seed from impl_sd so the next method in
+        // this block starts clean, matching the pre-merge behavior.
+        s_type_params      = impl_sd ? impl_sd->type_params      : prev_impl_tparams;
+        s_param_kinds      = impl_sd ? impl_sd->param_kinds      : prev_impl_pkinds;
+        s_type_param_count = impl_sd ? impl_sd->type_param_count : prev_impl_tparam_count;
+
+        append_block_statement(block, node);
+    }
+    if (s_curr.type != TOK_RBRACE) parse_error("Expected '}' to close impl block");
+    advance();
+    s_type_params      = prev_impl_tparams;
+    s_param_kinds      = prev_impl_pkinds;
+    s_type_param_count = prev_impl_tparam_count;
+    return block;
 }
 
 // A function declaration -- `fn`, `pub fn`, `extern fn`, and the `fn`s inside an `impl`
@@ -4778,7 +4497,9 @@ static ASTNode* parse_top_level(void) {
 //
 // Takes the modifiers as parameters because they are consumed BEFORE the dispatch
 // (`pub extern fn ...`), so they cannot be re-read from s_curr here.
-static ASTNode* parse_fn_decl(bool is_pub, bool is_extern) {
+static ASTNode* parse_fn_decl(bool is_pub, bool is_extern,
+                              const char* impl_type_name, size_t impl_type_len,
+                              StructDef* impl_sd) {
     if (s_curr.type == TOK_FN) {
         const char* p = s_curr.start + s_curr.length;
         while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
@@ -4799,10 +4520,25 @@ static ASTNode* parse_fn_decl(bool is_pub, bool is_extern) {
         Token name = s_curr;
         advance();
 
+        // Inside an impl block, the parsed name mangles to `TYPE_method`.
+        char* mname = NULL;
+        size_t mname_len = 0;
+        if (impl_type_name) {
+            mname_len = impl_type_len + 1 + name.length;
+            mname = (char*)malloc(mname_len + 1);
+            memcpy(mname, impl_type_name, impl_type_len);
+            mname[impl_type_len] = '_';
+            memcpy(mname + impl_type_len + 1, name.start, name.length);
+            mname[mname_len] = '\0';
+        }
+
         // Generic parameter list: fn name[T, u32 N](...). Type params are bare
         // names; value params are `type name` (e.g. `u32 N`), pinned like function
         // parameters. Installed into s_type_params/s_param_kinds so parse_type and
         // value-arg folding resolve them across this function's signature and body.
+        // Inside an impl block, the struct's own type params (already the active
+        // s_type_params from the impl-block scope) seed this list, so a method's
+        // optional `[U]` extension merges with them rather than replacing them.
         const char** tparams = NULL;
         Type**       pkinds  = NULL;
         size_t tparam_count = 0;
@@ -4815,24 +4551,44 @@ static ASTNode* parse_fn_decl(bool is_pub, bool is_extern) {
             s_type_params = tparams;
             s_param_kinds = pkinds;
             s_type_param_count = tparam_count;
+        } else if (impl_type_name) {
+            // No method-level extension: the struct's params (already installed
+            // as s_type_params by the impl-block loop) apply as-is.
+            tparams = prev_tparams;
+            pkinds = prev_pkinds;
+            tparam_count = prev_tparam_count;
         }
 
         if (s_curr.type != TOK_LPAREN) parse_error("Expected '('");
         advance();
-        
+
         ASTNode* node = new_node(AST_FUNC_DECL);
-        node->func_decl.name = name.start;
-        node->func_decl.name_len = name.length;
+        node->func_decl.name = impl_type_name ? mname : name.start;
+        node->func_decl.name_len = impl_type_name ? mname_len : name.length;
         node->func_decl.param_count = 0;
-        node->func_decl.pack_param_index = -1;
+        node->func_decl.pack_param_index = -1; // packs not supported on impl methods yet
         size_t param_cap = 6;
         node->func_decl.param_syms = (Symbol**)calloc(param_cap, sizeof(Symbol*));
-        
+
         // Temporarily set up a scope for the parameters
         SymbolTable* prev_table = s_symtable;
         s_symtable = SymTable_Create(prev_table);
         s_symtable->is_function_scope = true;
-        
+
+        if (impl_type_name) {
+            // Inject self as first param (name "self"), type TYPE*.
+            Type* self_base = (Type*)calloc(1, sizeof(Type));
+            self_base->cls = TYPE_STRUCT;
+            self_base->struct_name = impl_type_name;
+
+            Type* self_type = (Type*)calloc(1, sizeof(Type));
+            self_type->cls = TYPE_POINTER;
+            self_type->pointer_base = self_base;
+
+            Symbol* self_sym = SymTable_Add(s_symtable, "self", 4, self_type, SYM_LOCAL);
+            node->func_decl.param_syms[node->func_decl.param_count++] = self_sym;
+        }
+
         bool is_vararg = false;
         if (s_curr.type != TOK_RPAREN) {
             while (1) {
@@ -4915,7 +4671,9 @@ static ASTNode* parse_fn_decl(bool is_pub, bool is_extern) {
             ftype->function.param_types[i] = node->func_decl.param_syms[i]->type;
         }
         
-        Symbol* func_sym = SymTable_Add(prev_table, name.start, name.length, ftype, SYM_FUNCTION);
+        Symbol* func_sym = impl_type_name
+            ? SymTable_Add(prev_table, mname, mname_len, ftype, SYM_FUNCTION)
+            : SymTable_Add(prev_table, name.start, name.length, ftype, SYM_FUNCTION);
         node->func_decl.sym = func_sym;
         if (is_extern) func_sym->is_extern = true;
         if (is_pub) func_sym->is_pub = true;

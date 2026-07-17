@@ -1,4 +1,4 @@
-//@ expect err Expected return type or '{' in impl method
+//@ expect err Expected '{' for function body
 struct Box[T] { T val }
 impl Box[X] {
     fn get() X { return self.val }

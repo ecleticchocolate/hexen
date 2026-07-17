@@ -499,7 +499,7 @@ if cond { ... } else if cond2 { ... } else { ... }
 while cond { ... }
 for i32 i = 0 to 10 { ... }              // exclusive end, step +1
 for i32 i = 10 to 0 by (0 - 1) { ... }   // explicit step
-for TYPE val in iterable { ... }         // iteration over arrays, __index/len structs, or begin/next cursor structs
+for TYPE val in iterable { ... }         // iteration over begin/next cursor structs
 for unpack PATTERN in iterable { ... }   // destructure directly in the loop header
 break
 continue
