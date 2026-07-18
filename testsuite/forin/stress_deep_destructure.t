@@ -9,7 +9,7 @@ impl List {
         if self.ix >= 2 { return .None }
         Outer o = self.arr[self.ix]
         self.ix = self.ix + 1
-        return .Some{o}
+        return .Some(o)
     }
 }
 fn main() i32 {

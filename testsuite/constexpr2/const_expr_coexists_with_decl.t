@@ -14,6 +14,8 @@ fn main() i32 {
     printf("local  decl : %d\n", LOCAL_C)
     printf("float  decl : %f\n", FL)
     printf("agg    decl : %d %d %d\n", ARR[0], ARR[1], ARR[2])
-    printf("expr   form : %d\n", const(LOCAL_C + 8))
+    u32 t1
+    const { t1 = LOCAL_C + 8 }
+    printf("expr   form : %d\n", t1)
     return 0
 }

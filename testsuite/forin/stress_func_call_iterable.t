@@ -7,7 +7,7 @@ impl Iter {
         if self.curr >= self.limit { return .None }
         i32 v = self.curr
         self.curr = self.curr + 1
-        return .Some{v}
+        return .Some(v)
     }
 }
 fn make_iter(i32 limit) Iter { return {.limit = limit, .curr = 0} }

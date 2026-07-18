@@ -7,8 +7,8 @@
 enum E { i32 A  None }
 fn get(E e) i32 {
     match e {
-        .A{x} { return x }
+        .A(x) { return x }
         .None { return 0 }
     }
 }
-fn main() i32 { E e = .A{5}  return get(e) }
+fn main() i32 { E e = .A(5)  return get(e) }

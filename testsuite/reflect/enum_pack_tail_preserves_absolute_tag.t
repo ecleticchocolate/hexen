@@ -23,7 +23,7 @@ fn tag_after_n_peels[Walk, u32 N](Walk* p) u32 {
 }
 
 fn main() i32 {
-    Five v = .V3{30}
+    Five v = .V3(30)
     printf("%d %d %d %d\n",
         tag_after_n_peels[Five, 0](&v),
         tag_after_n_peels[Five, 1](&v),

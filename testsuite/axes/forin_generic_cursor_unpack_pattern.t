@@ -13,7 +13,7 @@ impl Cur[T] {
         if self.pos >= 2 { return .None }
         Pair[T] p = self.items[self.pos]
         self.pos = self.pos + 1
-        return .Some{p}
+        return .Some(p)
     }
 }
 fn main() i32 {

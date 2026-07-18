@@ -7,10 +7,10 @@ fn main() i32 {
     Fns f
     f.arr[0] = inc
     f.arr[1] = dec
-    Cmd c = .Batch{f}
+    Cmd c = .Batch(f)
     match c {
-        .Batch{fs} { return (i32)(fs.arr[0](10) + fs.arr[1](10)) }
-        .Single{v} { return (i32) v }
+        .Batch(fs) { return (i32)(fs.arr[0](10) + fs.arr[1](10)) }
+        .Single(v) { return (i32) v }
     }
     return -1
 }

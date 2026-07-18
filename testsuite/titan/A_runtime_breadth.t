@@ -14,8 +14,8 @@ fn dist2(Vec[i32] v) i32 { return v.x * v.x + v.y * v.y }
 
 fn classify(i32 n) Shape {
     if n < 0 { return .None }
-    if n == 0 { return .Circle{0} }
-    return .Point{ {.x = n, .y = n} }
+    if n == 0 { return .Circle(0) }
+    return .Point( {.x = n, .y = n} )
 }
 
 fn main() i32 {
@@ -84,8 +84,8 @@ fn main() i32 {
     // --- enum + match + generic-enum-payload + nested struct in enum ---
     Shape s = classify(7)
     match s {
-        .Point{pt} { total = total + (i64)(pt.x + pt.y) }   // 7+7 = +14
-        .Circle{r} { total = total - 1 }
+        .Point(pt) { total = total + (i64)(pt.x + pt.y) }   // 7+7 = +14
+        .Circle(r) { total = total - 1 }
         .None { total = total - 2 }
     }                                   // = 797
 

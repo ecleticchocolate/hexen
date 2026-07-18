@@ -7,10 +7,10 @@
 extern fn printf(u8* fmt, ...) i32
 struct Buf[T, u32 N] { T[N] data }
 impl Buf[T, N] {
-    fn double_cap() u32 { return const(N * 2) }
-    fn cap_plus() u32   { return const(N + 1) }
+    fn double_cap() u32 { u32 r  const { r = N * 2 }  return r }
+    fn cap_plus() u32   { u32 r  const { r = N + 1 }  return r }
 }
-fn tsize[T]() u32 { return const(sizeof(T) * 2) }
+fn tsize[T]() u32 { u32 r  const { r = sizeof(T) * 2 }  return r }
 fn main() i32 {
     Buf[i32, 5] a
     Buf[i32, 8] b

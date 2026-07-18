@@ -8,22 +8,30 @@ enum Expr {
 }
 fn eval(Expr* e) i32 {
     match *e {
-        .Num{n} { return n }
-        .Neg{inner} { return -eval(inner) }
-        .Add{pair} { return eval(pair.l) + eval(pair.r) }
-        .Mul{pair} { return eval(pair.l) * eval(pair.r) }
+        .Num(n) { return n }
+        .Neg(inner) { return -eval(inner) }
+        .Add(pair) { return eval(pair.l) + eval(pair.r) }
+        .Mul(pair) { return eval(pair.l) * eval(pair.r) }
     }
     return 0
 }
 fn build() i32 {
-    Expr* two = new Expr{.Num = 2}
-    Expr* three = new Expr{.Num = 3}
-    Expr* ten = new Expr{.Num = 10}
-    Expr* four = new Expr{.Num = 4}
-    Expr* neg_four = new Expr{.Neg = four}
-    Expr* sum = new Expr{.Add = {.l = two, .r = three}}
-    Expr* diff = new Expr{.Add = {.l = ten, .r = neg_four}}
-    Expr* product = new Expr{.Mul = {.l = sum, .r = diff}}
+    Expr* two = new Expr
+    *two = .Num(2)
+    Expr* three = new Expr
+    *three = .Num(3)
+    Expr* ten = new Expr
+    *ten = .Num(10)
+    Expr* four = new Expr
+    *four = .Num(4)
+    Expr* neg_four = new Expr
+    *neg_four = .Neg(four)
+    Expr* sum = new Expr
+    *sum = .Add({.l = two, .r = three})
+    Expr* diff = new Expr
+    *diff = .Add({.l = ten, .r = neg_four})
+    Expr* product = new Expr
+    *product = .Mul({.l = sum, .r = diff})
     return eval(product)
 }
 const i32 RESULT = build()

@@ -10,7 +10,7 @@ impl Cur {
         if self.pos >= 3 { return .None }
         fn(i32) i32 f = self.fns[self.pos]
         self.pos = self.pos + 1
-        return .Some{f}
+        return .Some(f)
     }
 }
 fn double(i32 x) i32 { return x * 2 }

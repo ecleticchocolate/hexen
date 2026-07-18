@@ -7,7 +7,7 @@ impl Iter {
         if self.cur >= self.max { return .None }
         i32 v = self.cur
         self.cur = self.cur + 2
-        return .Some{v}
+        return .Some(v)
     }
 }
 fn main() i32 {

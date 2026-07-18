@@ -76,9 +76,9 @@ fn dump[T](T* p) void {
 }
 
 fn main() i32 {
-    Shape s1 = .Circle{5}
-    Shape s2 = .Rect{{7, 9}}
-    Shape s3 = .Flag{true}
+    Shape s1 = .Circle(5)
+    Shape s2 = .Rect({7, 9})
+    Shape s3 = .Flag(true)
     Shape s4 = .None
     dump(&s1)  printf("\n")
     dump(&s2)  printf("\n")

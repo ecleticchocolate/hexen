@@ -7,7 +7,7 @@ struct Node { i32 v  Node* next }
 struct List[T] { Node* head }
 struct Cur { Node* p }
 impl List[T] { fn begin() Cur { return {.p = self.head} } }
-impl Cur { fn next() Option[i32*] { if self.p == null { return .None } Node* n = self.p  self.p = n.next  return .Some{&n.v} } }
+impl Cur { fn next() Option[i32*] { if self.p == null { return .None } Node* n = self.p  self.p = n.next  return .Some(&n.v) } }
 fn main() i32 {
     Node c = {.v = 30, .next = null}
     Node b = {.v = 20, .next = &c}

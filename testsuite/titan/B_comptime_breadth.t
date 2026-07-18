@@ -17,7 +17,7 @@ fn fib(u32 n) u32 { return fib_step({.a = 0, .b = 1}, n).a }   // fib(10) = 55
 fn dot(Vec[u32] v) u32 { return v.x * v.x + v.y * v.y }        // generic struct arg
 
 fn maybe(u32 x) Opt[u32] {                  // fn returning generic enum (contextual)
-    if x > 3 { return .Some{x * 10} }
+    if x > 3 { return .Some(x * 10) }
     return .None
 }
 
@@ -61,7 +61,7 @@ fn compute() u32 {
     // fn returning generic enum + match + array of them
     Opt[u32][3] opts = { maybe(5), maybe(2), maybe(7) }   // Some{50}, None, Some{70}
     for u32 j = 0 to 3 {
-        match opts[j] { .Some{s} { total = total + s }  .None { } }   // +50 +70 = +120 -> 373
+        match opts[j] { .Some(s) { total = total + s }  .None { } }   // +50 +70 = +120 -> 373
     }
 
     // nested generic + field chain

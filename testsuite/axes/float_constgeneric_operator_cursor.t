@@ -18,7 +18,7 @@ impl Cur[u32 N] {
         if self.pos >= N { return .None }
         f64 x = self.v[self.pos]
         self.pos = self.pos + 1
-        return .Some{x}
+        return .Some(x)
     }
 }
 fn main() i32 {

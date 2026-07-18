@@ -13,7 +13,7 @@ impl Cur[f64 K] {
         if self.pos >= 3 { return .None }
         i32 v = (i32)((f64)self.items[self.pos] * K)
         self.pos = self.pos + 1
-        return .Some{v}
+        return .Some(v)
     }
 }
 fn main() i32 {

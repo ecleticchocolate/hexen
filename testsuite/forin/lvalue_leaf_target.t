@@ -4,7 +4,7 @@ struct Node { i32 x  i32 y  Node* next }
 struct List { Node* head }
 struct Cur { Node* p }
 impl List { fn begin() Cur { return {.p = self.head} } }
-impl Cur { fn next() Option[Node*] { if self.p == null { return .None } Node* n = self.p  self.p = n.next  return .Some{n} } }
+impl Cur { fn next() Option[Node*] { if self.p == null { return .None } Node* n = self.p  self.p = n.next  return .Some(n) } }
 fn main() i32 {
     Node b = {.x=3,.y=4,.next=null}
     Node a = {.x=1,.y=2,.next=&b}

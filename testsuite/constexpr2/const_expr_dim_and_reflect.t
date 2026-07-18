@@ -11,11 +11,15 @@ fn nf[T]() u32 {
         else { return 0 }
     }
 }
+const u32 ARR_DIM = fib(7)
 fn main() i32 {
-    u32[const(fib(7))] arr
+    u32[ARR_DIM] arr
     printf("array dim  : %d\n", sizeof(arr))
-    u32[const(nf[struct{i32 a  i32 b  i32 c}]())] slots
+    const u32 REFLECT_DIM = nf[struct{i32 a  i32 b  i32 c}]()
+    u32[REFLECT_DIM] slots
     printf("reflect dim: %d\n", sizeof(slots))
-    printf("reflect arg: %d\n", const(nf[struct{i32 a  u8 b}]()))
+    u32 t1
+    const { t1 = nf[struct{i32 a  u8 b}]() }
+    printf("reflect arg: %d\n", t1)
     return 0
 }

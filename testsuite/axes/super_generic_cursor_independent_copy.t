@@ -11,7 +11,7 @@ impl BaseCur[T] {
         if self.pos >= 3 { return .None }
         T v = self.items[self.pos]
         self.pos = self.pos + 1
-        return .Some{v}
+        return .Some(v)
     }
 }
 struct Box[T] { super BaseCur[T] base  u32 extra }

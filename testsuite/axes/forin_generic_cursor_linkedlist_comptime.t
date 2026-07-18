@@ -13,7 +13,7 @@ impl Cur[T] {
         if self.p == null { return .None }
         T v = self.p.val
         self.p = self.p.next
-        return .Some{v}
+        return .Some(v)
     }
 }
 fn build(u32 n) Node[i32]* {

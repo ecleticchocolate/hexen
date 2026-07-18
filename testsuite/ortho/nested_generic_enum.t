@@ -1,11 +1,11 @@
 //@ expect val 5
 enum Option[T] { T Some  None }
 fn main() i32 {
-    Option[Option[u32]] oo = .Some{ .Some{5} }
+    Option[Option[u32]] oo = .Some( .Some(5) )
     match oo {
-        .Some{inner} {
+        .Some(inner) {
             match inner {
-                .Some{v} { return (i32) v }
+                .Some(v) { return (i32) v }
                 .None { return -2 }
             }
         }

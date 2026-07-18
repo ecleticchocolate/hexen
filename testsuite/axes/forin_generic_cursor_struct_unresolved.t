@@ -19,7 +19,7 @@ impl Cur[T, u32 N] {
         if self.pos >= N { return .None }
         T v = self.items[self.pos]
         self.pos = self.pos + 1
-        return .Some{v}
+        return .Some(v)
     }
 }
 fn main() i32 {

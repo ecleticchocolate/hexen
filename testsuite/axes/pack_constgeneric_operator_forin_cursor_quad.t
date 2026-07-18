@@ -31,7 +31,7 @@ impl Cur[u32 N] {
         if self.pos >= N { return .None }
         i32 v = self.fns[self.pos]((i32)N) + self.bias[self.pos]
         self.pos = self.pos + 1
-        return .Some{v}
+        return .Some(v)
     }
 }
 

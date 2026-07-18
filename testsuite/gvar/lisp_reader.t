@@ -12,30 +12,30 @@ enum Val { i64 Int  i64 Op  Cell Cons  i64 Nil }
 
 fn mk_int(i64 n) Val* {
     Val* v = new Val
-    *v = .Int{n}
+    *v = .Int(n)
     return v
 }
 fn mk_op(i64 o) Val* {
     Val* v = new Val
-    *v = .Op{o}
+    *v = .Op(o)
     return v
 }
 fn mk_nil() Val* {
     Val* v = new Val
-    *v = .Nil{0}
+    *v = .Nil(0)
     return v
 }
 
 fn cons(Val* a, Val* b) Val* {
     Val* v = new Val
-    *v = .Cons{ {.a = a, .b = b} }
+    *v = .Cons( {.a = a, .b = b} )
     return v
 }
 
-fn car(Val* v) Val* { match *v { .Cons{c} { return c.a }  .Int{n} { return v }  .Op{o} { return v }  .Nil{x} { return v } }  return v }
-fn cdr(Val* v) Val* { match *v { .Cons{c} { return c.b }  .Int{n} { return v }  .Op{o} { return v }  .Nil{x} { return v } }  return v }
+fn car(Val* v) Val* { match *v { .Cons(c) { return c.a }  .Int(n) { return v }  .Op(o) { return v }  .Nil(x) { return v } }  return v }
+fn cdr(Val* v) Val* { match *v { .Cons(c) { return c.b }  .Int(n) { return v }  .Op(o) { return v }  .Nil(x) { return v } }  return v }
 
-fn is_nil(Val* v) bool { match *v { .Nil{x} { return true }  .Int{n} { return false }  .Op{o} { return false }  .Cons{c} { return false } }  return false }
+fn is_nil(Val* v) bool { match *v { .Nil(x) { return true }  .Int(n) { return false }  .Op(o) { return false }  .Cons(c) { return false } }  return false }
 
 // ─── Reader ──────────────────────────────────────────────────────────────────
 // Parses from a NUL-terminated u8* buffer. A global cursor walks the string.
@@ -83,14 +83,14 @@ fn read_list() Val* {
 }
 
 // ─── Evaluator ───────────────────────────────────────────────────────────────
-fn op_of(Val* v) i64 { match *v { .Op{o} { return o }  .Int{n} { return 0 }  .Cons{c} { return 0 }  .Nil{x} { return 0 } }  return 0 }
+fn op_of(Val* v) i64 { match *v { .Op(o) { return o }  .Int(n) { return 0 }  .Cons(c) { return 0 }  .Nil(x) { return 0 } }  return 0 }
 
 fn eval(Val* e) i64 {
     match *e {
-        .Int{n} { return n }
-        .Op{o} { return 0 }
-        .Nil{x} { return 0 }
-        .Cons{c} {
+        .Int(n) { return n }
+        .Op(o) { return 0 }
+        .Nil(x) { return 0 }
+        .Cons(c) {
             i64 op = op_of(car(e))     // operator symbol
             Val* rest = cdr(e)
             i64 a = eval(car(rest))

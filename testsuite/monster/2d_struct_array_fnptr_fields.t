@@ -5,8 +5,8 @@ fn sq(u32 x) u32 { return x * x }
 fn main() i32 {
     Cell[2][2] grid
     grid[1][1].op = sq
-    grid[1][1].cached = .Some{7}
+    grid[1][1].cached = .Some(7)
     u32 acc = grid[1][1].op(6)
-    match grid[1][1].cached { .Some{v} { acc += v }  .None { } }
+    match grid[1][1].cached { .Some(v) { acc += v }  .None { } }
     return (i32) acc
 }
