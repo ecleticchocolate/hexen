@@ -29,6 +29,7 @@ static ASTNode* parse_expr_prec(int min_prec);
 static ASTNode* parse_block_body(void);
 static ASTNode* parse_alias_decl(void);
 static ASTNode* parse_const_decl(bool is_pub);
+static ASTNode* parse_const_block(void);
 static void advance(void);
 static void parse_error(const char* msg);
 static bool token_is_type_start(TokenType t);
@@ -514,6 +515,30 @@ static Type* parse_generic_value_arg(Type* pin) {
 //   arr[0] = mk          <- statement ends with a value
 //   (fn(u32) u32)[2]* p  <- next statement; the `(` must NOT read as `mk(...)`
 static bool s_curr_newline_before = false;
+
+// Full parser position snapshot: the lexer's scan cursor (LexerState) PLUS the
+// already-lexed lookahead token (s_curr) and its newline flag. A LexerState
+// alone only rewinds the SCANNER -- it says nothing about the token already
+// sitting in s_curr, which is stale the moment the scanner moves. Every
+// speculative-parse site in this file used to snapshot/restore these three
+// fields by hand (14 call sites, no two spelled quite the same way); this is
+// the one shared checkpoint for all of them.
+typedef struct {
+    LexerState lex;
+    Token curr;
+    bool curr_newline_before;
+} ParseCheckpoint;
+static void parser_save(ParseCheckpoint* cp) {
+    Lexer_Save(&cp->lex);
+    cp->curr = s_curr;
+    cp->curr_newline_before = s_curr_newline_before;
+}
+static void parser_restore(const ParseCheckpoint* cp) {
+    Lexer_Restore(&cp->lex);
+    s_curr = cp->curr;
+    s_curr_newline_before = cp->curr_newline_before;
+}
+
 // `with` desugaring: after replaying N prefix tokens, switch the lexer back to
 // the body source. s_with_switch_after counts how many more advance() calls
 // before the switch fires. On fire: restore s_with_switch_st, set s_curr to
@@ -1418,7 +1443,7 @@ static ASTNode** parse_call_arg_list(size_t* count_out) {
     return args;
 }
 
-// Compile-time reflection operators: const(), sizeof(), alignof(), fnof(), offsetof(),
+// Compile-time reflection operators: sizeof(), alignof(), fnof(), offsetof(),
 // nameof(). Split out of parse_primary, which had grown to 851 lines by absorbing every
 // expression form that wasn't an infix operator.
 //
@@ -1426,44 +1451,12 @@ static ASTNode** parse_call_arg_list(size_t* count_out) {
 // they are the surface cost of a deliberate design choice: Torrent has no `typeinfo`,
 // because a type is never a value. Each operator therefore takes a TYPE and returns a
 // LEAF (a u64, a u8*, a fn symbol) that cannot be projected further, and each needs its
-// own hand-written parse. Six near-identical blocks is what "no types as values" LOOKS
+// own hand-written parse. Five near-identical blocks is what "no types as values" LOOKS
 // like at the parser; the alternative is one general reflection API returning a
 // projectable value, i.e. the spiral this language exists to avoid.
 //
 // Returns NULL if the current token starts none of them, so parse_primary can fall
 // through to the next form.
-
-static ASTNode* parse_const_expr(void) {
-    advance();  // 'const'
-    if (s_curr.type != TOK_LPAREN)
-        parse_error("Expected '(' after 'const' in expression position "
-                    "(a const *declaration* is `const TYPE NAME = expr`)");
-    advance();  // '('
-    ASTNode* inner = parse_expr_prec(0);
-    if (s_curr.type != TOK_RPAREN) parse_error("Expected ')' to close const(...)");
-    advance();  // ')'
-
-    if (s_type_param_count > 0 && expr_mentions_generic_param(inner)) {
-        ASTNode* node = new_node(AST_CONST_EXPR);
-        node->const_expr.inner = inner;
-        return node;
-    }
-
-    int64_t value = 0;
-    if (!ConstEval(inner, &value))
-        parse_error("const(...) operand is not a constant expression");
-
-    ASTNode* node = new_node(AST_INT_LITERAL);
-    if (s_ce_isfloat) {
-        node->lit_kind = LIT_FLOAT;
-        double d; memcpy(&d, &value, sizeof d);
-        node->float_value = d;
-    } else {
-        node->lit_kind = LIT_INT;
-        node->int_value = (uint64_t)value;
-    }
-    return node;
-}
 
 static ASTNode* parse_sizeof_expr(void) {
     advance();
@@ -1588,27 +1581,6 @@ static ASTNode* parse_offsetof_and_nameof_expr(void) {
     return node;
 }
 static ASTNode* parse_reflect_op(void) {
-    // const(EXPR) -- force compile-time evaluation in EXPRESSION position.
-    //
-    // This adds no evaluation machinery. `const NAME = EXPR` already folds EXPR via
-    // ConstEval and splices the resulting literal in at every use site (a scalar
-    // const has no runtime storage at all). The only thing that was missing was
-    // *reachability*: the folder could only be invoked at a binding, so any
-    // intermediate fold had to be given a name whether or not the name meant
-    // anything. `const(EXPR)` is that same folder, reachable as an expression --
-    // an anonymous const. One concept, one keyword, two syntactic positions.
-    //
-    // Deliberately NOT a second keyword (`comptime`): Torrent's `const` is already
-    // purely an evaluation-time marker (it is not a mutability marker -- there is no
-    // var/const axis), so a new keyword would be a synonym for a mechanism that
-    // exists. That is the C++ `const`/`constexpr`/`consteval` trap, where the first
-    // keyword's scope was drawn too narrowly and two more were needed to widen it.
-    //
-    // Hard error if EXPR does not fold -- never a silent fallback to runtime, or the
-    // annotation would be a hint rather than a guarantee (see design tenets, §1:
-    // loud failure over silent wrongness).
-    if (s_curr.type == TOK_CONST) return parse_const_expr();
-
     // sizeof(type) or sizeof(expr) -> u64 compile-time constant. Polymorphic like C.
     if (s_curr.type == TOK_SIZEOF) return parse_sizeof_expr();
 
@@ -1697,7 +1669,7 @@ static ASTNode* parse_new_expr(void) {
             resolve_brace_literal(lit, t);
             node->new_expr.init = lit;
         }
-        
+
         node->result_type = NULL; // pointer-to-t; inferred in Type_Infer
         return node;
     }
@@ -1737,7 +1709,7 @@ static ASTNode* parse_if_expr(void) {
 
 // Bare, payload-less enum-variant node shell: `.Variant` with the type still
 // inferred from context (resolved from target in typecheck). Shared by every
-// `.Variant` / `.Variant{payload}` parse site; callers that allow a payload
+// `.Variant` / `.Variant(payload)` parse site; callers that allow a payload
 // fill node->struct_lit.values[0]/count themselves after checking for one --
 // what differs between sites is how (or whether) a following '{' is read as
 // a payload wrapper, not how the bare node is built.
@@ -1754,28 +1726,39 @@ static ASTNode* make_enum_variant_node(Token vtok) {
     return node;
 }
 
-// `.Variant` / `.Variant{payload}` -- an enum literal with the type inferred from
+// `.Variant` / `.Variant(payload)` -- an enum literal with the type inferred from
 // context. Split out of parse_primary.
 static ASTNode* parse_enum_literal(void) {
 
 
-    // Contextual enum literal `.Variant` / `.Variant{payload}` -- UNTYPED at parse
+    // Contextual enum literal `.Variant` / `.Variant(payload)` -- UNTYPED at parse
     // time, just like a bare `{...}` aggregate. The leading `.` is unambiguous (no
     // value expression starts with `.`), so the enum type is inferred from the
-    // target via resolve_brace_literal rather than written out. Mirrors struct/array
-    // literal inference; the explicit `EnumType.Variant{..}` form still works (above).
+    // target via resolve_brace_literal rather than written out.
+    //
+    // Payload uses `(` (not `{`) deliberately: a variant is a tagged constructor
+    // taking one positional argument, not an aggregate with named/positional
+    // fields, so it doesn't share {}'s grammar family with struct/array literals.
+    // This also means a bare `.Variant` can never be followed by a `{` that
+    // belongs to IT -- the `{` is always something else (a block, a struct
+    // literal elsewhere), so no lookahead is needed here or at any call site
+    // to tell "payload" from "whatever comes after this value." `(` was
+    // previously `{`, which required match's own depth-counting lookahead hack
+    // to avoid swallowing the arm's own body brace on a payload-less variant --
+    // that hack, and the equivalent bug this left unpatched in if/while/every
+    // other expression position, is exactly what this syntax removes.
     if (s_curr.type == TOK_DOT) {
         advance();
         if (s_curr.type != TOK_IDENTIFIER) parse_error("Expected variant name after '.'");
         Token vtok = s_curr; advance();
         ASTNode* node = make_enum_variant_node(vtok);
-        if (s_curr.type == TOK_LBRACE) {
+        if (s_curr.type == TOK_LPAREN) {
             advance();
-            if (s_curr.type != TOK_RBRACE) {
+            if (s_curr.type != TOK_RPAREN) {
                 node->struct_lit.values[0] = parse_expr_prec(0);
                 node->struct_lit.count = 1;
             }
-            if (s_curr.type != TOK_RBRACE) parse_error("Expected '}' after variant payload");
+            if (s_curr.type != TOK_RPAREN) parse_error("Expected ')' after variant payload");
             advance();
         }
         return node;
@@ -1790,7 +1773,7 @@ static ASTNode* parse_enum_literal(void) {
     //   `{ expr, ... }` / `{}` -> array-shaped (AST_ARRAY_LITERAL, elem_type=NULL)
     // A leading `.IDENT` is AMBIGUOUS: `.field =` is a struct field, but `.Variant`
     // (no `=`) is a contextual ENUM element of an ARRAY literal — e.g.
-    // `Opt[2] a = {.S{10}, .None}`. Two-token lookahead disambiguates: `.IDENT =`
+    // `Opt[2] a = {.S(10), .None}`. Two-token lookahead disambiguates: `.IDENT =`
     // is struct-shaped, anything else after `.IDENT` is an enum element (array).
 
     return NULL;
@@ -2495,21 +2478,30 @@ static void compile_pattern(ASTNode* pat, ASTNode* scrut, Type* scrut_type, ASTN
         return;
     }
     
-    // Enum-variant pattern: `.Variant` or `.Variant{payload}`, parsed as an
-    // AST_STRUCT_LITERAL with is_enum_variant=true (field_names[0] = variant
-    // name, values[0] = payload sub-pattern if count==1). This mirrors the old
-    // hardcoded enum-match path's TAGREAD()+_m.Variant shape, but generically:
-    // emit a tag-equality check ANDed into cond, then recurse into the payload
-    // sub-pattern via a field access on the SAME scrut node (reused, same as
-    // every other branch here -- scrut is always a side-effect-free chain of
-    // field/index/ident reads on top of the one materialized match temp, so
-    // reusing the pointer in two places just re-emits the same read twice).
+    // Enum-variant pattern: `.Variant(payload)` (is_enum_variant=true, field_names[0]
+    // = variant name, values[0] = payload sub-pattern if count==1) OR the designated-
+    // literal idiom `{.Variant = payload}` (is_enum_variant=false, but sdef resolved
+    // to the enum itself with exactly one field -- same shape, different spelling,
+    // see the identical broadening in the exhaustiveness check above). Emit a
+    // tag-equality check ANDed into cond, then recurse into the payload sub-pattern
+    // via a field access on the SAME scrut node (reused, same as every other branch
+    // here -- scrut is always a side-effect-free chain of field/index/ident reads on
+    // top of the one materialized match temp, so reusing the pointer in two places
+    // just re-emits the same read twice).
     // MUST come before the plain AST_STRUCT_LITERAL branch below: that branch
     // matches any struct literal unconditionally, including enum-variant ones,
     // and would treat the variant name as a bogus field name -- worse, for a
     // no-payload variant its count==0 loop body never runs, so it returns
     // having added NO condition at all, silently making that arm match always.
-    if (pat->type == AST_STRUCT_LITERAL && pat->struct_lit.is_enum_variant) {
+    // Real bug found and fixed via this exact gap: `{.Some = v}` fell through to
+    // the plain-struct branch, read `scrut.Some` unconditionally with no tag
+    // check, and silently returned garbage/wrong values on a `.None`-tagged scrut
+    // instead of failing to match.
+    bool is_variant_pat = pat->type == AST_STRUCT_LITERAL &&
+        (pat->struct_lit.is_enum_variant ||
+         (scrut_type && scrut_type->cls == TYPE_STRUCT && pat->struct_lit.sdef &&
+          pat->struct_lit.sdef->is_enum && pat->struct_lit.count == 1));
+    if (is_variant_pat) {
         StructDef* sd = (scrut_type && scrut_type->cls == TYPE_STRUCT) ? Struct_Find(scrut_type->struct_name) : NULL;
         if (!sd || !sd->is_enum) parse_error("'.Variant' pattern used against a non-enum scrutinee");
 
@@ -2682,43 +2674,29 @@ static ASTNode* parse_match_value(ASTNode* scrut, Type* st) {
         
         if (is_wildcard) advance();
         else if (s_curr.type == TOK_DOT) {
-            // Enum dot-variant pattern head `.Variant` or `.Variant{payload}`.
+            // Enum dot-variant pattern head `.Variant` or `.Variant(payload)`.
             // Parsed by hand here rather than via the generic parse_expr_prec(0)
-            // dot-literal path, because that grammar greedily treats ANY '{'
-            // immediately after the variant name as opening a payload wrapper
-            // -- which collides with the match arm's own '{' when a no-payload
-            // variant is matched bare, e.g. `.None { ... }`. Fix: only treat
-            // the immediate '{' as a payload wrapper if, after skipping its
-            // balanced contents, ANOTHER '{' follows (the real arm body) --
-            // i.e. only when two brace-groups are actually stacked back to
-            // back. A bare `.None { ... }` has just one group (the arm body),
-            // so it's left alone and the payload-group logic never fires.
+            // dot-literal path because match arms need their own AST_STRUCT_LITERAL
+            // pattern node wired into compile_pattern/exhaustiveness below, not
+            // because of any remaining ambiguity: `(` never opens the arm's own
+            // body (that's always `{`), so a bare `.None { ... }` and a payload
+            // `.Some(v) { ... }` are told apart by construction, no lookahead
+            // needed -- unlike the old `{payload}{body}` double-brace shape this
+            // replaced, which required a depth-counting scan to tell whether one
+            // or two brace-groups followed the variant name.
             advance(); // '.'
             if (s_curr.type != TOK_IDENTIFIER) parse_error("Expected variant name after '.'");
             Token vtok = s_curr; advance();
             ASTNode* node = make_enum_variant_node(vtok);
 
-            if (s_curr.type == TOK_LBRACE) {
-                LexerState psave; Lexer_Save(&psave); Token pcur_save = s_curr;
-                int depth = 0;
-                do {
-                    if (s_curr.type == TOK_LBRACE) depth++;
-                    else if (s_curr.type == TOK_RBRACE) depth--;
-                    else if (s_curr.type == TOK_EOF) break;
-                    advance();
-                } while (depth > 0);
-                bool has_payload_group = (s_curr.type == TOK_LBRACE);
-                Lexer_Restore(&psave); s_curr = pcur_save;
-
-                if (has_payload_group) {
-                    advance(); // '{'
-                    if (s_curr.type != TOK_RBRACE) {
-                        node->struct_lit.values[0] = parse_expr_prec(0);
-                        node->struct_lit.count = 1;
-                    }
-                    if (s_curr.type != TOK_RBRACE) parse_error("Expected '}' after variant payload");
-                    advance();
+            if (s_curr.type == TOK_LPAREN) {
+                advance(); // '('
+                if (s_curr.type != TOK_RPAREN) {
+                    node->struct_lit.values[0] = parse_expr_prec(0);
+                    node->struct_lit.count = 1;
                 }
+                if (s_curr.type != TOK_RPAREN) parse_error("Expected ')' after variant payload");
+                advance();
             }
             pat = node;
             if (Type_IsAggregate(st)) {
@@ -2732,7 +2710,19 @@ static ASTNode* parse_match_value(ASTNode* scrut, Type* st) {
             }
         }
 
-        if (!is_wildcard && is_enum_match && pat->type == AST_STRUCT_LITERAL && pat->struct_lit.is_enum_variant) {
+        // Two AST shapes reach here for the SAME thing -- `.Variant(payload)`
+        // (is_enum_variant=true, via make_enum_variant_node) and the designated-
+        // literal idiom `{.Variant = payload}` (is_enum_variant=false, resolved
+        // as an ordinary struct field whose owning sdef just happens to be the
+        // enum). Both must count toward exhaustiveness identically: `{.Some=v}`
+        // covering Some and `.None` covering None together IS a complete match,
+        // and requiring `else` anyway just because one arm took the designated-
+        // literal spelling would make the documented idiom worse than its
+        // alternate spelling for no reason.
+        bool is_variant_pattern = !is_wildcard && is_enum_match && pat->type == AST_STRUCT_LITERAL &&
+            (pat->struct_lit.is_enum_variant ||
+             (pat->struct_lit.sdef == enum_sd && pat->struct_lit.count == 1));
+        if (is_variant_pattern) {
             int vidx = Enum_VariantIndex(enum_sd, pat->struct_lit.field_names[0], pat->struct_lit.field_name_lens[0]);
             if (vidx >= 0) {
                 if (enum_covered[vidx]) parse_error("unreachable match arm: this variant is already fully covered by an earlier arm");
@@ -3073,23 +3063,12 @@ static ASTNode* parse_match(void) {
 
     // Enums route through the SAME generic pattern matcher as structs, arrays,
     // and primitives: parse_match_value + compile_pattern. There is no separate
-    // enum-match path. Every arm is a `.Variant`/`.Variant{payload}` pattern (or
-    // `else`); the leading dot is what compile_pattern keys on. The old bare
-    // `Variant binding {}` arm form (a hand-rolled tag-read/if-else chain that
-    // duplicated this logic) has been removed -- if the first arm is neither a
-    // dot-variant nor `else`, that's the deleted syntax, and we say so plainly
-    // rather than emitting a confusing "expected variant name" from deep in a
-    // path that no longer exists.
+    // enum-match path. Every arm is a `.Variant`/`.Variant(payload)` pattern (or
+    // `else`); the leading dot is what compile_pattern keys on. No forward peek
+    // here for a better error message on the deleted legacy `Variant binding {}`
+    // form -- that syntax now just falls through to parse_match_value's own
+    // arm parsing and errors there, same as any other malformed arm.
     if (s_curr.type != TOK_LBRACE) parse_error("Expected '{' to begin match arms");
-    {
-        LexerState msave; Lexer_Save(&msave); Token cur_save = s_curr;
-        advance(); // '{'
-        bool ok_first = (s_curr.type == TOK_DOT || s_curr.type == TOK_ELSE || s_curr.type == TOK_RBRACE);
-        Lexer_Restore(&msave); s_curr = cur_save;
-        if (!ok_first)
-            parse_error("enum match arms use `.Variant` / `.Variant{payload}` (or `else`); "
-                        "the bare `Variant name {}` form was removed -- write `.Variant{name}`");
-    }
     return parse_match_value(scrut, st);
 }
 
@@ -3234,16 +3213,14 @@ static ASTNode* parse_forin_statement(void); // fwd
 // containers, so overloading composes for free.
 
 // A method resolved through its receiver's generic base (Method_Mangle) still
-// has that base's own declared type as its return type. If `recv_sd` is a
-// concrete instantiation, substitute its args into `ret` so the result names
-// the actual instantiated type instead of the base's bare type-param symbol.
-static Type* specialize_return(Type* ret, StructDef* recv_sd) {
-    if (ret && recv_sd && recv_sd->generic_base && recv_sd->type_arg_count > 0) {
-        return Type_Substitute(ret, recv_sd->generic_base->type_params,
-                               recv_sd->type_args, recv_sd->type_arg_count);
-    }
-    return ret;
-}
+// has that base's own declared type as its return type. If the receiver is a
+// concrete instantiation, substitute its args into the return type so the
+// result names the actual instantiated type instead of the base's bare
+// type-param symbol. This used to be a hand-rolled copy of Type_Substitute's
+// own generic_base/type_arg_count guard living only here; it's now
+// Type_Substitute_Through_Instance (types.c), the same shared helper
+// types.c's own __assign-operand case uses -- one substitution primitive
+// instead of two independent copies of it drifting apart across files.
 static ASTNode* parse_forin_statement(void) {
     advance(); // past 'for'
 
@@ -3312,7 +3289,7 @@ static ASTNode* parse_forin_statement(void) {
             // instead of the bare param symbol -- else the loop var typechecks
             // as `T` itself. Applied once for begin()'s receiver (itype/csd) and
             // again for next()'s receiver (cur_type, once known).
-            cur_type = specialize_return(begin_fn->type->function.return_type, csd);
+            cur_type = Type_Substitute_Through_Instance(begin_fn->type->function.return_type, csd);
             if (cur_type && cur_type->cls == TYPE_STRUCT) {
                 size_t nn = 0;
                 char* nmangled = Method_Mangle(cur_type, "next", 4, &nn);
@@ -3320,7 +3297,7 @@ static ASTNode* parse_forin_statement(void) {
                 free(nmangled);
                 if (next_fn && next_fn->type && next_fn->type->cls == TYPE_FUNCTION) {
                     StructDef* cur_sd_concrete = Struct_Find(cur_type->struct_name);
-                    opt_type = specialize_return(next_fn->type->function.return_type, cur_sd_concrete);
+                    opt_type = Type_Substitute_Through_Instance(next_fn->type->function.return_type, cur_sd_concrete);
                     opt_sd = (opt_type && opt_type->cls == TYPE_STRUCT)
                                  ? Struct_Find(opt_type->struct_name) : NULL;
                     if (opt_sd && opt_sd->is_enum && opt_sd->field_count == 2) {
@@ -3727,7 +3704,30 @@ static ASTNode* parse_delete_statement(void) {
 }
 
 static ASTNode* parse_decl_or_expr_statement(void) {
+    ParseCheckpoint before_type;
+    parser_save(&before_type);
     Type* type = parse_type();
+    // A real declaration's name is followed by '=', a statement terminator, or
+    // another statement -- never '(' (there is no "declare and immediately call
+    // it" grammar). A parenthesized type immediately followed by NAME( is
+    // therefore always a CAST applied to a call result (`(T)f(x)`), not a
+    // declaration, even though `parse_type()` happily accepts `(T)` as a type
+    // spelling on its own (parens are pure grouping in the type grammar). Back
+    // out and re-parse the whole thing as an expression statement instead of
+    // misreading `f` as a fresh local -- which used to silently shadow an
+    // existing function of that name, dropping the call entirely with no error.
+    if (type != NULL && s_curr.type == TOK_IDENTIFIER) {
+        LexerState after_name; Lexer_Save(&after_name);
+        Token name_tok = s_curr;
+        advance();
+        bool looks_like_call = (s_curr.type == TOK_LPAREN);
+        Lexer_Restore(&after_name);
+        s_curr = name_tok;
+        if (looks_like_call) {
+            parser_restore(&before_type);
+            type = NULL;
+        }
+    }
     if (type != NULL) {
         if (s_curr.type != TOK_IDENTIFIER) {
             parse_error("Expected identifier after type");
@@ -3843,6 +3843,26 @@ static ASTNode* parse_statement(void) {
         return parse_block_body();
     }
     if (s_curr.type == TOK_CONST) {
+        // `const { stmts }` -- a STATEMENT, exactly like `defer { stmts }`, never
+        // an expression (there is no `TYPE x = const { ... }`, the same way there
+        // is no `TYPE x = if cond { .. } else { .. }` in this language). Unlike
+        // `const TYPE name = expr` below (which creates a NEW symbol that VANISHES
+        // -- inlined as a literal, no runtime storage), this form assigns a
+        // comptime-folded value INTO an already-declared, genuinely-runtime
+        // variable: `u32 x  const { x = expr }` -- x is a real local/global,
+        // only its fill is computed at compile time. This is the ONE mechanism
+        // for a forced compile-time fold now -- there used to also be an inline
+        // `const(expr)` operator reachable from expression position (any
+        // sub-expression, anywhere), removed in favor of this single statement
+        // form: declare a temp first, fold into it here, use the temp. Same
+        // discipline `if`/`match` already have as statements, never expressions.
+        {
+            LexerState csave; Lexer_Save(&csave); Token ccur_save = s_curr;
+            advance(); // 'const'
+            bool is_block = (s_curr.type == TOK_LBRACE);
+            Lexer_Restore(&csave); s_curr = ccur_save;
+            if (is_block) return parse_const_block();
+        }
         return parse_const_decl(false);
     }
 
@@ -4024,6 +4044,58 @@ static ASTNode* parse_struct_decl_ex(bool is_enum, bool is_overlapping, bool is_
 }
 
 
+
+// `const { stmts }` -- a STATEMENT (like `defer`, never an expression: there is
+// no `TYPE x = const { .. }`). Parses an ordinary block via parse_block_body
+// (so scoping, nested blocks, everything about it is a plain `{ }` -- `const`
+// itself contributes no scoping, exactly like `defer` contributes none; the
+// braces do that on their own). Then walks the block's TOP-LEVEL statements:
+// any bare assignment `x = expr` (x already declared, ordinary runtime
+// variable -- this does NOT create a new symbol, unlike `const TYPE name =
+// expr`) has its RHS constant-folded in place, so `x` ends up a real runtime
+// variable whose fill was computed at compile time. Handles the same
+// generic-body deferred-fold case the old inline `const(expr)` operator did:
+// an assignment whose RHS mentions an in-scope generic param can't fold NOW
+// (the template body is parsed once, before any instantiation exists), so
+// it's wrapped in AST_CONST_EXPR -- the SAME node clone_ast already re-folds
+// per instantiation (see its AST_CONST_EXPR case) -- instead of failing.
+static ASTNode* parse_const_block(void) {
+    advance(); // consume 'const'
+    ASTNode* block = parse_block_body();
+
+    for (size_t i = 0; i < block->block.count; i++) {
+        ASTNode* stmt = block->block.statements[i];
+        if (stmt->type != AST_ASSIGN) continue; // only bare `x = expr` folds; anything
+                                                   // else (if/while/nested block/decl)
+                                                   // is left as an ordinary statement.
+        ASTNode* rhs = stmt->binary.right;
+
+        if (s_type_param_count > 0 && expr_mentions_generic_param(rhs)) {
+            ASTNode* deferred = new_node(AST_CONST_EXPR);
+            deferred->const_expr.inner = rhs;
+            stmt->binary.right = deferred;
+            continue;
+        }
+
+        int64_t value = 0;
+        s_ce_isfloat = false;
+        if (!ConstEval(rhs, &value))
+            parse_error("const { } assignment operand is not a constant expression");
+
+        ASTNode* lit = new_node(AST_INT_LITERAL);
+        if (s_ce_isfloat) {
+            lit->lit_kind = LIT_FLOAT;
+            double d; memcpy(&d, &value, sizeof d);
+            lit->float_value = d;
+        } else {
+            lit->lit_kind = LIT_INT;
+            lit->int_value = (uint64_t)value;
+        }
+        stmt->binary.right = lit;
+    }
+
+    return block;
+}
 
 static ASTNode* parse_const_decl(bool is_pub) {
     advance(); // consume 'const'

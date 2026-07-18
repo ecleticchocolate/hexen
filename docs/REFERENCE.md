@@ -40,6 +40,9 @@ both mean the same thing). Elsewhere it's a genuine zero-sized unit type, not
 specially restricted: `void x`, `void[N]`, a struct field, or a generic type
 argument (`Box[void]`) are all legal and all cost 0 bytes; `void == void` is
 always `true`. See Showcases for the idiomatic uses this enables.
+`(void) expr` is an ordinary cast to this type — not a dedicated discard
+syntax as in C, just the same cast grammar every other type already uses —
+and reads naturally as "discard the result" since `void` holds nothing.
 
 ---
 
@@ -176,7 +179,7 @@ Config c2                              // bare decl — no literal, no defaults 
 ```
 - By-value pass/return (full copy). Use `Point*` for aliasing.
 - `a == b` on two structs/arrays: field-by-field value equality.
-- Lanewise `+ - * & | ^` and `== !=` on same-shaped aggregates. No `/ % < > <= >=`
+- Implicit lanewise `==` and `!=` on same-shaped aggregates (implicit arithmetic was removed; implement `__add`, `__sub` etc. for `+ - * & | ^`). No `/ % < > <= >=`
   on aggregates, no aggregate-scalar broadcast.
 - Recursive-by-value layout errors on first use (`sizeof`/instantiation), not on
   declaration. Self-pointer (`Node* next`) is always fine.
@@ -225,17 +228,25 @@ enum Direction { North South East West }  // no variant has a payload
 ```
 Layout: `u32` tag + largest payload, laid out like any struct.
 
-Construction (contextual — target type supplies the enum):
+Construction (contextual — target type supplies the enum). The idiom is the
+designated struct-literal shape `{.Variant = payload}` — an enum variant is
+stored as an ordinary field of its enum's own type, so this is the exact same
+grammar `{.field = value}` already uses for structs, not a separate mechanism.
+`.Variant(payload)` also works as an equivalent alternate spelling. A
+payload-less variant is always bare — `.None`, never wrapped in either form,
+since there's no payload to write:
 ```
-Option[u32] o = .Some{42}
+Option[u32] o = {.Some = 42}   // idiom
+Option[u32] o2 = .Some(42)     // equivalent alternate spelling
 Option[u32] n = .None
 ```
 
-`match` on an enum **value** (exhaustive, or `else`):
+`match` on an enum **value** (exhaustive, or `else`) — patterns use the same
+two spellings, tracked identically for exhaustiveness/duplicate-arm checking:
 ```
 match o {
-    .Some{v} { ... }     // v bound to payload
-    .None    { ... }     // no payload -> no binding
+    {.Some = v} { ... }   // v bound to payload
+    .None       { ... }   // no payload -> no binding
 }
 ```
 A bound name in an arm is scoped to that arm only.
@@ -268,8 +279,8 @@ match n {
     else { ... }
 }
 match opt {
-    .Some{v} { ... }       // v bound to the payload
-    .None    { ... }
+    {.Some = v} { ... }    // v bound to the payload
+    .None       { ... }
 }
 ```
 
@@ -394,7 +405,7 @@ fn matmul[T, u32 R, u32 K, u32 Cc](M[T, R, K] a, M[T, K, Cc] b) M[T, R, Cc] {
 ### Variadic packs
 
 ```
-fn f[T...](T... args) i32 { ... }
+fn f[T](T... args) i32 { ... }
 ```
 `T... args` bundles every trailing call argument into one synthesized
 anonymous struct value. Peel one at a time via type-level `match`, recursing
@@ -482,10 +493,10 @@ bool differs = (a == c)   // false
 A function pointer can be an enum variant's payload, matched and called:
 ```
 enum OpKind { fn(i32) i32 Named  None }
-OpKind o = .Named{double}
+OpKind o = {.Named = double}
 match o {
-    .Named{h} { return h(21) }
-    .None     { return 0 }
+    {.Named = h} { return h(21) }
+    .None        { return 0 }
 }
 ```
 Arithmetic on a function pointer is a compile error (nothing to scale by).
@@ -622,7 +633,31 @@ a = b                                   -> __assign(b)  (only when b doesn't alr
 makes `v[i]` both readable and writable — see `std/vector.t`. Known gap:
 `v[i]` as a direct argument to a variadic extern call (`printf`) is unreliable;
 assign to a local first. Not implemented: unary minus overload (desugars to
-`0 - x` before dispatch), `__cast`, destructor hook for `delete`.
+`0 - x` before dispatch), destructor hook for `delete`.
+
+`__cast[T]() T` overloads `(T) x` — dispatches through `x.__cast[T]()`, one
+generic method monomorphized per distinct cast target:
+```
+struct Meters { i32 v }
+impl Meters { fn __cast[T]() T { return (T)(self.v * 100) } }
+Meters m = { .v = 5 }
+f64 cm  = (f64) m   // -> m.__cast[f64]()
+i32 icm = (i32) m   // -> m.__cast[i32](), same method, different instantiation
+```
+A non-generic `__cast() T` (fixed return type) only applies when the cast's
+own target type matches that fixed `T` — casting to anything else does not
+dispatch through it.
+
+`__delete() void` overloads `delete x` — called automatically before the
+underlying `free`. This serves as the language's real destructor hook.
+```
+impl Vector[T] {
+    fn __delete() void {
+        delete self.data
+    }
+}
+// delete v  ->  calls v.__delete() then frees v
+```
 
 ---
 
@@ -646,13 +681,13 @@ fn main() i32 {
 ```
 enum State { u32 Active  bool Inactive }
 fn main() i32 {
-    State[2] arr = { .Active{42}, .Inactive{true} }
+    State[2] arr = { {.Active = 42}, {.Inactive = true} }
     State[2]* p1 = &arr
     State[2]** p2 = &p1
     State[2]*** p3 = &p2
     match (***p3)[0] {
-        .Active{v}   { return (i32) v }
-        .Inactive{b} { return -1 }
+        {.Active = v}   { return (i32) v }
+        {.Inactive = b} { return -1 }
     }
     return -2
 }
@@ -662,12 +697,12 @@ fn main() i32 {
 ```
 enum Option[T] { T Some  None }
 fn fib(u32 n) Option[u32] {
-    if n < 2 { return .Some{n} }
+    if n < 2 { return {.Some = n} }
     match fib(n - 1) {
-        .Some{a} {
+        {.Some = a} {
             match fib(n - 2) {
-                .Some{b} { return .Some{a + b} }
-                .None    { return .None }
+                {.Some = b} { return {.Some = a + b} }
+                .None       { return .None }
             }
         }
         .None { return .None }
@@ -684,8 +719,8 @@ struct Vec { i32[2] xy }
 enum Shape { Vec Line  None }
 fn desc(Shape s) i32 {
     match s {
-        .Line{{ .xy = {0, y} }} { return y }       // first elem pinned to 0
-        .Line{{ .xy = {x, y} }} { return x + y }    // falls through otherwise
+        {.Line = {.xy = {0, y}}} { return y }       // first elem pinned to 0
+        {.Line = {.xy = {x, y}}} { return x + y }    // falls through otherwise
         .None { return -1 }
     }
 }
@@ -786,24 +821,24 @@ enum Res[T] { T Ok  i32 Err }
 enum Node[T] { Res[T][2] Branch  T Leaf }
 fn sum_node[T](Node[T] n, fn(T) i32 f) i32 {
     match n {
-        .Branch{b} {
+        {.Branch = b} {
             i32 acc = 0
             for u32 i = 0 to 2 {
                 match b[i] {
-                    .Ok{v}  { acc = acc + f(v) }
-                    .Err{e} { acc = acc + e }
+                    {.Ok = v}  { acc = acc + f(v) }
+                    {.Err = e} { acc = acc + e }
                 }
             }
             return acc
         }
-        .Leaf{v} { return f(v) }
+        {.Leaf = v} { return f(v) }
     }
     return 0
 }
 fn id(i32 x) i32 { return x }
 fn main() i32 {
-    Res[i32][2] arr = { .Ok{10}, .Err{5} }
-    return sum_node(.Branch{arr}, id)   // f(10) + 5 = 15
+    Res[i32][2] arr = { {.Ok = 10}, {.Err = 5} }
+    return sum_node({.Branch = arr}, id)   // f(10) + 5 = 15
 }
 ```
 
@@ -841,19 +876,19 @@ extern fn printf(u8* fmt, ...) i32
 enum Result[T, E] { T Ok  E Err }
 struct Config { i32 x }
 fn validate(Config* c) Result[void, u8*] {
-    if c.x <= 0 { return .Err{"bad config"} }
-    return .Ok{}          // {} supplies the void payload
+    if c.x <= 0 { return {.Err = "bad config"} }
+    return {.Ok = {}}          // {} supplies the void payload
 }
 fn main() i32 {
     Config good = {.x = 1}
     Config bad = {.x = 0}
     match validate(&good) {
-        .Ok{v}  { printf("good: ok, sizeof(v)=%d\n", (i32)sizeof(v)) }   // 0
-        .Err{e} { printf("good: err %s\n", e) }
+        {.Ok = v}  { printf("good: ok, sizeof(v)=%d\n", (i32)sizeof(v)) }   // 0
+        {.Err = e} { printf("good: err %s\n", e) }
     }
     match validate(&bad) {
-        .Ok{v}  { printf("bad: ok\n") }
-        .Err{e} { printf("bad: err %s\n", e) }   // "bad config"
+        {.Ok = v}  { printf("bad: ok\n") }
+        {.Err = e} { printf("bad: err %s\n", e) }   // "bad config"
     }
     return 0
 }

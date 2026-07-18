@@ -389,6 +389,7 @@ static Type* make_ptr(Type* base) {
 static bool is_untyped_int_literal(ASTNode* n);
 static bool is_untyped_float_literal(ASTNode* n);
 static bool is_null_literal(ASTNode* n);
+static bool is_untyped_literal(ASTNode* n);
 static bool int_fits(int64_t v, const Type* dst);
 static bool check_assignable_ne(Type* dst, ASTNode* src, const char* where);
 static bool unify_types(Type* concrete, Type* generic, const char** type_params, Type** inferred_args, size_t param_count);
@@ -568,6 +569,12 @@ void resolve_brace_literal(ASTNode* node, Type* target) {
             Error_AtNode(node, "struct literal `{.field=..}` used where a non-struct type is expected", NULL);
         StructDef* sd = Struct_Find(target->struct_name);
         if (!sd) Error_AtNode(node, "unknown struct type for literal", NULL);
+        // A designated literal `{.Variant = payload}` targeting an enum resolves
+        // here same as an ordinary struct field: enum variants are stored as
+        // StructFields on their StructDef, so Struct_FindField below finds the
+        // variant exactly like it would a real field. This IS the enum
+        // construction idiom -- `{.Some = 30}` -- not a coincidence to guard
+        // against.
         node->struct_lit.sdef = sd;
         // Validate each named field exists; recurse so nested `{...}` field values
         // resolve against the field's declared type.
@@ -593,7 +600,7 @@ void resolve_brace_literal(ASTNode* node, Type* target) {
             // a bare bind identifier (possibly `_`) with no symbol yet — check_assignable
             // would wrongly see that as an unresolved-type value and error "void vs value".
             ASTNode* fv = node->struct_lit.values[i];
-            if (is_untyped_int_literal(fv) || is_untyped_float_literal(fv) || is_null_literal(fv)) {
+            if (is_untyped_literal(fv)) {
                 check_assignable(f->type, fv, "struct field");
             }
         }
@@ -703,7 +710,7 @@ void resolve_brace_literal(ASTNode* node, Type* target) {
             // -- this walk also runs over match/unpack array-destructure patterns, whose
             // elements may be bare bind identifiers (or `_`), not values.
             ASTNode* ev = node->array_lit.values[i];
-            if (is_untyped_int_literal(ev) || is_untyped_float_literal(ev) || is_null_literal(ev)) {
+            if (is_untyped_literal(ev)) {
                 check_assignable(elem, ev, "array element");
             }
         }
@@ -893,6 +900,23 @@ Type* Type_Substitute(Type* t, const char** params, Type** args, size_t n) {
         }
     }
     return c;
+}
+
+// Shared guard + substitution for "a type expressed in terms of a generic
+// struct's OWN type params, resolved through a concrete instantiation of
+// that struct" -- the same one-line check (generic_base set, at least one
+// real type arg) and the same Type_Substitute call were independently
+// duplicated at three call sites (a method's return type, an __assign
+// operand's param type, a for-in cursor's begin()/next() return types)
+// before being pulled out here. `sd` non-generic or non-instantiated
+// (generic_base NULL, or type_arg_count == 0) is the common case and
+// returns `t` unchanged, same as before.
+Type* Type_Substitute_Through_Instance(Type* t, StructDef* sd) {
+    if (t && sd && sd->generic_base && sd->type_arg_count > 0) {
+        return Type_Substitute(t, sd->generic_base->type_params,
+                               sd->type_args, sd->type_arg_count);
+    }
+    return t;
 }
 
 // impl method call: `expr.method(args)` parses as AST_CALL with target_expr=AST_FIELD.
@@ -1110,11 +1134,7 @@ static bool rewrite_operand_to_method_call(ASTNode* node, ASTNode* recv, ASTNode
         // the identical purpose one level up (the CALL's return type instead
         // of this ASSIGN's argument type).
         if (rt->cls == TYPE_STRUCT) {
-            StructDef* rt_sd = Struct_Find(rt->struct_name);
-            if (rt_sd && rt_sd->generic_base && rt_sd->type_arg_count > 0) {
-                param_t = Type_Substitute(param_t, rt_sd->generic_base->type_params,
-                                          rt_sd->type_args, rt_sd->type_arg_count);
-            }
+            param_t = Type_Substitute_Through_Instance(param_t, Struct_Find(rt->struct_name));
         }
         // A bare brace literal (`v = {1,2,3}` or `v = {.x=1,.y=2}`) is ambiguous
         // BEFORE anything resolves it: it could be ordinary construction of the
@@ -1333,6 +1353,15 @@ bool try_rewrite_cast_operator(ASTNode* node) {
     return true;
 }
 
+// Try every operator-overload rewrite in dispatch-priority order, short-
+// circuiting on the first that applies. Node has at most one dunder overload
+// shape (it can't simultaneously be a binary op AND a cast, say), so exactly
+// one of these ever rewrites it -- the chain is just "which one, if any."
+static bool try_rewrite_any_operator(ASTNode* node) {
+    return try_rewrite_operator_method(node) || try_rewrite_index_method(node) ||
+           try_rewrite_unary_operator_method(node) || try_rewrite_cast_operator(node);
+}
+
 Type* Type_Infer(ASTNode* node) {
     if (!node) return NULL;
     if (node->result_type) return node->result_type;
@@ -1347,8 +1376,7 @@ Type* Type_Infer(ASTNode* node) {
     // self_type_args, infer_generic to substitute them into the return type)
     // are what a NON-generic struct doesn't need but a generic one (Box[T]'s
     // __add/__index) does -- see rewrite_operand_to_method_call's own comment.
-    if (try_rewrite_operator_method(node) || try_rewrite_index_method(node) ||
-        try_rewrite_unary_operator_method(node) || try_rewrite_cast_operator(node)) {
+    if (try_rewrite_any_operator(node)) {
         try_rewrite_method_call(node);
         infer_generic(node, NULL);
         wrap_index_result_deref(node);
@@ -1775,6 +1803,7 @@ static bool unify_types(Type* concrete, Type* generic, const char** type_params,
 static bool is_untyped_int_literal(ASTNode* n);
 static bool is_untyped_float_literal(ASTNode* n);
 static bool is_null_literal(ASTNode* n);
+static bool is_untyped_literal(ASTNode* n);
 
 // Attempts to infer missing generic type arguments for an unresolved generic
 // reference -- either a CALL to a generic function, or a bare IDENT naming one
@@ -1869,8 +1898,7 @@ void infer_generic(ASTNode* node, Type* target) {
     // it now so the AST_CALL branch below (and its self_type_args
     // substitution) actually sees an AST_CALL this call, instead of only on
     // some LATER visit after Type_Infer already fired.
-    try_rewrite_operator_method(node) || try_rewrite_index_method(node) ||
-        try_rewrite_unary_operator_method(node) || try_rewrite_cast_operator(node);
+    try_rewrite_any_operator(node);
 
     if (node->type == AST_CALL) {
         pack_expand_call_args(node);
@@ -1910,7 +1938,7 @@ void infer_generic(ASTNode* node, Type* target) {
         size_t arg_count = node->call.sym->type->function.param_count;
         for (size_t i = 0; i < node->call.arg_count && i < arg_count; i++) {
             ASTNode* a = node->call.args[i];
-            if (is_untyped_int_literal(a) || is_untyped_float_literal(a) || is_null_literal(a))
+            if (is_untyped_literal(a))
                 continue;
             Type* arg_t = Type_Infer(a);
             if (arg_t) {
@@ -2036,6 +2064,12 @@ static bool is_untyped_float_literal(ASTNode* n) {
 }
 static bool is_null_literal(ASTNode* n) {
     return n && n->type == AST_INT_LITERAL && n->lit_kind == LIT_NULL;
+}
+// Any of the three UNTYPED literal kinds -- takes its concrete type from
+// context (an int/float literal with no fixed width yet, or `null` fitting
+// any pointer) rather than carrying one of its own.
+static bool is_untyped_literal(ASTNode* n) {
+    return is_untyped_int_literal(n) || is_untyped_float_literal(n) || is_null_literal(n);
 }
 
 // Does the integer literal value `v` fit destination primitive `dst`? (unsigned dst:
@@ -2765,9 +2799,8 @@ void Typecheck_Tree(ASTNode* node) {
                 if (node->struct_lit.is_enum_variant)
                     snprintf(msg, sizeof(msg),
                              "cannot infer the enum type of `.%.*s`; the target type "
-                             "is unknown (e.g. an un-inferred generic parameter). Write it explicitly, "
-                             "e.g. EnumType.%.*s{...}, or pass a type argument.",
-                             (int)node->struct_lit.field_name_lens[0], node->struct_lit.field_names[0],
+                             "is unknown (e.g. an un-inferred generic parameter). Bind it to a "
+                             "typed variable or pass an explicit type argument.",
                              (int)node->struct_lit.field_name_lens[0], node->struct_lit.field_names[0]);
                 else
                     snprintf(msg, sizeof(msg),

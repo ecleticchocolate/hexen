@@ -717,6 +717,7 @@ bool Type_IsAggregate(const Type* t); // struct or array? (addressed, not regist
 // variant) or an EXPLICIT void/PRIM_V node. Two spellings of the same thing.
 bool Type_IsVoidLike(const Type* t);
 Type* Type_Substitute(Type* t, const char** params, Type** args, size_t n);
+Type* Type_Substitute_Through_Instance(Type* t, StructDef* sd);
 Type* Type_FnLitShape(Type* t); // unwrap TYPE_FN_LITERAL to its underlying TYPE_FUNCTION shape; no-op otherwise
 int  Type_Width(const Type* t);      // size in bytes of the value in a register context (1,2,4,8)
 // Shared width table for a REAL (non-void) primitive kind: 1/2/4/8, or -1 for
