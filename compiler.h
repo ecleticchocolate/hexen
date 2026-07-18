@@ -617,6 +617,18 @@ typedef struct Symbol {
     // types.c) -- so downstream (arity checks, ABI, codegen) never sees a pack,
     // only an ordinary struct-typed argument.
     bool is_pack;
+    // For a struct-typed const-generic param materialized as a synthetic global
+    // (types.c's materialize_agg_param, `$cgen$L$0`): the comptime interpreter's
+    // OWN cached copy of global_bytes, persisted into s_ce_mem once on first
+    // read (constexpr.c's ce_eval_ident) rather than re-copied fresh on every
+    // read. -1 = not yet materialized this compiler run. Without this cache, a
+    // value like `L` read many times across many separate comptime-call frames
+    // (e.g. once per for-in loop iteration) allocated a fresh, independent arena
+    // copy every single time -- wasteful, and the real root cause of a found
+    // corruption bug where an EARLIER loop's accumulator silently changed value
+    // after a LATER, unrelated-looking loop ran on a different generic
+    // instantiation.
+    int64_t ce_cached_addr;
 } Symbol;
 
 typedef struct SymbolTable {
@@ -757,6 +769,7 @@ typedef struct ReflectBindings {
 bool reflect_unify(struct Type* concrete, struct Type* pattern, ReflectBindings* out);
 void reflect_bindings_free(ReflectBindings* b);
 
+void AST_Dump(struct ASTNode* node, int depth);
 void  Typecheck_Tree(ASTNode* root); // eager pass: annotate every node's result_type (home for v1(b) checks)
 void  resolve_brace_literal(ASTNode* node, Type* target); // bind a bare `{...}` literal to its context type
 

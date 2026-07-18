@@ -781,9 +781,9 @@ Type* Type_Substitute(Type* t, const char** params, Type** args, size_t n) {
             s_ce_generic_params = params;
             s_ce_generic_args = args;
             s_ce_generic_n = n;
-            
+
             bool ok = ConstEval(t->array.count_expr, &eval_val);
-            
+
             s_ce_generic_params = old_params;
             s_ce_generic_args = old_args;
             s_ce_generic_n = old_n;
@@ -3104,11 +3104,30 @@ static Symbol* agg_param_sym(const char* name, size_t len) {
 
 // Materialize one aggregate value-arg into a synthetic const global and record it
 // under the param name. `pin` is the aggregate type; `agg_off` its arena offset.
-static void materialize_agg_param(const char* pname, Type* pin, uint32_t agg_off) {
+static void materialize_agg_param(const char* pname, Type* pin, uint32_t agg_off, ASTNode* err_node) {
     if (s_agg_param_count >= 16) return; // more than 16 aggregate params: give up quietly
     uint64_t sz = Type_SizeOf(pin);
     uint8_t* bytes = (uint8_t*)calloc(1, sz ? sz : 1);
     if (!ConstEval_ReadBytes(agg_off, bytes, sz)) { free(bytes); return; }
+    // Same escape-boundary rule an ordinary `const Agg X = {...}` decl already
+    // enforces (parser.c's parse_const_decl) -- a real bug found via a segfault:
+    // a struct-typed const-generic VALUE holding a function-pointer field (e.g.
+    // `struct Cfg{ fn(i32)i32 op }` used as `Wrapped[T, Cfg C]`) reached here
+    // uncaught, and these raw bytes (a Symbol* -- the compiler's own
+    // process-space heap pointer, meaningless at runtime) got copied verbatim
+    // into the emitted binary's data section. Calling through `C.op` at
+    // runtime then jumped to a stale compiler-process address. This wasn't
+    // wired to the escape check at all before; now it is, turning the crash
+    // into the same clean, honest compile error a plain pointer field already gets.
+    if (ConstEval_AggHasEscapingPtr(pin, bytes, sz)) {
+        char msg[256];
+        snprintf(msg, sizeof(msg),
+                 "const-generic value for '%s' stores a pointer or function reference from "
+                 "compile-time memory that has no runtime address (a comptime-heap pointer/"
+                 "fn-symbol can't escape into a const-generic argument); store a value or an "
+                 "index, not a pointer", pname);
+        Error_AtNode(err_node, msg, NULL);
+    }
     // Synthetic name that the lexer can never produce ($ prefix), unique per use.
     char nbuf[64];
     int n = snprintf(nbuf, sizeof(nbuf), "$cgen$%s$%d", pname, s_agg_counter++);
@@ -3316,7 +3335,7 @@ ASTNode* clone_ast(ASTNode* n, const char** params, Type** args, size_t np, bool
             c->cast.target_type = Type_Substitute(n->cast.target_type, params, args, np);
             c->cast.expr = clone_ast(n->cast.expr, params, args, np, clone_symbols);
             break;
-        case AST_DECLARATION:
+        case AST_DECLARATION: {
             c->decl.var_type = Type_Substitute(n->decl.var_type, params, args, np);
             c->decl.init_expr = clone_ast(n->decl.init_expr, params, args, np, clone_symbols);
             c->decl.sym = clone_symbol(n->decl.sym, params, args, np, clone_symbols);
@@ -3364,6 +3383,7 @@ ASTNode* clone_ast(ASTNode* n, const char** params, Type** args, size_t np, bool
                 }
             }
             break;
+        }
         case AST_CONST_EXPR: {
             // const(EXPR) inside a generic body: the fold was deferred at parse time
             // because EXPR mentions an in-scope generic param, and the template is
@@ -3732,7 +3752,7 @@ Symbol* Generic_Instantiate(Symbol* generic, Type** targs, size_t targ_count) {
     for (size_t i = 0; i < np; i++) {
         Type* a = argcopy[i];
         if (a && a->cls == TYPE_CONST_VALUE && a->cval.is_agg && Type_IsAggregate(a->cval.pin)) {
-            materialize_agg_param(params[i], a->cval.pin, a->cval.agg_off);
+            materialize_agg_param(params[i], a->cval.pin, a->cval.agg_off, gdecl);
         }
     }
     ASTNode* inst = clone_ast(gdecl, params, argcopy, np, true);

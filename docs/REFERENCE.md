@@ -593,7 +593,7 @@ fn main() i32 { return RESULT }
 
 ```
 pub fn foo() u32 { ... }      // exported
-fn bar() u32 { ... }          // file-private
+fn bar() u32 { ... }
 ```
 No `import` keyword. `-emit-mod <path>` writes every `pub` item as a
 generated interface file (structs, `extern fn` signatures, const values) —

@@ -42,6 +42,7 @@ Symbol* SymTable_Add(SymbolTable* table, const char* name, size_t len, Type* typ
     sym->name_len = len;
     sym->type = type;
     sym->kind = kind;
+    sym->ce_cached_addr = -1; // not yet materialized in the comptime arena (0 is a real offset)
     
     // Allocate real storage size (structs/arrays are larger than 8 bytes),
     // rounded up to an 8-byte slot so subsequent vars stay word-aligned.

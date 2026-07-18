@@ -150,9 +150,37 @@ struct Type** s_ce_generic_args = NULL;
 size_t s_ce_generic_n = 0;
 
 static long s_ce_budget = 0; // remaining steps; <=0 => exceeded
+// Is a ConstEval already running RIGHT NOW, anywhere on the C call stack?
+// This is the real "am I the outermost entry" signal -- s_ce_budget==0 was
+// being used for that, which is wrong: the budget also legitimately hits 0
+// from ordinary step-counting partway through a big fold, which is
+// indistinguishable from "fresh, never started." A parse-time site that
+// calls ConstEval unconditionally (e.g. an array dimension `u32[expr]`,
+// evaluated the same way whether or not it's lexically inside a `const {}`
+// block) must NOT reset the shared scratch arena/budget just because it
+// can't tell the difference -- if a fold is already active, this is just
+// one more sub-expression of THAT fold, not a new one.
+//
+// A REENTRANCY COUNTER, not a boolean. Real bug found the hard way: with a
+// bool, ConstEval's own top-level guard and ConstEval_AggPersist's sibling
+// guard each independently set it true on entry and false on exit. When one
+// of these fires NESTED inside the other (e.g. Type_Substitute's deferred
+// TYPE_CONST_VALUE branch calls ConstEval_AggPersist while re-instantiating
+// a struct-typed const-generic arg, itself invoked from deep inside an
+// active `const{}` fold's own generic-instantiation machinery), the INNER
+// call's own exit set the flag back to false -- even though the OUTER fold
+// was still very much alive. The NEXT top-level check anywhere then saw
+// "not active" and treated itself as fresh, rewinding the scratch arena and
+// silently destroying an unrelated local from EARLIER in the same real
+// fold (an accumulator that had already been correctly computed, read back
+// as garbage moments later with nothing in the source ever touching it
+// again). A counter (active = depth > 0, increment on entry, decrement on
+// exit) can't be fooled this way: only the call that brings it back to 0
+// is allowed to reset shared state.
+int s_ce_depth = 0;
 
 #include "codegen.h"
-#define CE_MEM_SIZE 65536
+#define CE_MEM_SIZE 1048576
 static uint8_t  s_ce_mem[CE_MEM_SIZE];
 // Offset 0 is reserved and never allocated into: null is represented as the
 // plain integer 0 (see AST_INT_LITERAL's LIT_NULL case below), so if a real
@@ -163,6 +191,7 @@ static uint8_t  s_ce_mem[CE_MEM_SIZE];
 // legitimate allocation's rounded start can land back on 0.
 #define CE_MEM_GUARD 16
 static uint32_t s_ce_mem_top = CE_MEM_GUARD;
+uint32_t Debug_CeMemTop(void) { return s_ce_mem_top; }
 // Bytes below this watermark are PERSISTENT const-aggregate storage that survives
 // across ConstEval calls (so `const B = P.x` can read into `P`). Per-eval scratch
 // (locals, temporaries) resets to this line, not to 0 (see CE_MEM_GUARD above).
@@ -348,7 +377,22 @@ static bool ce_sink_put_agg_value(void* ctx, uint64_t off, uint64_t size, ASTNod
     (void)ctx;
     int64_t src; if (!ConstEval(val, &src)) return false;  // yields an arena offset
     if (!s_ce_isagg) return false;
-    memcpy(s_ce_mem + ce_base() + (uint32_t)off, s_ce_mem + src, size);
+    // src is meant to be an arena offset (s_ce_isagg says so), but a value that
+    // folds to a raw Symbol* bit-pattern (a bare fn-name ident, e.g. one bundled
+    // through a variadic pack `V... fns` into a synthesized struct whose field
+    // type LOOKS aggregate at the declared-type level even though the actual
+    // value is a function reference) can reach here with s_ce_isagg left true
+    // from stale/unrelated prior state instead of the fn-symbol path's own
+    // s_ce_isagg=false. Previously this did an unchecked memcpy on whatever src
+    // happened to be -- a real Symbol* heap pointer is nowhere near a valid
+    // arena offset, so it read/wrote wildly out of s_ce_mem's bounds and
+    // segfaulted the compiler itself. Bounds-check first and fail the fold
+    // cleanly (this codebase's own rule: loud failure over silent wrongness)
+    // instead of crashing.
+    uint32_t dst = ce_base() + (uint32_t)off;
+    if (src < 0 || (uint64_t)src + size > CE_MEM_SIZE || (uint64_t)dst + size > CE_MEM_SIZE)
+        return false;
+    memcpy(s_ce_mem + dst, s_ce_mem + src, size);
     return true;
 }
 static bool ce_sink_put_tag(void* ctx, int tag) {
@@ -405,12 +449,27 @@ bool ConstEval_ReadBytes(uint32_t off, uint8_t* out_buf, uint64_t size) {
 // live (non-null) pointer into comptime storage. Recursively scan the type over
 // the folded bytes; return true if a non-null pointer field is found (= escape).
 // null pointers are fine (0 is 0 at runtime too), as are pure-value aggregates.
+//
+// TYPE_FUNCTION is the SAME class of escape, found the hard way: a bare fn-name
+// value (`.op = triple`) folds to a raw Symbol* -- the compiler's own
+// process-space heap pointer, per ce_eval_ident's fn-symbol convention -- which
+// is exactly as meaningless at runtime as a comptime arena offset. This checker
+// already existed specifically to catch "compiler-process-only value written
+// into bytes that become part of the emitted binary" for real pointers; it just
+// never had the TYPE_FUNCTION case added, so a function-pointer FIELD nested
+// inside a const-generic struct value (e.g. `struct Cfg{ fn(i32)i32 op }` used
+// as `Wrapped[T, Cfg C]`) sailed through uncaught. materialize_agg_param
+// (types.c) never called this check at all, so those bytes got copied verbatim
+// into the runtime binary's data section -- C.op at runtime held a stale
+// compiler-process address, and calling through it segfaulted. Fixed on both
+// ends: this function now also flags a non-null TYPE_FUNCTION field, and
+// materialize_agg_param calls it before persisting (see its own comment).
 bool ConstEval_AggHasEscapingPtr(Type* t, uint8_t* bytes, uint64_t size) {
     if (!t) return false;
-    if (t->cls == TYPE_POINTER) {
+    if (t->cls == TYPE_POINTER || t->cls == TYPE_FUNCTION) {
         uint64_t p = 0;
         memcpy(&p, bytes, size < 8 ? size : 8);
-        return p != 0;   // a non-null comptime pointer can't survive to runtime
+        return p != 0;   // a non-null comptime pointer/fn-symbol can't survive to runtime
     }
     if (t->cls == TYPE_STRUCT) {
         StructDef* sd = Struct_Find(t->struct_name);
@@ -443,31 +502,63 @@ int64_t ConstEval_AggPersist(ASTNode* node, Type* t) {
     // scratch offset, then its bytes are copied down into the persist region.
     bool is_literal = (node->type == AST_STRUCT_LITERAL || node->type == AST_ARRAY_LITERAL);
     if (is_literal) {
-        // Prime the budget frame so any nested field ConstEval during layout_fill
-        // is NOT treated as a fresh top frame — otherwise it would reset
-        // s_ce_mem_top back to persist mid-build and clobber the slot we just
-        // allocated (two persisted aggregates would collide at offset 0).
-        bool own_budget = (s_ce_budget == 0);
-        if (own_budget) s_ce_budget = 100000;
+        // Prime the shared fold state so any nested field ConstEval during
+        // layout_fill is NOT treated as a fresh top-level entry -- otherwise it
+        // would reset s_ce_mem_top back to persist mid-build and clobber the slot
+        // we just allocated (two persisted aggregates would collide at offset 0).
+        // Uses the SAME s_ce_depth counter ConstEval's own top-level guard checks
+        // (this function is a sibling top-level entry point, called directly by
+        // parser sites, not reached through ConstEval itself, so it needs the
+        // same guard applied locally).
+        bool own_budget = (s_ce_depth == 0);
+        s_ce_depth++;
         uint32_t save_top = s_ce_mem_top;
-        s_ce_mem_top = s_ce_mem_persist;
+        if (own_budget) {
+            s_ce_budget = 100000;
+            s_ce_mem_top = s_ce_mem_persist;
+        }
         s_ce_isagg = false; s_ce_isfloat = false;
         int64_t off = ce_build_aggregate(node, t);
-        if (off < 0) { s_ce_mem_top = save_top; if (own_budget) s_ce_budget = 0; return -1; }
+        if (off < 0) { s_ce_mem_top = save_top; if (own_budget) s_ce_budget = 0; s_ce_depth--; return -1; }
         s_ce_mem_persist = s_ce_mem_top;   // commit
         if (own_budget) s_ce_budget = 0;
+        s_ce_depth--;
         return off;
     }
     // Non-literal: reserve the persistent slot FIRST (so the eval that follows
     // can't reclaim it), then evaluate into scratch above it, then copy down.
-    uint32_t reserved = s_ce_mem_persist;
+    //
+    // Real bug found and fixed here: this path ALWAYS reserved from
+    // s_ce_mem_persist directly, with no regard for whether a fold was
+    // already active (unlike the literal path just above, which checks
+    // s_ce_depth==0 before touching shared state). When called NESTED --
+    // e.g. from Type_Substitute's deferred TYPE_CONST_VALUE branch, itself
+    // invoked deep inside an active `const{}` fold's own generic-
+    // instantiation machinery -- s_ce_mem_persist can be stale (nothing
+    // "real" has committed since the fold started), while s_ce_mem_top has
+    // long since grown past it from ordinary scratch allocations (comptime
+    // locals). Reserving from the stale, low s_ce_mem_persist then landed
+    // the new persisted value DIRECTLY ON TOP OF a live scratch local,
+    // silently overwriting it. Fix: when nested (a fold is already active),
+    // reserve from s_ce_mem_top (the real current high-water mark) instead
+    // of s_ce_mem_persist, so it can never collide with anything already
+    // allocated -- and don't commit the result back into s_ce_mem_persist
+    // in that case either, since scratch above the true persist line was
+    // never meant to become permanently persisted this way; the caller
+    // (Type_Substitute) copies the returned offset's bytes out immediately
+    // via its own r->cval.agg_off, so a scratch-lifetime offset here is
+    // sufficient for that one read, exactly like every other scratch value
+    // in an active fold.
+    bool nested = (s_ce_depth > 0);
+    uint32_t reserved = nested ? s_ce_mem_top : s_ce_mem_persist;
     uint64_t sz = Type_SizeOf(t);
     uint32_t after = (reserved + 15u) & ~15u;
     if ((uint64_t)after + (sz ? sz : 1) > CE_MEM_SIZE) return -1;
-    s_ce_mem_persist = after + (uint32_t)(sz ? sz : 1);  // claim the dst slot
+    if (nested) s_ce_mem_top = after + (uint32_t)(sz ? sz : 1);
+    else        s_ce_mem_persist = after + (uint32_t)(sz ? sz : 1);  // claim the dst slot
     int64_t v;
-    if (!ConstEval(node, &v)) { s_ce_mem_persist = reserved; return -1; }
-    if (!s_ce_isagg) { s_ce_mem_persist = reserved; return -1; }
+    if (!ConstEval(node, &v)) { if (nested) s_ce_mem_top = reserved; else s_ce_mem_persist = reserved; return -1; }
+    if (!s_ce_isagg) { if (nested) s_ce_mem_top = reserved; else s_ce_mem_persist = reserved; return -1; }
     if ((uint64_t)v + sz <= CE_MEM_SIZE)
         memmove(s_ce_mem + after, s_ce_mem + v, sz);
     return (int64_t)after;
@@ -475,12 +566,22 @@ int64_t ConstEval_AggPersist(ASTNode* node, Type* t) {
 
 bool ConstEval(ASTNode* node, int64_t* out) {
     if (!node) return false;
-    // Prime the step budget at the outermost entry so EVERY constexpr (not just
-    // ones that call a function) is bounded — an inline `const X = while...` loop
-    // must not be able to hang the compiler. Reset to 0 when this top frame exits.
-    bool top_budget = (s_ce_budget == 0);
-    if (top_budget) { s_ce_budget = 100000; s_ce_isfloat = false; s_ce_isagg = false; s_ce_mem_top = s_ce_mem_persist;
-                      s_ce_returned = false; s_ce_broke = false; s_ce_continued = false; }
+    // Prime the step budget/arena on the OUTERMOST entry only -- if a fold is
+    // already active anywhere on the stack (s_ce_depth > 0), this call is just
+    // one more sub-expression of that SAME fold (a parse-time site like an
+    // array dimension `u32[expr]` fires unconditionally, with no idea whether
+    // it's lexically inside an active `const {}`/const-decl/generic-instantiation
+    // fold or not -- it must not care; either way, this is idempotent: entering
+    // again while already active changes nothing about setup/teardown, it's
+    // an ordinary nested call). Never reset an already-active fold's arena or
+    // budget out from under it. s_ce_depth (not a bool) so a NESTED call's own
+    // exit can't be mistaken for the outermost one ending -- see its comment.
+    bool top_budget = (s_ce_depth == 0);
+    s_ce_depth++;
+    if (top_budget) {
+        s_ce_budget = 100000; s_ce_isfloat = false; s_ce_isagg = false; s_ce_mem_top = s_ce_mem_persist;
+                      s_ce_returned = false; s_ce_broke = false; s_ce_continued = false;
+    }
     s_ce_isagg = false; // most values are scalars; aggregate paths set it true
     s_ce_isfnsym = false; // most values are ordinary integers; fn-symbol paths set it true
     if (s_ce_budget > 0 && --s_ce_budget <= 0) {
@@ -488,10 +589,12 @@ bool ConstEval(ASTNode* node, int64_t* out) {
             fprintf(stderr, "Error: constexpr evaluation exceeded step budget (possible infinite loop/recursion)\n");
             s_ce_budget = 0;
         }
+        s_ce_depth--;
         return false;
     }
     bool _r = ConstEval_inner(node, out);
     if (top_budget) s_ce_budget = 0;
+    s_ce_depth--;
     return _r;
 }
 
@@ -717,21 +820,62 @@ static bool ce_eval_call(ASTNode* node, int64_t* out) {
             //
             // Type args: prefer node->call.type_args if typecheck's infer_generic
             // already ran and populated them (rare here, since const folds BEFORE
-            // typecheck); otherwise fall back to self_type_args, which
-            // try_rewrite_method_call already seeds from the receiver struct's own
-            // instantiation (Box[i32,4].push(v) -> self_type_args = [i32, 4]).
-            // This covers every type param being fixed by the struct — the common
-            // case, and the only one reachable without also running infer_generic's
-            // full bottom-up-from-arguments inference, which this path doesn't
-            // attempt; a method declaring EXTRA type params of its own beyond the
-            // struct's own is not yet foldable (falls through to fsym->generic_decl
-            // still being unresolved, so the call fails cleanly rather than
-            // silently instantiating with too few args).
+            // typecheck); otherwise run infer_generic here, which itself seeds
+            // from self_type_args (the receiver struct's own instantiation --
+            // Box[i32,4].push(v) -> self_type_args = [i32, 4]) and then infers
+            // any REMAINING params bottom-up from the call's own arguments --
+            // covering both a method fully fixed by the struct AND one with its
+            // own extra type params beyond the struct's (see infer_generic below).
             if (fsym->generic_decl) {
+                // Run the SAME bottom-up-from-arguments/top-down-from-target
+                // inference the ordinary typecheck pass uses whenever the type
+                // args aren't ALREADY fully resolved -- infer_generic only reads
+                // already-inferrable argument types and the callee's static
+                // signature, and only writes back onto this call node, so it's
+                // safe to invoke standalone here even though const-folding runs
+                // before the real typecheck pass. On success it populates
+                // node->call.type_args/type_arg_count itself.
+                //
+                // Real bug fixed here: this used to gate on `targc == 0` only,
+                // i.e. "nothing at all is known yet" -- but a method declaring
+                // its OWN extra type param beyond the struct's (`impl Box[T] {
+                // fn addv[V](V other) V }`) already has targc=1 from
+                // self_type_args (just T, seeded by try_rewrite_method_call from
+                // the receiver's own instantiation), which made this gate skip
+                // entirely and fall straight to the arity check below --
+                // `targc(1) != type_param_count(1 for V alone)` looked equal in
+                // COUNT but was actually T's value being checked against V's
+                // slot, so the call always failed. infer_generic itself already
+                // seeds inferred_args FROM self_type_args first (see its own
+                // "Seed any prefix already fixed" comment) and only infers what's
+                // still missing, so calling it whenever the full param count
+                // isn't already satisfied is both correct and sufficient --
+                // no separate merge logic needed here.
+                //
+                // Real bug found via a segfault-turned-section-12-tensor2.t
+                // investigation: infer_generic's FIRST action, unconditionally, is
+                // pack_expand_call_args (bundling a `V... fns`-style trailing
+                // argument run into one synthesized struct literal) -- but this
+                // call was gated to only run infer_generic when the type args
+                // WEREN'T already fully known. A call with EXPLICIT type args that
+                // happen to already match the full param count (e.g.
+                // `pack_it[SomeStruct](t_get[i32])`) skipped this entirely, so the
+                // pack argument never got bundled -- node->call.args still held
+                // the raw, un-expanded argument list, mismatching the callee's
+                // real (post-expansion) arity, and the fold failed. Calling
+                // infer_generic unconditionally is safe: it early-returns on its
+                // OWN type-arg-inference work once type_arg_count > 0 (right after
+                // the pack expansion runs), so this never overwrites already-
+                // explicit type args -- it only ever ADDS the pack expansion this
+                // call site was missing.
                 Type** targs = node->call.type_args;
                 size_t targc = node->call.type_arg_count;
-                if (targc == 0) { targs = node->call.self_type_args; targc = node->call.self_type_arg_count; }
-                
+                ASTNode* gdecl = fsym->generic_decl;
+                if (fsym->type && fsym->type->cls == TYPE_FUNCTION) {
+                    infer_generic(node, NULL);
+                    targs = node->call.type_args;
+                    targc = node->call.type_arg_count;
+                }
                 if (targc > 0 && s_ce_generic_n > 0) {
                     Type** sub_targs = malloc(targc * sizeof(Type*));
                     for (size_t i = 0; i < targc; i++) {
@@ -739,24 +883,6 @@ static bool ce_eval_call(ASTNode* node, int64_t* out) {
                     }
                     targs = sub_targs;
                 }
-                
-                // Neither explicit type_args nor a struct-receiver's
-                // self_type_args are populated (a bare `ident(42)`-style
-                // call with T left for the compiler to work out). Run the
-                // SAME bottom-up-from-arguments/top-down-from-target
-                // inference the ordinary typecheck pass uses instead of
-                // giving up — infer_generic only reads already-inferrable
-                // argument types and the callee's static signature, and
-                // only writes back onto this call node, so it's safe to
-                // invoke standalone here even though const-folding runs
-                // before the real typecheck pass. On success it populates
-                // node->call.type_args/type_arg_count itself.
-                if (targc == 0 && fsym->type && fsym->type->cls == TYPE_FUNCTION) {
-                    infer_generic(node, NULL);
-                    targs = node->call.type_args;
-                    targc = node->call.type_arg_count;
-                }
-                ASTNode* gdecl = fsym->generic_decl;
                 if (targc == 0 || targc != gdecl->func_decl.type_param_count) return false;
                 struct Symbol* isym = Generic_Instantiate(fsym, targs, targc);
                 if (!isym || !isym->func_decl) return false;
@@ -767,15 +893,20 @@ static bool ce_eval_call(ASTNode* node, int64_t* out) {
             if (fn->func_decl.type_param_count > 0) return false; // still generic after the above: not foldable
             if (node->call.arg_count != fn->func_decl.param_count) return false;
 
-            // Start the step budget on the OUTERMOST comptime call so the bound covers
-            // the whole evaluation (nested calls share it). 100k steps is plenty for
-            // real const computation and still fails fast on runaway recursion.
-            bool top = (s_ce_budget == 0);
-            if (top) s_ce_budget = 100000;
-
-            // Fold args BEFORE pushing the frame (they evaluate in the caller's scope).
+            // Budget/arena lifecycle belongs SOLELY to ConstEval's own s_ce_depth
+            // guard (top of this file) -- this function is only ever reached
+            // through ConstEval (via ConstEval_inner), so s_ce_depth is already
+            // correctly > 0 by the time execution gets here. A second, independent
+            // "am I outermost" check here was a real bug: it used to read
+            // s_ce_budget==0, which is also true partway through a big fold from
+            // ordinary step-counting, not just "fresh" -- so a call landing here
+            // exactly when the shared budget had ticked down to 0 would wrongly
+            // reset the scratch arena out from under everything already folded
+            // earlier in the SAME logical evaluation (e.g. an accumulator from an
+            // earlier for-in loop, silently changing value after a later,
+            // unrelated-looking call).
             int64_t argv[8];
-            if (fn->func_decl.param_count > 8) { if (top) s_ce_budget = 0; return false; }
+            if (fn->func_decl.param_count > 8) return false;
             for (size_t i = 0; i < node->call.arg_count; i++) {
                 // An arg gets its type from the parameter (const runs at parse time,
                 // before typecheck would resolve it). resolve_brace_literal handles
@@ -786,10 +917,10 @@ static bool ce_eval_call(ASTNode* node, int64_t* out) {
                     (arg->type == AST_STRUCT_LITERAL || arg->type == AST_ARRAY_LITERAL ||
                      (arg->type == AST_INT_LITERAL && arg->lit_kind == LIT_INT)))
                     resolve_brace_literal(arg, fn->func_decl.param_syms[i]->type);
-                if (!ConstEval(arg, &argv[i])) { if (top) s_ce_budget = 0; return false; }
+                if (!ConstEval(arg, &argv[i])) return false;
             }
             int frame_base = s_ce_env_top;
-            if (frame_base + (int)fn->func_decl.param_count > 256) { if (top) s_ce_budget = 0; return false; }
+            if (frame_base + (int)fn->func_decl.param_count > 256) return false;
             for (size_t i = 0; i < fn->func_decl.param_count; i++) {
                 struct Symbol* psym = fn->func_decl.param_syms[i];
                 Type* pt = psym ? psym->type : NULL;
@@ -797,7 +928,7 @@ static bool ce_eval_call(ASTNode* node, int64_t* out) {
                 // the param aliases the caller's bytes (by-ref); scalar/pointer gets a
                 // fresh slot holding its value. ce_bind_local does both.
                 if (!ce_bind_local(psym, pt, argv[i], /*init_is_addr=*/Type_IsAggregate(pt))) {
-                    s_ce_env_top = frame_base; if (top) s_ce_budget = 0; return false;
+                    s_ce_env_top = frame_base; return false;
                 }
             }
             Type* prev_ret = s_ce_ret_type;
@@ -807,7 +938,6 @@ static bool ce_eval_call(ASTNode* node, int64_t* out) {
             bool returned = s_ce_returned;
             s_ce_returned = false;       // this frame consumes its return
             s_ce_env_top = frame_base;   // unwind the frame
-            if (top) s_ce_budget = 0;
             // Non-void fn must return a value. A void fn is called for EFFECT: it may
             // mutate through pointer params into the caller's storage (this is what
             // makes mutating methods like c.inc() fold), succeeding with no value.
@@ -1004,7 +1134,20 @@ static bool ce_eval_cast(ASTNode* node, int64_t* out) {
                     (inner && inner->type == AST_IDENT && inner->ident.sym &&
                      inner->ident.sym->kind == SYM_FUNCTION) ||
                     (inner && inner->type == AST_INT_LITERAL && inner->lit_kind == LIT_FN_SYMBOL);
-                if (!names_a_function) return false;
+                // A THIRD shape is exactly as safe as the two above, for a
+                // different reason: `(fn(...) T) null` -- the folded operand is
+                // the integer 0, not an arbitrary address. The guard above exists
+                // to reject "some unrelated int treated as a code address"
+                // (unmapped memory on call), but 0 is never dereferenced as code;
+                // it's the same "no dispatch function" sentinel a real fn-ptr
+                // variable can already hold at runtime (`fn(i32)i32 f = null` is
+                // ordinary, checked-before-called code). Missing this case broke
+                // exactly the pattern REFERENCE.md's own existential-vtable
+                // showcase uses for the "doesn't implement it" fallback arm
+                // (`.vt = { .get = (fn(void*) i32) null }`) -- fine at runtime,
+                // never foldable a second time inside `const`.
+                bool is_null_cast = (v == 0 && !names_a_function);
+                if (!names_a_function && !is_null_cast) return false;
                 *out = v; s_ce_isfloat = false; return true;
             }
             bool dst_float = Type_IsFloat(t);
@@ -1093,6 +1236,27 @@ static bool ce_eval_ident(ASTNode* node, int64_t* out) {
             }
             // First: a comptime param/local bound in the current call/block frame.
             if (node->ident.sym && ce_lookup_local(node->ident.sym, out)) return true;
+            // A struct-typed const-generic param (`Length L`) materializes as a
+            // synthetic global carrying raw global_bytes (types.c's
+            // materialize_agg_param, `$cgen$L$0`) -- built for the runtime/codegen
+            // image, never registered as a ConstDef and never bound into the
+            // comptime env, so a reference to it inside a method body being
+            // const-folded (e.g. `L.n` in a for-in cursor's next()) fell through
+            // both fallbacks below and failed the WHOLE fold. Persist those bytes
+            // into the comptime arena on first read and hand back the offset,
+            // exactly like the cv->cval.is_agg branch above does for the
+            // still-generic case -- same "aggregate value lives at an arena
+            // offset" representation, just sourced from a global instead of a
+            // deferred generic-frame value.
+            if (node->ident.sym && node->ident.sym->global_bytes && node->ident.sym->type &&
+                Type_IsAggregate(node->ident.sym->type)) {
+                uint64_t sz = Type_SizeOf(node->ident.sym->type);
+                int64_t off = ce_mem_alloc(sz ? sz : 1);
+                memcpy(s_ce_mem + off, node->ident.sym->global_bytes, sz);
+                *out = off;
+                s_ce_isagg = true; s_ce_isfloat = false;
+                return true;
+            }
             // Else: a global named constant (constants may build on earlier constants).
             // A real runtime variable (a sym not in the comptime env) is NOT foldable.
             ConstDef* c = Const_Find(node->ident.name, node->ident.name_len);
