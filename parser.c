@@ -37,6 +37,8 @@ static bool curr_begins_type(void); // token_is_type_start + registered struct/g
 static Type* parse_type(void);
 static void parse_generic_param_list(const char*** names_out, Type*** kinds_out, size_t* count_out);
 static Type* parse_generic_value_arg(Type* pin);
+static void parse_generic_arg_list(const char** param_names, Type** param_kinds, size_t param_count,
+                                    Type*** out_targs, size_t* out_tcount);
 static ASTNode* make_ident_node(const char* name, size_t len, Symbol* sym);
 static Type* make_const_value_type(Type* pin);
 // Generic FUNCTION headers recorded by pass 0b (Parse_Signatures). Defined here rather
@@ -506,6 +508,58 @@ static Type* parse_generic_value_arg(Type* pin) {
         }
     }
     return v;
+}
+
+// Parses a generic argument LIST (the comma-separated contents between an
+// already-consumed `[` and a not-yet-consumed `]`) shared by every use site
+// that instantiates a generic with explicit arguments -- a struct type
+// (`Container[i32, {.val=5}]`), an explicit generic function call
+// (`make[i32, {.val=5}]()`), and a generic alias (`SomeAlias[i32, {.val=5}]`).
+// These were three independently hand-written copies of the same loop before
+// this was pulled out; two of the three were missing the SAME fix (below) at
+// the same time, found by testing one, fixing it, then discovering the
+// second call site still had the bug -- exactly the "same primitive needed
+// at multiple sites, not actually shared" pattern this whole session kept
+// finding elsewhere. One function now; a fix here reaches every caller.
+//
+// `param_names`/`param_kinds`/`param_count` describe the generic's OWN
+// declared parameter list (NULL kind = type param, non-NULL = value param
+// pinned to that type). Returns the parsed args via `*out_targs`/`*out_tcount`
+// (heap-allocated, caller-owned) and leaves s_curr on the `]` (or whatever
+// stopped the loop) -- the caller still does its own `]`-expect/advance and
+// arity check, since the three call sites want different error wording there.
+static void parse_generic_arg_list(const char** param_names, Type** param_kinds, size_t param_count,
+                                    Type*** out_targs, size_t* out_tcount) {
+    size_t tcap = param_count ? param_count : 4;
+    Type** targs = (Type**)malloc(tcap * sizeof(Type*));
+    size_t tcount = 0;
+    while (s_curr.type != TOK_RBRACKET && s_curr.type != TOK_EOF) {
+        Type* pin = (param_kinds && tcount < param_count) ? param_kinds[tcount] : NULL;
+        // A later param's pin type may itself reference an EARLIER param in the
+        // same list (`Container[T, Box[T] val]` -- the second param's pin is
+        // `Box[T]`, naming the first). Substitute using the args already parsed
+        // so far before resolving this one, so an inline brace literal
+        // (`Container[i32, {.val=5}]`) resolves `.val` against the REAL,
+        // concrete `Box[i32]`, not the still-abstract declared `Box[T]`.
+        if (pin && tcount > 0 && param_names) {
+            pin = Type_Substitute(pin, param_names, targs, tcount);
+        }
+        Type* ta;
+        if (pin) {
+            ta = parse_generic_value_arg(pin);
+        } else {
+            ta = parse_type();
+            if (!ta) parse_error("Expected a type argument here (a bare value "
+                                  "argument requires the parameter to be declared "
+                                  "with a pinned type, e.g. `[T, u32 N]`, not `[T, N]`)");
+        }
+        if (tcount >= tcap) { tcap *= 2; targs = realloc(targs, tcap * sizeof(Type*)); }
+        targs[tcount++] = ta;
+        if (s_curr.type == TOK_COMMA) advance();
+        else break;
+    }
+    *out_targs = targs;
+    *out_tcount = tcount;
 }
 
 // True iff a newline appeared between the previous token and s_curr. Captured
@@ -990,16 +1044,8 @@ static Type* parse_alias_or_type_param_type(Type* base_t) {
             if (s_curr.type != TOK_LBRACKET)
                 parse_error("generic alias used without type arguments");
             advance();
-            Type** targs = (Type**)malloc(al->param_count * sizeof(Type*));
-            size_t tcount = 0;
-            while (s_curr.type != TOK_RBRACKET && s_curr.type != TOK_EOF) {
-                Type* pin = (al->kinds && tcount < al->param_count) ? al->kinds[tcount] : NULL;
-                Type* ta = pin ? parse_generic_value_arg(pin) : parse_type();
-                if (!ta) parse_error("expected a type or value argument in generic alias");
-                if (tcount < al->param_count) targs[tcount] = ta;
-                tcount++;
-                if (s_curr.type == TOK_COMMA) advance(); else break;
-            }
+            Type** targs; size_t tcount;
+            parse_generic_arg_list(al->params, al->kinds, al->param_count, &targs, &tcount);
             if (s_curr.type != TOK_RBRACKET) parse_error("Expected ']' after alias type arguments");
             advance();
             if (tcount != al->param_count) parse_error("wrong number of type arguments for alias");
@@ -1028,27 +1074,8 @@ static Type* parse_alias_or_type_param_type(Type* base_t) {
         if (s_curr.type != TOK_LBRACKET)
             parse_error("generic struct used without type arguments");
         advance();
-        Type** targs = (Type**)malloc(8 * sizeof(Type*));
-        size_t tcount = 0, tcap = 8;
-        while (s_curr.type != TOK_RBRACKET && s_curr.type != TOK_EOF) {
-            Type* pin = (sd->param_kinds && tcount < sd->type_param_count)
-                        ? sd->param_kinds[tcount] : NULL;
-            Type* ta;
-            if (pin) {
-                ta = parse_generic_value_arg(pin);
-            } else {
-                ta = parse_type();
-                if (!ta) {
-                    parse_error("Expected a type argument here (a bare value "
-                                "argument requires the parameter to be declared "
-                                "with a pinned type, e.g. `[T, u32 N]`, not `[T, N]`)");
-                }
-            }
-            if (tcount >= tcap) { tcap *= 2; targs = realloc(targs, tcap * sizeof(Type*)); }
-            targs[tcount++] = ta;
-            if (s_curr.type == TOK_COMMA) advance();
-            else break;
-        }
+        Type** targs; size_t tcount;
+        parse_generic_arg_list(sd->type_params, sd->param_kinds, sd->type_param_count, &targs, &tcount);
         if (s_curr.type != TOK_RBRACKET) parse_error("Expected ']' after generic struct type arguments");
         advance();
         StructDef* inst = Struct_Instantiate(sd, targs, tcount);
@@ -1817,32 +1844,12 @@ static ASTNode* parse_explicit_generic_call(Symbol* sym, Token id_tok, bool* out
     *out_is_gcall = is_gcall;
     if (!is_gcall) return NULL;
 
-    size_t param_count = call_pcount;
-    Type** pkinds = call_pkinds;
-    (void)call_tparams;
     advance(); // consume '['
-    size_t tcap = param_count ? param_count : 4;
-    Type** targs = (Type**)malloc(tcap * sizeof(Type*));
-    size_t tcount = 0;
-    while (s_curr.type != TOK_RBRACKET && s_curr.type != TOK_EOF) {
-        Type* pin = (pkinds && tcount < param_count) ? pkinds[tcount] : NULL;
-        Type* ta;
-        if (pin) {
-            ta = parse_generic_value_arg(pin);
-        } else {
-            ta = parse_type();
-            if (!ta) parse_error("Expected a type argument in explicit generic call "
-                                  "(a bare value argument requires the parameter to be "
-                                  "declared with a pinned type, e.g. `[T, u32 N]`)");
-        }
-        if (tcount >= tcap) { tcap *= 2; targs = realloc(targs, tcap * sizeof(Type*)); }
-        targs[tcount++] = ta;
-        if (s_curr.type == TOK_COMMA) advance();
-        else break;
-    }
+    Type** targs; size_t tcount;
+    parse_generic_arg_list(call_tparams, call_pkinds, call_pcount, &targs, &tcount);
     if (s_curr.type != TOK_RBRACKET) parse_error("Expected ']' after explicit generic call arguments");
     advance();
-    if (param_count && tcount != param_count)
+    if (call_pcount && tcount != call_pcount)
         parse_error("wrong number of explicit generic arguments for this call");
 
     if (s_curr.type != TOK_LPAREN) {
