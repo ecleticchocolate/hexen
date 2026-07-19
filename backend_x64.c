@@ -1781,6 +1781,19 @@ static void compile_node_ctx(JITBuffer* buf, ASTNode* node, LoopContext* loop) {
 
         // Struct- or array-typed declaration: zero-init only (unspecified
         // fields/elements zero-init, C99). Same emission for both.
+        //
+        // A GLOBAL aggregate is initialized in the static image before main (its
+        // folded bytes, or zero), exactly like the scalar-global case guarded
+        // below -- so emitting a runtime zero-init store here would CLOBBER that
+        // image. This bit a materialized const-generic value-param global
+        // ($cgen$S$0): a `match` on an aggregate-returning method reached this decl
+        // path and the zero loop wrote 0 over the param's real bytes at runtime, so
+        // `S.cols` read 0. The scalar path already skipped globals; the aggregate
+        // path must too.
+        if (vt && (vt->cls == TYPE_STRUCT || vt->cls == TYPE_ARRAY) &&
+            sym->kind == SYM_GLOBAL) {
+            return;
+        }
         if (vt && (vt->cls == TYPE_STRUCT || vt->cls == TYPE_ARRAY)) {
             uint64_t sz = Type_SizeOf(vt);
             emit_var_addr(buf, sym);                                  // rax = &var
