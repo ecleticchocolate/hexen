@@ -3053,10 +3053,24 @@ static ASTNode* parse_match(void) {
         return parse_match_type(scrut);
     }
 
-    Types_SetEnclosingParams(s_type_params, s_type_param_count); // see parse_unpack
-    Typecheck_Tree(scrut); // Run typecheck so bottom-up generic inference happens for AST_CALL
-    Types_SetEnclosingParams(NULL, 0);
-    Type* st = Type_Infer(scrut);
+    // A bare scrutinee that is an in-scope VALUE generic param (`match N` where
+    // `N` is `[u32 N]`) has no symbol at parse time and would fail the eager
+    // Typecheck_Tree below with "undeclared identifier" -- the same abstract-in-a-
+    // -generic-body problem the enclosing-param dance above handles for calls.
+    // The parser already knows N's pinned type, so take it directly and skip the
+    // eager typecheck; N folds to its concrete value at instantiation, exactly as
+    // it already does in `if N == 0` (which never hits this parse-time path).
+    Type* st = NULL;
+    Type* vp_pin = NULL;
+    if (scrut->type == AST_IDENT &&
+        param_kind_lookup(scrut->ident.name, scrut->ident.name_len, &vp_pin) == 1) {
+        st = vp_pin;
+    } else {
+        Types_SetEnclosingParams(s_type_params, s_type_param_count); // see parse_unpack
+        Typecheck_Tree(scrut); // Run typecheck so bottom-up generic inference happens for AST_CALL
+        Types_SetEnclosingParams(NULL, 0);
+        st = Type_Infer(scrut);
+    }
 
     ScrutKind k = classify_scrutinee_type(st);
     bool is_enum = k.is_enum;
