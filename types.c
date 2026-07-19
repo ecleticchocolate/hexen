@@ -800,8 +800,21 @@ static Type* array_substitute_maybe_hkt(Type* t, const char** params, Type** arg
 
     if (!base_sub || base_sub->cls != TYPE_STRUCT) { free(count_exprs); return NULL; }
     StructDef* esd = Struct_Find(base_sub->struct_name);
-    if (!esd || !esd->is_generic || esd->type_param_count == 0 ||
-        esd->type_param_count > depth) { free(count_exprs); return NULL; }
+    if (!esd || !esd->is_generic || esd->type_param_count == 0) { free(count_exprs); return NULL; }
+    if (esd->type_param_count > depth) {
+        // A bare, deliberately-unapplied template (struct_unapplied, from an
+        // HKT slot) with FEWER brackets than its arity is under-applied -- an
+        // error, not a silent fallthrough that leaves it unapplied and
+        // zero-sized. An ordinary generic struct named as an array element
+        // (not struct_unapplied) is genuinely not an HKT here; leave it alone.
+        if (base_sub->struct_unapplied) {
+            fprintf(stderr, "Error: generic struct '%s' expects %zu type arguments, "
+                            "but is applied to only %zu here\n",
+                            esd->name, esd->type_param_count, depth);
+            exit(1);
+        }
+        free(count_exprs); return NULL;
+    }
 
     size_t arity = esd->type_param_count;
     Type** type_args = (Type**)malloc(arity * sizeof(Type*));
