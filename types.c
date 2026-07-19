@@ -1010,6 +1010,18 @@ Type* Type_Substitute(Type* t, const char** params, Type** args, size_t n) {
                 c->function.param_types[i] = Type_Substitute(t->function.param_types[i], params, args, n);
         }
     }
+    else if (t->cls == TYPE_IMPL) {
+        // A generic `alias A[U] = impl { fn set(U) ... }`: substitute U into each
+        // method signature. Without this, U stayed an unbound wildcard and the
+        // impl-pattern matched ANY type (see reflect_unify's is_hole) instead of
+        // only types with the U-substituted methods. sigs[] are TYPE_FUNCTIONs,
+        // already substitutable; names are shared verbatim (not owned per-copy).
+        if (t->impl_pat.method_count) {
+            c->impl_pat.sigs = malloc(t->impl_pat.method_count * sizeof(Type*));
+            for (size_t i = 0; i < t->impl_pat.method_count; i++)
+                c->impl_pat.sigs[i] = Type_Substitute(t->impl_pat.sigs[i], params, args, n);
+        }
+    }
     return c;
 }
 
