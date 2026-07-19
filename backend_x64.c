@@ -275,24 +275,7 @@ static void compile_lvalue(JITBuffer* buf, ASTNode* node, LoopContext* loop) {
             Error_AtNode(node, "unresolved variable", NULL);
         }
         
-        if (sym->kind == SYM_GLOBAL) {
-            if (g_aot_mode) {
-                emit_byte(buf, 0x48); emit_byte(buf, 0x8d); emit_byte(buf, 0x05); // lea rax, [rip + offset]
-                ELF_AddRelocation(buf->size, ELF_RELOC_GLOBAL, NULL, sym->offset);
-                emit_u32(buf, 0);
-            } else {
-                // movabs r15, &s_repl_globals
-                emit_byte(buf, 0x49); emit_byte(buf, 0xbf); emit_u64(buf, (uint64_t)&s_repl_globals[0]);
-                // lea rax, [r15 + offset] (49 8d 87 <offset32>)
-                emit_byte(buf, 0x49); emit_byte(buf, 0x8d); emit_byte(buf, 0x87);
-                emit_u32(buf, sym->offset);
-            }
-        } else if (sym->kind == SYM_LOCAL) {
-            // lea rax, [rbp - offset]
-            emit_byte(buf, 0x48); emit_byte(buf, 0x8d); emit_byte(buf, 0x85);
-            uint32_t neg_offset = -sym->offset; // 2s complement
-            emit_u32(buf, neg_offset);
-        }
+        emit_var_addr(buf, sym); // rax = &var (global or local), same as emit_var_addr's own two cases
     } else if (node->type == AST_DEREF) {
         compile_node_ctx(buf, node->unary, loop);
     } else if (node->type == AST_FIELD) {
@@ -1796,8 +1779,9 @@ static void compile_node_ctx(JITBuffer* buf, ASTNode* node, LoopContext* loop) {
             sym->offset = s_func->current_local_offset;
         }
 
-        // Struct-typed declaration: zero-init only (unspecified fields zero-init, C99).
-        if (vt && vt->cls == TYPE_STRUCT) {
+        // Struct- or array-typed declaration: zero-init only (unspecified
+        // fields/elements zero-init, C99). Same emission for both.
+        if (vt && (vt->cls == TYPE_STRUCT || vt->cls == TYPE_ARRAY)) {
             uint64_t sz = Type_SizeOf(vt);
             emit_var_addr(buf, sym);                                  // rax = &var
             emit_byte(buf, 0x49); emit_byte(buf, 0x89); emit_byte(buf, 0xc0); // mov r8, rax (save base)
@@ -1806,18 +1790,6 @@ static void compile_node_ctx(JITBuffer* buf, ASTNode* node, LoopContext* loop) {
                 emit_byte(buf, 0x49); emit_byte(buf, 0xc7); emit_byte(buf, 0x80);
                 emit_u32(buf, (uint32_t)b);
                 emit_u32(buf, 0);
-            }
-            return;
-        }
-
-        // Array-typed declaration: zero-init only.
-        if (vt && vt->cls == TYPE_ARRAY) {
-            uint64_t sz = Type_SizeOf(vt);
-            emit_var_addr(buf, sym);
-            emit_byte(buf, 0x49); emit_byte(buf, 0x89); emit_byte(buf, 0xc0); // mov r8, rax
-            for (uint64_t b = 0; b < sz; b += 8) {
-                emit_byte(buf, 0x49); emit_byte(buf, 0xc7); emit_byte(buf, 0x80);
-                emit_u32(buf, (uint32_t)b); emit_u32(buf, 0);
             }
             return;
         }

@@ -1759,6 +1759,25 @@ static ASTNode* make_enum_variant_node(Token vtok) {
     return node;
 }
 
+// Parse `Variant` or `Variant(payload)` with the leading `.` ALREADY consumed
+// by the caller. Builds the enum-variant node and fills its optional single
+// `(payload)`. Shared by parse_enum_literal and parse_match_value's arm head.
+static ASTNode* parse_enum_variant_after_dot(void) {
+    if (s_curr.type != TOK_IDENTIFIER) parse_error("Expected variant name after '.'");
+    Token vtok = s_curr; advance();
+    ASTNode* node = make_enum_variant_node(vtok);
+    if (s_curr.type == TOK_LPAREN) {
+        advance();
+        if (s_curr.type != TOK_RPAREN) {
+            node->struct_lit.values[0] = parse_expr_prec(0);
+            node->struct_lit.count = 1;
+        }
+        if (s_curr.type != TOK_RPAREN) parse_error("Expected ')' after variant payload");
+        advance();
+    }
+    return node;
+}
+
 // `.Variant` / `.Variant(payload)` -- an enum literal with the type inferred from
 // context. Split out of parse_primary.
 static ASTNode* parse_enum_literal(void) {
@@ -1782,19 +1801,7 @@ static ASTNode* parse_enum_literal(void) {
     // other expression position, is exactly what this syntax removes.
     if (s_curr.type == TOK_DOT) {
         advance();
-        if (s_curr.type != TOK_IDENTIFIER) parse_error("Expected variant name after '.'");
-        Token vtok = s_curr; advance();
-        ASTNode* node = make_enum_variant_node(vtok);
-        if (s_curr.type == TOK_LPAREN) {
-            advance();
-            if (s_curr.type != TOK_RPAREN) {
-                node->struct_lit.values[0] = parse_expr_prec(0);
-                node->struct_lit.count = 1;
-            }
-            if (s_curr.type != TOK_RPAREN) parse_error("Expected ')' after variant payload");
-            advance();
-        }
-        return node;
+        return parse_enum_variant_after_dot();
     }
 
     // Bare aggregate literal `{...}` -- UNTYPED at parse time. Its concrete type is
@@ -2698,20 +2705,7 @@ static ASTNode* parse_match_value(ASTNode* scrut, Type* st) {
             // replaced, which required a depth-counting scan to tell whether one
             // or two brace-groups followed the variant name.
             advance(); // '.'
-            if (s_curr.type != TOK_IDENTIFIER) parse_error("Expected variant name after '.'");
-            Token vtok = s_curr; advance();
-            ASTNode* node = make_enum_variant_node(vtok);
-
-            if (s_curr.type == TOK_LPAREN) {
-                advance(); // '('
-                if (s_curr.type != TOK_RPAREN) {
-                    node->struct_lit.values[0] = parse_expr_prec(0);
-                    node->struct_lit.count = 1;
-                }
-                if (s_curr.type != TOK_RPAREN) parse_error("Expected ')' after variant payload");
-                advance();
-            }
-            pat = node;
+            pat = parse_enum_variant_after_dot();
             if (Type_IsAggregate(st)) {
                 resolve_brace_literal(pat, st);
             }

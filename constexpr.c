@@ -239,6 +239,18 @@ bool s_ce_isfnsym = false;
 static double ce_bits_to_f(int64_t b) { double d; memcpy(&d, &b, sizeof d); return d; }
 static int64_t ce_f_to_bits(double d) { int64_t b; memcpy(&b, &d, sizeof b); return b; }
 
+// Truncate a comptime integer to a declared primitive width (1/2/4 bytes),
+// sign- or zero-extending per `sgn`, matching runtime narrowing/wrap. width 8
+// (or anything else) is unchanged.
+static int64_t ce_trunc_to_width(int64_t v, int w, bool sgn) {
+    switch (w) {
+        case 1: return sgn ? (int64_t)(int8_t)v  : (int64_t)(uint8_t)v;
+        case 2: return sgn ? (int64_t)(int16_t)v : (int64_t)(uint16_t)v;
+        case 4: return sgn ? (int64_t)(int32_t)v : (int64_t)(uint32_t)v;
+        default: return v;
+    }
+}
+
 // Narrow an f64 value (carried as int64 bits) to a 32-bit float bit pattern in
 // the low 4 bytes — for storing into an f32 slot. Was hand-rolled (the fiddly
 // (float) + memcpy dance) in 3 separate places; centralized so an f32 store can't
@@ -1066,13 +1078,7 @@ static bool ce_eval_assign(ASTNode* node, int64_t* out) {
             // Truncate to the target variable's declared width so a comptime
             // `u8 x; x = x + 10` wraps mod 256, matching runtime (was: no wrap).
             if (!isf && tt && tt->cls == TYPE_PRIMITIVE) {
-                int w = Type_Width(tt); bool sgn = Type_IsSigned(tt);
-                switch (w) {
-                    case 1: v = sgn ? (int64_t)(int8_t)v  : (int64_t)(uint8_t)v;  break;
-                    case 2: v = sgn ? (int64_t)(int16_t)v : (int64_t)(uint16_t)v; break;
-                    case 4: v = sgn ? (int64_t)(int32_t)v : (int64_t)(uint32_t)v; break;
-                    default: break;
-                }
+                v = ce_trunc_to_width(v, Type_Width(tt), Type_IsSigned(tt));
             }
             if (!ce_set_local(tsym, v, isf)) return false;
             *out = v;
@@ -1160,14 +1166,7 @@ static bool ce_eval_cast(ASTNode* node, int64_t* out) {
             }
             // target is integer
             if (src_float) v = (int64_t)ce_bits_to_f(v); // float -> int truncation
-            int w = Type_Width(t);
-            bool sgn = Type_IsSigned(t);
-            switch (w) {
-                case 1: v = sgn ? (int64_t)(int8_t)v  : (int64_t)(uint8_t)v;  break;
-                case 2: v = sgn ? (int64_t)(int16_t)v : (int64_t)(uint16_t)v; break;
-                case 4: v = sgn ? (int64_t)(int32_t)v : (int64_t)(uint32_t)v; break;
-                default: break; // 8: unchanged
-            }
+            v = ce_trunc_to_width(v, Type_Width(t), Type_IsSigned(t));
             *out = v;
             s_ce_isfloat = false;
             return true;
