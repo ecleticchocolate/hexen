@@ -2659,6 +2659,14 @@ void Typecheck_Tree(ASTNode* node) {
             // A bare `{...}` initializer resolves against the declared variable type.
             if (node->decl.init_expr) resolve_brace_literal(node->decl.init_expr, node->decl.var_type);
             Typecheck_Tree(node->decl.init_expr);
+            // Array size inference for non-literal initializers (like casts or variables).
+            if (node->decl.init_expr && node->decl.var_type && node->decl.var_type->cls == TYPE_ARRAY &&
+                node->decl.var_type->array.count == 0 && !node->decl.var_type->array.count_expr) {
+                Type* init_t = Type_Infer(node->decl.init_expr);
+                if (init_t && init_t->cls == TYPE_ARRAY && init_t->array.count > 0) {
+                    node->decl.var_type->array.count = init_t->array.count;
+                }
+            }
             // Assignability: the initializer must be allowed into the declared type.
             if (node->decl.init_expr) {
                 char buf[256];
@@ -2832,9 +2840,16 @@ void Typecheck_Tree(ASTNode* node) {
             // Generic call or bare generic function name on the RHS, resolved
             // against the lvalue's type, e.g. `f = identity` where f is fn(u32) u32.
             infer_generic(node->binary.right, Type_Infer(node->binary.left));
-            // A bare `{...}` RHS resolves against the lvalue's type.
             resolve_brace_literal(node->binary.right, Type_Infer(node->binary.left));
             Typecheck_Tree(node->binary.right);
+            // Array size inference for non-literal RHS (like casts or variables).
+            Type* lhs_t = Type_Infer(node->binary.left);
+            if (lhs_t && lhs_t->cls == TYPE_ARRAY && lhs_t->array.count == 0 && !lhs_t->array.count_expr) {
+                Type* rhs_t = Type_Infer(node->binary.right);
+                if (rhs_t && rhs_t->cls == TYPE_ARRAY && rhs_t->array.count > 0) {
+                    lhs_t->array.count = rhs_t->array.count;
+                }
+            }
             // Assignability: the RHS must be allowed into the lvalue's type.
             check_assignable(Type_Infer(node->binary.left), node->binary.right, "assignment");
             Type_Infer(node);
