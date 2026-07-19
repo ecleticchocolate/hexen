@@ -2097,6 +2097,13 @@ void infer_generic(ASTNode* node, Type* target) {
             ASTNode* a = node->call.args[i];
             if (is_untyped_literal(a))
                 continue;
+            // An argument that is ITSELF an uninferred generic call (`id(id(5))`)
+            // must be resolved before we can read its type: without this, Type_Infer
+            // returns the callee's unsubstituted return param (a TYPE_PARAM), which
+            // unify skips, so the outer call never pins its own T. Recurse first.
+            // (Top-down positions -- decl init, return, call arg -- already do this
+            // via their own infer_generic; a bare operator operand did not.)
+            infer_generic(a, NULL);
             Type* arg_t = Type_Infer(a);
             if (arg_t) {
                 unify_types(arg_t, node->call.sym->type->function.param_types[i],
