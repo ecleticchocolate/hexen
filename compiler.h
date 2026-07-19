@@ -112,6 +112,14 @@ typedef enum {
 
 typedef struct Type {
     TypeClass cls;
+    // TYPE_STRUCT only: true iff this node names a still-generic template left
+    // DELIBERATELY unapplied (a "template template" argument, e.g. `M` bound to
+    // bare `Box` in `HKT[Box, i32]` -- Box is never instantiated here, just
+    // carried as a value). Set only at that one call-site path (parser.c's
+    // parse_generic_arg_list). Type_Substitute's TYPE_STRUCT case checks this to
+    // avoid its `Box*` self-param auto-completion firing by NAME COINCIDENCE on a
+    // node that was never meant to be completed at all.
+    bool struct_unapplied;
     union {
         PrimitiveKind primitive;
         struct Type* pointer_base;

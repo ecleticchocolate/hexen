@@ -731,6 +731,116 @@ void resolve_brace_literal(ASTNode* node, Type* target) {
 
 
 
+// Save/install/restore the comptime generic-substitution frame ConstEval
+// consults mid-fold.
+typedef struct { const char** params; Type** args; size_t n; } CeGenericFrame;
+static CeGenericFrame ce_generic_frame_install(const char** params, Type** args, size_t n) {
+    CeGenericFrame saved = { s_ce_generic_params, s_ce_generic_args, s_ce_generic_n };
+    s_ce_generic_params = params; s_ce_generic_args = args; s_ce_generic_n = n;
+    return saved;
+}
+static void ce_generic_frame_restore(CeGenericFrame saved) {
+    s_ce_generic_params = saved.params; s_ce_generic_args = saved.args; s_ce_generic_n = saved.n;
+}
+
+// Fold one array-postfix count_expr under a substitution frame: ConstEval,
+// positive check, else defer. Shared by Type_Substitute's own TYPE_ARRAY
+// case and array_substitute_maybe_hkt's outer-dimension rebuild.
+static void fold_array_count(ASTNode* ce, const char** params, Type** args, size_t n,
+                              uint64_t* count_out, ASTNode** count_expr_out) {
+    if (!ce) { *count_expr_out = NULL; return; }
+    int64_t eval_val;
+    CeGenericFrame saved = ce_generic_frame_install(params, args, n);
+    bool ok = ConstEval(ce, &eval_val);
+    ce_generic_frame_restore(saved);
+    if (ok) {
+        if (eval_val <= 0) {
+            fprintf(stderr, "Error: array size must be positive (const-generic size evaluated to %lld)\n",
+                    (long long)eval_val);
+            exit(1);
+        }
+        *count_out = (uint64_t)eval_val;
+        *count_expr_out = NULL;
+    } else {
+        *count_expr_out = ce;
+    }
+}
+
+// One array-postfix dimension as a Type* type argument, or NULL if it's an
+// ordinary (non-type) array-size expression.
+static Type* count_expr_as_type_arg(ASTNode* count_expr, const char** params, Type** args, size_t n) {
+    if (!count_expr) return NULL;
+    if (count_expr->type == AST_TYPE_EXPR) {
+        return Type_Substitute(count_expr->sizeof_expr.type, params, args, n);
+    }
+    if (count_expr->type == AST_IDENT) {
+        for (size_t i = 0; i < n; i++) {
+            if (strcmp(count_expr->ident.name, params[i]) == 0) return args[i];
+        }
+    }
+    return NULL;
+}
+
+// `M[T][N]`, M an unapplied template: leftmost bracket is outermost (same
+// fold as u32[2][3]), so T (M's type arg) wraps N (a real array dim) --
+// backwards from what M[T] needs. Consumes `arity` brackets from the
+// outside in as type args; whatever's left wraps the instantiated result
+// as ordinary array dims. NULL (no-op) unless the base is confirmed a
+// still-generic template -- T[N]/Mat[T,R,C]{T[R][C]} never reach that.
+static Type* array_substitute_maybe_hkt(Type* t, const char** params, Type** args, size_t n) {
+    size_t depth = 0;
+    Type* base = t;
+    for (; base->cls == TYPE_ARRAY; base = base->array.element) depth++;
+    if (depth == 0) return NULL;
+
+    ASTNode** count_exprs = (ASTNode**)malloc(depth * sizeof(ASTNode*));
+    size_t i = 0;
+    for (Type* cur = t; cur->cls == TYPE_ARRAY; cur = cur->array.element) count_exprs[i++] = cur->array.count_expr;
+    Type* base_sub = Type_Substitute(base, params, args, n);
+
+    if (!base_sub || base_sub->cls != TYPE_STRUCT) { free(count_exprs); return NULL; }
+    StructDef* esd = Struct_Find(base_sub->struct_name);
+    if (!esd || !esd->is_generic || esd->type_param_count == 0 ||
+        esd->type_param_count > depth) { free(count_exprs); return NULL; }
+
+    size_t arity = esd->type_param_count;
+    Type** type_args = (Type**)malloc(arity * sizeof(Type*));
+    for (size_t k = 0; k < arity; k++) {
+        Type* ta = count_expr_as_type_arg(count_exprs[k], params, args, n);
+        if (!ta) {
+            // A confirmed template short on type-shaped brackets (e.g. M[T][N]
+            // with M arity-2 and N a real value) is an arity error, not a
+            // silent fallthrough to "unapplied" -- that used to read as
+            // sizeof 0 instead of failing.
+            fprintf(stderr, "Error: generic struct '%s' expects %zu type arguments "
+                            "(used as %s[...] here), got fewer -- the remaining "
+                            "bracket(s) are not type-shaped\n",
+                            esd->name, arity, esd->name);
+            exit(1);
+        }
+        type_args[k] = ta;
+    }
+    StructDef* inst = Struct_Instantiate(esd, type_args, arity);
+    free(type_args);
+
+    // Rebuild any remaining OUTER-of-the-consumed-arity levels as genuine
+    // arrays (the brackets nearer the front that weren't needed for arity --
+    // for `M[T][N]` with a 1-ary M, arity consumes count_exprs[0]=T, leaving
+    // count_exprs[1]=N to wrap the instantiated result as a real array dim).
+    Type* result = (Type*)calloc(1, sizeof(Type));
+    result->cls = TYPE_STRUCT;
+    result->struct_name = inst->name;
+    for (size_t k = depth; k > arity; k--) {
+        Type* outer = (Type*)calloc(1, sizeof(Type));
+        outer->cls = TYPE_ARRAY;
+        outer->array.element = result;
+        fold_array_count(count_exprs[k - 1], params, args, n, &outer->array.count, &outer->array.count_expr);
+        result = outer;
+    }
+    free(count_exprs);
+    return result;
+}
+
 // --- type substitution ---
 Type* Type_Substitute(Type* t, const char** params, Type** args, size_t n) {
     if (!t) return NULL;
@@ -747,8 +857,7 @@ Type* Type_Substitute(Type* t, const char** params, Type** args, size_t n) {
         // Deferred value arg (e.g. `M * 2` from an outer generic). Re-fold with the
         // frame active so its params resolve, then produce a concrete value pinned
         // to the same type. Mirrors the array.count_expr deferral below.
-        const char** op = s_ce_generic_params; Type** oa = s_ce_generic_args; size_t on = s_ce_generic_n;
-        s_ce_generic_params = params; s_ce_generic_args = args; s_ce_generic_n = n;
+        CeGenericFrame saved = ce_generic_frame_install(params, args, n);
         Type* pin = t->cval.pin;
         bool aggregate = Type_IsAggregate(pin);
         Type* r = (Type*)calloc(1, sizeof(Type));
@@ -763,43 +872,20 @@ Type* Type_Substitute(Type* t, const char** params, Type** args, size_t n) {
             if (ConstEval(t->cval.defer, &v)) { r->cval.scalar = v; }
             else                              { r->cval.defer = t->cval.defer; }
         }
-        s_ce_generic_params = op; s_ce_generic_args = oa; s_ce_generic_n = on;
+        ce_generic_frame_restore(saved);
         return r;
     }
     Type* c = (Type*)calloc(1, sizeof(Type));
     *c = *t;
     if (t->cls == TYPE_POINTER) c->pointer_base = Type_Substitute(t->pointer_base, params, args, n);
     else if (t->cls == TYPE_ARRAY) {
+        // M[T][N] on an unapplied template: see array_substitute_maybe_hkt.
+        Type* hkt = array_substitute_maybe_hkt(t, params, args, n);
+        if (hkt) return hkt;
+
         c->array.element = Type_Substitute(t->array.element, params, args, n);
-        if (t->array.count_expr) {
-            int64_t eval_val;
-            
-            const char** old_params = s_ce_generic_params;
-            Type** old_args = s_ce_generic_args;
-            size_t old_n = s_ce_generic_n;
-            
-            s_ce_generic_params = params;
-            s_ce_generic_args = args;
-            s_ce_generic_n = n;
-
-            bool ok = ConstEval(t->array.count_expr, &eval_val);
-
-            s_ce_generic_params = old_params;
-            s_ce_generic_args = old_args;
-            s_ce_generic_n = old_n;
-            
-            if (ok) {
-                if (eval_val <= 0) {
-                    fprintf(stderr, "Error: array size must be positive (const-generic size evaluated to %lld)\n",
-                            (long long)eval_val);
-                    exit(1);
-                }
-                c->array.count = (uint64_t)eval_val;
-                c->array.count_expr = NULL;
-            } else {
-                c->array.count_expr = t->array.count_expr; // Still unresolved (e.g. nested generic)
-            }
-        }
+        if (t->array.count_expr)
+            fold_array_count(t->array.count_expr, params, args, n, &c->array.count, &c->array.count_expr);
     }
     else if (t->cls == TYPE_STRUCT && t->struct_name) {
         StructDef* sd = Struct_Find(t->struct_name);
@@ -812,9 +898,21 @@ Type* Type_Substitute(Type* t, const char** params, Type** args, size_t n) {
             StructDef* new_sd = Struct_Instantiate(sd->generic_base, new_args, sd->type_arg_count);
             c->struct_name = new_sd->name;
             free(new_args);
-        } else if (sd && sd->is_generic && sd->type_param_count > 0) {
+        } else if (sd && sd->is_generic && sd->type_param_count > 0 && !t->struct_unapplied) {
             // Template struct (e.g. Box): if any of its type_params are in scope,
-            // instantiate it with the substituted args. This handles `Box*` self params.
+            // instantiate it with the substituted args. This handles `Box*` self
+            // params (self's implicit type is a bare `TYPE_STRUCT{struct_name=Box}`
+            // built fresh per method, so it never shares array identity with
+            // whatever frame substitutes it -- name-matching against the CURRENT
+            // frame's params is the only signal available here).
+            //
+            // struct_unapplied (set only by the "let an unapplied template ride
+            // through" call-site path) opts a node OUT of this: without it, a bare
+            // Box used as a foreign generic's ARGUMENT (`describe[M,T](...)` binding
+            // M=Box) falsely matched this branch whenever Box's OWN param name
+            // ("T") happened to collide with an unrelated same-named param in
+            // describe's frame, force-instantiating Box into the wrong concrete
+            // type using describe's T instead of leaving it deliberately unapplied.
             bool any_match = false;
             for (size_t i = 0; i < sd->type_param_count && !any_match; i++)
                 for (size_t j = 0; j < n && !any_match; j++)
@@ -2259,6 +2357,40 @@ static bool stmt_always_returns(ASTNode* n) {
 // `match T`'s resolution path) needs to call it -- see that case for why.
 static void Resolve_Reflect_Matches(ASTNode* n);
 
+// Core of a `match T` AST_IF's resolution, shared by Typecheck_Tree (the
+// non-generic path) and Resolve_Reflect_Matches (the post-clone_ast path):
+// unify the scrutinee against the pattern, splice `node` in place into
+// either the taken arm (cloning it with any reflect bindings) or the
+// else/empty fallback. Returns false (no-op) when the scrutinee is still an
+// unresolved TYPE_PARAM -- not yet substituted, defer to a later pass -- or
+// true once `node` has become the selected block, ready for the caller's own
+// follow-up. A NULL scrutinee is NOT "still generic": it's also the genuine
+// resolved value of an omitted type (a no-payload enum variant's H) -- only
+// bail on an ACTUAL TYPE_PARAM node.
+static bool reflect_match_select(ASTNode* node) {
+    Type* scrut = node->if_stmt.reflect_scrutinee;
+    if (scrut && scrut->cls == TYPE_PARAM) return false;
+    ReflectBindings binds = {0};
+    if (reflect_unify(scrut, node->if_stmt.reflect_pattern, &binds)) {
+        ASTNode* body = node->if_stmt.true_block;
+        if (binds.count > 0) body = clone_ast(body, binds.names, binds.args, binds.count, false);
+        reflect_bindings_free(&binds);
+        *node = *body;
+    } else {
+        reflect_bindings_free(&binds);
+        ASTNode* rest = node->if_stmt.false_block;
+        if (rest) {
+            *node = *rest;
+        } else {
+            node->type = AST_BLOCK;
+            node->block.statements = NULL;
+            node->block.count = 0;
+            node->block.capacity = 0;
+        }
+    }
+    return true;
+}
+
 void Typecheck_Tree(ASTNode* node) {
     if (!node) return;
 
@@ -2306,60 +2438,19 @@ void Typecheck_Tree(ASTNode* node) {
         }
 
         case AST_IF:
+            // `match T` resolution: shared with Resolve_Reflect_Matches (that
+            // copy runs eagerly right after a generic clone; this one is the
+            // ONLY place ordinary non-generic code's `match` ever resolves,
+            // since Resolve_Reflect_Matches only runs on generic bodies).
+            // reflect_match_select splices node into its taken arm (or the
+            // empty/else fallback) in place; the taken branch's OWN nested
+            // matches still need resolving (Resolve_Reflect_Matches, since
+            // clone_ast doesn't recurse into them), only then Typecheck_Tree.
             if (node->if_stmt.reflect_pattern) {
-                // A `match` whose scrutinee is CONCRETE (an ordinary, non-generic
-                // `match u64* { ... }`, or a generic body Typecheck_Tree happens
-                // to reach with T already substituted) must resolve right here —
-                // this is the only place ordinary non-generic code's `match` ever
-                // gets typechecked, since Generic_Instantiate's own eager pass
-                // (Resolve_Reflect_Matches) only ever runs on generic bodies.
-                // Only a genuinely still-abstract scrutinee (bare TYPE_PARAM,
-                // i.e. this is the original generic template, not an
-                // instantiation) defers — that copy gets resolved later, once,
-                // by Resolve_Reflect_Matches right after clone_ast.
-                Type* scrut = node->if_stmt.reflect_scrutinee;
-                // See Resolve_Reflect_Matches's identical fix: a NULL scrutinee is
-                // not automatically "still an unresolved generic param" -- it's also
-                // the genuine, resolved value of an omitted type (a no-payload enum
-                // variant's H). Only bail when scrut is a REAL TYPE_PARAM node.
-                bool still_generic = scrut && scrut->cls == TYPE_PARAM;
-                if (!still_generic) {
-                    ReflectBindings binds = {0};
-                    if (reflect_unify(scrut, node->if_stmt.reflect_pattern, &binds)) {
-                        ASTNode* body = node->if_stmt.true_block;
-                        if (binds.count > 0) {
-                            body = clone_ast(body, binds.names, binds.args, binds.count, false);
-                            // clone_ast's own AST_NAMEOF case only substitutes the type
-                            // reference -- it never actually folds the node into a real
-                            // AST_STRING (that conversion lives solely in
-                            // Resolve_Reflect_Matches, normally run by Generic_Instantiate
-                            // right after ITS OWN clone_ast call). This path is the OTHER
-                            // place a match gets resolved -- an ordinary, non-generic
-                            // function's `match T` -- and it was skipping that pass
-                            // entirely, leaving nameof(A)/nameof(B) permanently unresolved
-                            // ("never resolved to a constant") even though sizeof(A) on
-                            // the identical binding worked fine (AST_SIZEOF needs no such
-                            // fold-to-string step).
-                            Resolve_Reflect_Matches(body);
-                        }
-                        reflect_bindings_free(&binds);
-                        *node = *body;
-                        Typecheck_Tree(node);
-                    } else {
-                        reflect_bindings_free(&binds);
-                        ASTNode* rest = node->if_stmt.false_block;
-                        if (rest) { *node = *rest; Typecheck_Tree(node); }
-                        else {
-                            node->type = AST_BLOCK;
-                            node->block.statements = NULL;
-                            node->block.count = 0;
-                            node->block.capacity = 0;
-                        }
-                    }
+                if (reflect_match_select(node)) {
+                    Resolve_Reflect_Matches(node);
+                    Typecheck_Tree(node);
                 }
-                // Abstract scrutinee: still the generic template, not yet
-                // instantiated — defer entirely; Resolve_Reflect_Matches
-                // handles the real (substituted) copy after clone_ast.
                 return;
             }
             Typecheck_Tree(node->if_stmt.condition);
@@ -3349,15 +3440,14 @@ ASTNode* clone_ast(ASTNode* n, const char** params, Type** args, size_t np, bool
             // use of this name within the clone (e.g. as an array size) sees a
             // concrete, per-instantiation value instead of a runtime expr.
             if (n->decl.is_generic_const) {
-                const char** op = s_ce_generic_params; Type** oa = s_ce_generic_args; size_t on = s_ce_generic_n;
-                s_ce_generic_params = params; s_ce_generic_args = args; s_ce_generic_n = np;
+                CeGenericFrame saved = ce_generic_frame_install(params, args, np);
                 int64_t v;
                 s_ce_isfloat = false;
                 s_ce_isfnsym = false;
                 bool ok = ConstEval(c->decl.init_expr, &v);
                 bool was_float = s_ce_isfloat;
                 bool was_fnsym = s_ce_isfnsym;
-                s_ce_generic_params = op; s_ce_generic_args = oa; s_ce_generic_n = on;
+                ce_generic_frame_restore(saved);
                 if (!ok) {
                     fprintf(stderr, "Error: const '%.*s' initializer is not a constant "
                             "expression for this instantiation\n",
@@ -3396,15 +3486,14 @@ ASTNode* clone_ast(ASTNode* n, const char** params, Type** args, size_t np, bool
             // NOTE this replaces the AST_CONST_EXPR node with the folded literal, so
             // nothing downstream ever sees this node kind -- const(...) leaves no
             // trace in the tree and emits no code, exactly like a scalar const.
-            const char** op = s_ce_generic_params; Type** oa = s_ce_generic_args; size_t on = s_ce_generic_n;
-            s_ce_generic_params = params; s_ce_generic_args = args; s_ce_generic_n = np;
+            CeGenericFrame saved = ce_generic_frame_install(params, args, np);
             int64_t v = 0;
             s_ce_isfloat = false;
             s_ce_isfnsym = false;
             bool ok = ConstEval(n->const_expr.inner, &v);
             bool was_float = s_ce_isfloat;
             bool was_fnsym = s_ce_isfnsym;
-            s_ce_generic_params = op; s_ce_generic_args = oa; s_ce_generic_n = on;
+            ce_generic_frame_restore(saved);
             if (!ok) {
                 fprintf(stderr, "Error: const(...) operand is not a constant "
                                 "expression for this instantiation\n");
@@ -3565,43 +3654,12 @@ static void Resolve_Reflect_Matches(ASTNode* n) {
     if (!n) return;
     switch (n->type) {
         case AST_IF:
+            // Shared core with Typecheck_Tree's identical AST_IF case -- see
+            // reflect_match_select. This copy runs eagerly right after
+            // clone_ast, so its own follow-up is just recursing into itself
+            // (the taken/fallback block may hold further nested matches).
             if (n->if_stmt.reflect_pattern) {
-                Type* scrut = n->if_stmt.reflect_scrutinee;
-                // A NULL scrutinee is NOT automatically "still generic, not yet
-                // substituted" -- it's also the genuine, resolved value of an
-                // omitted type (a no-payload enum variant's H, after Type_Substitute
-                // ran and legitimately produced NULL; see Type_IsVoidLike). Only an
-                // ACTUAL unresolved TYPE_PARAM node means "wait, substitution hasn't
-                // happened yet" -- that requires scrut to be non-NULL. Treating every
-                // NULL as "still generic" left THIS match unresolved forever (neither
-                // arm ever selected), so downstream code silently fell back to
-                // whatever this half-finished AST_IF happened to do next -- the same
-                // silent-wrongness class as the Struct_MakeAnon/Type_Substitute
-                // is_enum bugs already fixed this session, just one level up.
-                bool still_generic = scrut && scrut->cls == TYPE_PARAM;
-                if (!still_generic) {
-                    ReflectBindings binds = {0};
-                    if (reflect_unify(scrut, n->if_stmt.reflect_pattern, &binds)) {
-                        ASTNode* body = n->if_stmt.true_block;
-                        if (binds.count > 0)
-                            body = clone_ast(body, binds.names, binds.args, binds.count, false);
-                        reflect_bindings_free(&binds);
-                        *n = *body;              // become the selected block
-                        Resolve_Reflect_Matches(n); // the block itself may hold more matches
-                    } else {
-                        ASTNode* rest = n->if_stmt.false_block;
-                        if (rest) { *n = *rest; Resolve_Reflect_Matches(n); }
-                        else {
-                            ASTNode* empty = (ASTNode*)calloc(1, sizeof(ASTNode));
-                            empty->type = AST_BLOCK;
-                            *n = *empty;
-                        }
-                    }
-                    return; // node became something else; don't also walk stale fields below
-                }
-                // Scrutinee still generic: nothing more to do at this instantiation
-                // (shouldn't normally happen — clone_ast always substitutes it —
-                // but fail closed rather than silently misreading it as a plain if).
+                if (reflect_match_select(n)) Resolve_Reflect_Matches(n);
                 return;
             }
             Resolve_Reflect_Matches(n->if_stmt.condition);

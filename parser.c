@@ -1071,8 +1071,14 @@ static Type* parse_alias_or_type_param_type(Type* base_t) {
     
     advance();
     if (sd->is_generic) {
-        if (s_curr.type != TOK_LBRACKET)
-            parse_error("generic struct used without type arguments");
+        if (s_curr.type != TOK_LBRACKET) {
+            // No `[...]` -- a bare, deliberately unapplied template (e.g. `M`
+            // bound to `Box` in `HKT[Box, i32]`), not an error here.
+            base_t->cls = TYPE_STRUCT;
+            base_t->struct_name = sd->name;
+            base_t->struct_unapplied = true;
+            return base_t;
+        }
         advance();
         Type** targs; size_t tcount;
         parse_generic_arg_list(sd->type_params, sd->param_kinds, sd->type_param_count, &targs, &tcount);
@@ -4308,6 +4314,8 @@ static ASTNode* parse_alias_decl(void) {
         s_aliases = realloc(s_aliases, s_alias_cap * sizeof(AliasDef));
     }
     s_aliases[s_alias_count++] = (AliasDef){ aname, alen, aparams, akinds, apc, body };
+
+    if (s_curr.type == TOK_SEMI) advance(); // optional separator, same as every sibling declaration
 
     // No codegen artifact: an alias is a parse-time-only binding.
     ASTNode* empty = new_node(AST_BLOCK);

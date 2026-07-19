@@ -167,6 +167,7 @@ Token Lexer_NextToken(void) {
         if (check_keyword(&tok, "union", TOK_UNION)) return tok;
         if (check_keyword(&tok, "match", TOK_MATCH)) return tok;
         if (check_keyword(&tok, "unpack", TOK_UNPACK)) return tok;
+        if (check_keyword(&tok, "auto", TOK_UNPACK)) return tok; // alias for `unpack`
         if (check_keyword(&tok, "extern", TOK_EXTERN)) return tok;
         if (check_keyword(&tok, "pub", TOK_PUB)) return tok;
 
