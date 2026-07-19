@@ -138,6 +138,8 @@ void Struct_AppendField(StructField** fields, size_t* count, size_t* cap, Struct
     f->default_val_buf = proto.default_val_buf;
     f->is_super_param = false;
     f->variant_tag = proto.variant_tag; // preserve on copy (super splice, generic instantiation)
+    f->is_super_alias = proto.is_super_alias;       // preserve the prefix-alias flag on copy
+    f->super_prefix_span = proto.super_prefix_span;
 }
 
 StructDef* Struct_Instantiate(StructDef* gen, Type** targs, size_t targ_count) {
@@ -207,13 +209,18 @@ StructDef* Struct_Instantiate(StructDef* gen, Type** targs, size_t targ_count) {
                 // this position (same expansion the non-generic `super A base` path
                 // performs at parse time), then the base field itself.
                 StructDef* super_sd = Struct_Find(subst_type->struct_name);
+                uint32_t span = 0;
                 if (super_sd) {
                     for (size_t si = 0; si < super_sd->field_count; si++) {
                         Struct_AppendField(&inst->fields, &inst->field_count, &icap, super_sd->fields[si]);
                     }
+                    span = (uint32_t)super_sd->field_count;
                 }
+                // Packaged field aliases the just-spliced prefix (single storage),
+                // matching the non-generic `super A base` path.
                 StructField base_f = { .name = gf->name, .type = subst_type,
-                    .has_default = gf->has_default, .default_val_buf = gf->default_val_buf };
+                    .has_default = gf->has_default, .default_val_buf = gf->default_val_buf,
+                    .is_super_alias = true, .super_prefix_span = span };
                 Struct_AppendField(&inst->fields, &inst->field_count, &icap, base_f);
                 continue;
             }
@@ -332,6 +339,17 @@ void Struct_Layout(StructDef* sd) {
         if (f->type && f->type->cls == TYPE_STRUCT) {
             StructDef* inner = Struct_Find(f->type->struct_name);
             Struct_Layout(inner);
+        }
+
+        // A `super A base` packaged field aliases the promoted prefix instead of
+        // owning storage: point it at the first promoted field's offset and skip
+        // the cursor advance (zero size contribution). super_prefix_span promoted
+        // fields immediately precede it, so the prefix starts at fields[i-span].
+        // (Aligned to falign too, so d.base and the prefix share the same address.)
+        if (f->is_super_alias) {
+            uint32_t span = f->super_prefix_span;
+            f->offset = (span && i >= span) ? sd->fields[i - span].offset : f->offset;
+            continue;
         }
 
         uint64_t fsize = f->type ? Type_SizeOf(f->type) : 0;

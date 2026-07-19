@@ -211,6 +211,14 @@ typedef struct StructField {
     // downstream (Enum_VariantIndex, match's codegen, nameof) would silently
     // read the wrong variant. Meaningless (0) for a struct/union field.
     uint32_t variant_tag;
+    // A `super A base` packaged field (`d.base`) ALIASES the promoted prefix
+    // rather than owning a second copy of A's bytes: its offset is that of the
+    // first promoted field and it contributes zero size. `super_prefix_span` is
+    // how many promoted fields immediately precede it in fields[] (== A's field
+    // count), so Struct_Layout can point the alias at fields[i - span].offset.
+    // Single storage: writing d.x and reading d.base.x hit the same bytes.
+    bool is_super_alias;
+    uint32_t super_prefix_span;
 } StructField;
 
 typedef struct StructDef {
@@ -755,6 +763,11 @@ Type* Type_Infer(ASTNode* node);     // result type of an expression (memoized i
 // refusing to fold any generic call whose type args aren't already explicit.
 void infer_generic(ASTNode* node, Type* target);
 Type* Type_MakePrim(int primitive_kind); // construct a primitive Type* (PrimitiveKind cast to int at the call site)
+// Publish the generic type params in scope where an expression was written, so
+// unify_types can bind a callee param to an enclosing param (see s_encl_type_params
+// in types.c). The parser sets this around the eager parse-time typecheck of an
+// `auto`/`unpack` initializer inside a generic body, and clears it (NULL, 0) after.
+void Types_SetEnclosingParams(const char** params, size_t count);
 
 // --- Reflections: structural type unification for `match T` (reflections.c) ---
 //

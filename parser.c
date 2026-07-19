@@ -3983,8 +3983,14 @@ static ASTNode* parse_struct_decl_ex(bool is_enum, bool is_overlapping, bool is_
                 Struct_AppendField(&sd->fields, &sd->field_count, &cap, super_sd->fields[si]);
             }
 
+            // The packaged field `d.base` ALIASES the promoted prefix (single
+            // storage) rather than owning a second copy: flag it and record how
+            // many promoted fields precede it, so Struct_Layout points its offset
+            // at the prefix start and gives it zero size.
             // TYPE_STRUCT, already correctly resolved by parse_type (handles generics/aliases)
-            StructField f = { .name = base_name, .type = super_pt };
+            StructField f = { .name = base_name, .type = super_pt,
+                              .is_super_alias = true,
+                              .super_prefix_span = (uint32_t)super_sd->field_count };
             Struct_AppendField(&sd->fields, &sd->field_count, &cap, f);
             free(base_name);
 

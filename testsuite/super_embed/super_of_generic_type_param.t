@@ -1,10 +1,13 @@
-//@ expect val 4017
+//@ expect val 101017
 // `super T base` inside a generic template: T is an unresolved TYPE_PARAM at
 // template-parse time, so there's nothing to promote fields from yet. The
 // promotion is deferred to Struct_Instantiate, which expands the single
 // template field into N instance fields once T is bound to a concrete
 // struct. Two different instantiations (Holder[A], Holder[C]) must each get
 // their own correctly-expanded, non-crosstalking field set.
+// The packaged name aliases the promoted prefix (single storage), same as the
+// non-generic path: here h1.base.x = 100 overwrites the earlier h1.x = 3, so
+// h1.x reads back 100 -> 100*1000 + 9*100 + 100 + (1*10 + 2 + 5) = 101017.
 struct A { u32 x }
 struct C { u32 w  u32 z }
 struct Holder[T] {
@@ -15,7 +18,7 @@ fn main() i32 {
     Holder[A] h1
     h1.x = 3
     h1.tag = 9
-    h1.base.x = 100
+    h1.base.x = 100   // aliases h1.x -> overwrites it
 
     Holder[C] h2
     h2.w = 1

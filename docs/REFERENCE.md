@@ -201,12 +201,17 @@ struct Derived {
 }
 ```
 - `d.tag` reaches the promoted field directly.
-- `d.info` gives the whole embedded `Base` as an **independent copy** —
-  writing through the promoted name does not alias writing through `.info`.
+- `d.info` names the whole embedded `Base` and **aliases the promoted prefix** —
+  it is the *same storage*, not a second copy. `d.tag` and `d.info.tag` are the
+  same bytes; writing either is visible through the other. `sizeof(Derived)` is
+  `sizeof(Base)` + Derived's own fields, with no duplication.
+- `d.info` is a genuine lvalue of type `Base`: readable, writable, and copyable
+  by value (`f(d.info)` passes an ordinary independent *value* copy).
 - Works in `struct` and `union` bodies. Embedded type may be a generic
   param (`super T base`), resolved at instantiation.
 - Copies fields only, never methods.
-- `(Base*)&derived_val` reads through the shared prefix (see Casts).
+- `(Base*)&derived_val` reads through the shared prefix (see Casts) — the same
+  bytes `d.info` names.
 
 ---
 
