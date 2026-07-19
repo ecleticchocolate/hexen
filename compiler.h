@@ -211,6 +211,14 @@ typedef struct StructField {
     // downstream (Enum_VariantIndex, match's codegen, nameof) would silently
     // read the wrong variant. Meaningless (0) for a struct/union field.
     uint32_t variant_tag;
+    // A `super A base` packaged field (`d.base`) ALIASES the promoted prefix
+    // rather than owning a second copy of A's bytes: its offset is that of the
+    // first promoted field and it contributes zero size. `super_prefix_span` is
+    // how many promoted fields immediately precede it in fields[] (== A's field
+    // count), so Struct_Layout can point the alias at fields[i - span].offset.
+    // Single storage: writing d.x and reading d.base.x hit the same bytes.
+    bool is_super_alias;
+    uint32_t super_prefix_span;
 } StructField;
 
 typedef struct StructDef {
@@ -365,7 +373,15 @@ typedef enum {
                         // computation.
     AST_STRING,        // "..." -> u8* to static NUL-terminated bytes
     AST_NEW,           // new T / new T{...} / new T[expr] -> T*
-    AST_DELETE         // delete p -> free
+    AST_DELETE,        // delete p -> free
+    AST_MATCH          // A VALUE `match`: scrutinee + raw arms captured at parse
+                       // time WITHOUT any type resolution. Classified and lowered to
+                       // the if-chain at typecheck time (Lower_Match), where generic
+                       // params are concrete -- so `match N + 1` / `match arr[N]` and
+                       // any value expression resolve through the ordinary Type_Infer,
+                       // with no parse-time type query to fail. (A TYPE match --
+                       // `match T { P* {..} }` -- still routes to parse_match_type and
+                       // never produces this node.)
 } ASTNodeType;
 
 typedef struct ASTNode {
@@ -488,6 +504,22 @@ typedef struct ASTNode {
             // check (types.c, stmt_always_returns) reads this -- codegen is unchanged.
             bool exhaustive_tail;
         } if_stmt;
+        // A value `match` captured at parse time with NO scrutinee typechecking.
+        // Each arm is a raw pattern node (NULL for the `else` arm) plus its already-
+        // parsed body block. Classification (enum/primitive/aggregate) and lowering
+        // to an if-chain happen at typecheck time, in Lower_Match, where generic
+        // params are concrete -- so `match N + 1` / `match arr[N]` resolve like any
+        // other expression instead of failing an eager parse-time Type_Infer.
+        struct {
+            struct ASTNode* scrutinee;
+            struct ASTNode** arm_patterns; // arm_patterns[i] == NULL  =>  else arm
+            struct ASTNode** arm_bodies;   // parsed block per arm
+            struct SymbolTable** arm_scopes; // the scope each arm body was parsed in
+                                             // (holds its pre-declared pattern binders,
+                                             // reused verbatim by Lower_Match)
+            size_t arm_count;
+            bool is_type_match;            // scrutinee parsed as a bare type (AST_TYPE_EXPR)
+        } match_stmt;
         struct {
             struct ASTNode* condition;
             struct ASTNode* body;
@@ -755,6 +787,16 @@ Type* Type_Infer(ASTNode* node);     // result type of an expression (memoized i
 // refusing to fold any generic call whose type args aren't already explicit.
 void infer_generic(ASTNode* node, Type* target);
 Type* Type_MakePrim(int primitive_kind); // construct a primitive Type* (PrimitiveKind cast to int at the call site)
+// Publish the generic type params in scope where an expression was written, so
+// unify_types can bind a callee param to an enclosing param (see s_encl_type_params
+// in types.c). The parser sets this around the eager parse-time typecheck of an
+// `auto`/`unpack` initializer inside a generic body, and clears it (NULL, 0) after.
+void Types_SetEnclosingParams(const char** params, size_t count);
+// Lower a parse-time-captured AST_MATCH (value match) into the if-chain, now that
+// the scrutinee type `st` is known. Called from Typecheck_Tree's AST_MATCH case
+// (and ConstEval for a comptime `const` initializer). Defined in parser.c, reusing
+// its static lowering helpers (compile_pattern, matchchain, pattern_covers_all).
+struct ASTNode* Lower_Match(struct ASTNode* node, struct Type* st);
 
 // --- Reflections: structural type unification for `match T` (reflections.c) ---
 //

@@ -1782,6 +1782,28 @@ Type* Type_Infer(ASTNode* node) {
 // resolved against it. Set when entering a function body, restored on exit.
 static Type* s_current_fn_return = NULL;
 
+// The type params in scope where the expression currently being type-inferred was
+// WRITTEN -- set by the parser around the eager parse-time typecheck of an
+// `auto`/`unpack` initializer inside a generic body (parse_unpack). It lets
+// unify_types tell "this arg is one of my enclosing generic's OWN params" (e.g.
+// `inner(v)` where v:T and T is outer_diff's own param -> bind U:=T, yielding the
+// inner instantiation inner[T], re-substituted concrete at monomorphization) apart
+// from "this arg is some other call's still-unresolved return param" (`make()` in
+// `wrap(make())`, which must stay unbound so top-down inference from the outer
+// Box[i32] context fills it in). Only the former is a genuine bound param in scope.
+static const char** s_encl_type_params = NULL;
+static size_t s_encl_type_param_count = 0;
+void Types_SetEnclosingParams(const char** params, size_t count) {
+    s_encl_type_params = params; s_encl_type_param_count = count;
+}
+static bool is_enclosing_param(Type* t) {
+    if (!t || t->cls != TYPE_PARAM || !t->param_name) return false;
+    for (size_t i = 0; i < s_encl_type_param_count; i++)
+        if (s_encl_type_params[i] && strcmp(s_encl_type_params[i], t->param_name) == 0)
+            return true;
+    return false;
+}
+
 // Callee param types for the call currently having its args typechecked, so a bare
 // `{...}` passed as an argument resolves against the matching parameter type.
 
@@ -1793,7 +1815,19 @@ static bool unify_types(Type* concrete, Type* generic, const char** type_params,
     // generic (e.g. the return type of an inner generic call whose T hasn't been
     // inferred yet). Binding from an unresolved param would poison the table with a
     // non-concrete type; skip and let a later top-down or outer pass fill it in.
-    if (concrete->cls == TYPE_PARAM) return false;
+    //
+    // Exception: when the concrete param is one of the ENCLOSING generic's OWN
+    // params (a real bound param in scope -- `inner(v)` with v:T inside
+    // `outer_diff[T]`) AND the callee's param is a bare TYPE_PARAM, binding it is
+    // correct: it produces the inner instantiation `inner[T]`, and clone_ast
+    // re-substitutes T to a concrete type when the enclosing generic is
+    // monomorphized. This is what makes `auto x = inner(v)` (which typechecks its
+    // initializer eagerly at parse time, while T is still abstract) work. A param
+    // from some OTHER unresolved call (`make()` in `wrap(make())`) is NOT enclosing,
+    // so it still bails here and waits for top-down inference. See s_encl_type_params.
+    if (concrete->cls == TYPE_PARAM &&
+        !(generic->cls == TYPE_PARAM && is_enclosing_param(concrete)))
+        return false;
     // A TYPE_FN_LITERAL binding DIRECTLY to a bare type param (`Cmp cmp`, generic
     // side is TYPE_PARAM) is the one case that should keep the literal's identity
     // -- that's the entire feature (see the TYPE_PARAM branch below, which stores
@@ -2063,6 +2097,13 @@ void infer_generic(ASTNode* node, Type* target) {
             ASTNode* a = node->call.args[i];
             if (is_untyped_literal(a))
                 continue;
+            // An argument that is ITSELF an uninferred generic call (`id(id(5))`)
+            // must be resolved before we can read its type: without this, Type_Infer
+            // returns the callee's unsubstituted return param (a TYPE_PARAM), which
+            // unify skips, so the outer call never pins its own T. Recurse first.
+            // (Top-down positions -- decl init, return, call arg -- already do this
+            // via their own infer_generic; a bare operator operand did not.)
+            infer_generic(a, NULL);
             Type* arg_t = Type_Infer(a);
             if (arg_t) {
                 unify_types(arg_t, node->call.sym->type->function.param_types[i],
@@ -2512,6 +2553,24 @@ void Typecheck_Tree(ASTNode* node) {
             Typecheck_Tree(node->while_stmt.condition);
             Typecheck_Tree(node->while_stmt.body);
             return;
+
+        case AST_MATCH: {
+            // A value `match`: the scrutinee was captured raw at parse time. NOW its
+            // type is resolvable (generic params concrete at this point), so classify
+            // + lower here instead of during parsing -- which is what makes
+            // `match N + 1` / `match arr[N]` and any value expression work. infer_generic
+            // first (as parse_unpack does) so a generic-call scrutinee still infers.
+            ASTNode* scrut = node->match_stmt.scrutinee;
+            infer_generic(scrut, NULL);
+            Type* st = Type_Infer(scrut);
+            if (!st) { Error_AtNode(node, "cannot resolve match scrutinee type", NULL); return; }
+            ASTNode* lowered = Lower_Match(node, st);
+            // Morph this node into the lowered block in place so the parent's
+            // pointer stays valid, then typecheck the result normally.
+            *node = *lowered;
+            Typecheck_Tree(node);
+            return;
+        }
 
         case AST_FOR:
             Typecheck_Tree(node->for_stmt.init);
@@ -3569,6 +3628,39 @@ ASTNode* clone_ast(ASTNode* n, const char** params, Type** args, size_t np, bool
             c->if_stmt.reflect_scrutinee = Type_Substitute(n->if_stmt.reflect_scrutinee, params, args, np);
             c->if_stmt.reflect_pattern   = Type_Substitute(n->if_stmt.reflect_pattern, params, args, np);
             break;
+        case AST_MATCH: {
+            // Clone the raw scrutinee + arms with substitution, so at
+            // this instantiation the scrutinee's generic params (a value param N,
+            // a type param T) are concrete BEFORE Lower_Match runs at typecheck.
+            c->match_stmt.scrutinee = clone_ast(n->match_stmt.scrutinee, params, args, np, clone_symbols);
+            size_t m = n->match_stmt.arm_count;
+            c->match_stmt.arm_patterns = malloc((m?m:1) * sizeof(ASTNode*));
+            c->match_stmt.arm_bodies   = malloc((m?m:1) * sizeof(ASTNode*));
+            c->match_stmt.arm_scopes   = malloc((m?m:1) * sizeof(SymbolTable*));
+            for (size_t i = 0; i < m; i++) {
+                // Each arm's pre-declared binder symbols must be CLONED per
+                // instantiation -- otherwise every instantiation shares (and
+                // clobbers) the template's `v`, and a generic payload type T comes
+                // out wrong. Clone the scope's symbols first (registering old->new in
+                // the clone map), so the arm body's idents remap to the fresh ones.
+                SymbolTable* os = n->match_stmt.arm_scopes[i];
+                SymbolTable* cs = SymTable_Create(os->parent);
+                cs->is_function_scope = os->is_function_scope;
+                if (clone_symbols) {
+                    for (size_t s = 0; s < os->count; s++) {
+                        Symbol* ns = clone_symbol(os->symbols[s], params, args, np, clone_symbols);
+                        cs->symbols = realloc(cs->symbols, (cs->count + 1) * sizeof(Symbol*));
+                        cs->symbols[cs->count++] = ns;
+                    }
+                }
+                c->match_stmt.arm_scopes[i] = clone_symbols ? cs : os;
+                c->match_stmt.arm_patterns[i] = n->match_stmt.arm_patterns[i]
+                    ? clone_ast(n->match_stmt.arm_patterns[i], params, args, np, clone_symbols) : NULL;
+                c->match_stmt.arm_bodies[i] = clone_ast(n->match_stmt.arm_bodies[i], params, args, np, clone_symbols);
+            }
+            c->match_stmt.arm_count = m;
+            break;
+        }
         case AST_WHILE:
             c->while_stmt.condition = clone_ast(n->while_stmt.condition, params, args, np, clone_symbols);
             c->while_stmt.body = clone_ast(n->while_stmt.body, params, args, np, clone_symbols);
