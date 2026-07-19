@@ -57,6 +57,7 @@ Symbol* SymTable_Add(SymbolTable* table, const char* name, size_t len, Type* typ
         table->current_local_offset += slot;
         sym->offset = table->current_local_offset;
     }
+    // SYM_CONST gets no storage slot or offset
 
     return sym;
 }

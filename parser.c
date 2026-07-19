@@ -411,8 +411,11 @@ static Type* parse_generic_value_arg(Type* pin) {
     if (s_in_match_pattern && s_curr.type == TOK_IDENTIFIER) {
         // Only treat as a wildcard if it's not already a resolvable constant/param.
         Type* dummy;
-        bool is_known = (param_kind_lookup(s_curr.start, s_curr.length, &dummy) >= 0) ||
-                        (Const_Find(s_curr.start, s_curr.length) != NULL);
+        bool is_known = (param_kind_lookup(s_curr.start, s_curr.length, &dummy) >= 0);
+        if (!is_known) {
+            Symbol* sym = SymTable_Find(s_symtable, s_curr.start, s_curr.length);
+            if (sym && (sym->kind == SYM_CONST || sym->kind == SYM_GLOBAL)) is_known = true;
+        }
         // Peek: a bare identifier immediately followed by `,` or `]` is a lone name,
         // i.e. a candidate wildcard (not part of a larger constant expression).
         if (!is_known) {
@@ -1963,41 +1966,31 @@ static ASTNode* parse_ident_expr(void) {
             return node;
         } else {
             // Variable reference, or a named constant.
-            if (sym) {
-                return make_ident_node(id_tok.start, id_tok.length, sym);
-            }
-            // A generic param in scope shadows any same-named global const. Emit a
-            // deferred AST_IDENT (not a folded literal) so it resolves under the
-            // generic frame at instantiation — correct pinning precedence. Without
-            // this, `struct A[T, u32 N] {..}` next to a global `const N` would fold
-            // N to the global's value at parse time.
+            // A generic param in scope shadows any same-named global/outer variable or const.
+            // Emit a deferred AST_IDENT (not a folded literal or bound sym) so it resolves
+            // under the generic frame at instantiation — correct pinning precedence.
             {
                 Type* dummy;
                 if (param_kind_lookup(id_tok.start, id_tok.length, &dummy) >= 0) {
                     return make_ident_node(id_tok.start, id_tok.length, NULL);
                 }
             }
-            // Named constant -> inline as a literal of its declared kind. A float
-            // const stores its value as IEEE-754 bits in c->value; inline it as a
-            // FLOAT literal (bitcast back to double) so the backend treats it as a
-            // float, not an integer with that bit pattern. (ConstEval also folds a
-            // const through its own AST_IDENT lookup if needed.)
-            ConstDef* c = Const_Find(id_tok.start, id_tok.length);
-            if (c) {
-                ASTNode* node = new_node(AST_INT_LITERAL);
-                if (c->type && Type_IsFloat(c->type)) {
-                    node->lit_kind = LIT_FLOAT;
-                    double d; memcpy(&d, &c->value, sizeof d);
-                    node->float_value = d;
-                } else {
-                    node->lit_kind = LIT_INT;
-                    node->int_value = (uint64_t)c->value;
+            if (sym) {
+                if (sym->kind == SYM_CONST) {
+                    ConstDef* c = sym->cdef;
+                    ASTNode* node = new_node(AST_INT_LITERAL);
+                    if (c->type && Type_IsFloat(c->type)) {
+                        node->lit_kind = LIT_FLOAT;
+                        double d; memcpy(&d, &c->value, sizeof d);
+                        node->float_value = d;
+                    } else {
+                        node->lit_kind = LIT_INT;
+                        node->int_value = (uint64_t)c->value;
+                    }
+                    if (c->pending_expr) Const_RegisterPendingUse(node, c);
+                    return node;
                 }
-                // If the const isn't folded yet (forward-referenced a later fn), its
-                // value here is a placeholder 0. Register this literal node so
-                // Const_ResolvePending back-patches it once the const is folded.
-                if (c->pending_expr) Const_RegisterPendingUse(node, c);
-                return node;
+                return make_ident_node(id_tok.start, id_tok.length, sym);
             }
             // Deferred resolution: the identifier may refer to a function defined
             // later in the file (e.g. function pointer passed as argument).
@@ -4221,6 +4214,10 @@ static ASTNode* parse_const_decl(bool is_pub) {
     ConstDef* cdef = Const_Register(name.start, name.length, value, t);
     cdef->is_pub = is_pub;
     if (!folded) cdef->pending_expr = expr;
+
+    Symbol* sym = SymTable_Add(s_symtable, name.start, name.length, t, SYM_CONST);
+    sym->is_pub = is_pub;
+    sym->cdef = cdef;
 
     if (s_curr.type == TOK_SEMI) advance();
     // A const emits no code; return a harmless empty block.

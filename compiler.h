@@ -622,7 +622,8 @@ typedef struct ASTNode {
 typedef enum {
     SYM_GLOBAL,
     SYM_LOCAL,
-    SYM_FUNCTION
+    SYM_FUNCTION,
+    SYM_CONST
 } SymbolKind;
 
 typedef struct Symbol {
@@ -669,6 +670,7 @@ typedef struct Symbol {
     // after a LATER, unrelated-looking loop ran on a different generic
     // instantiation.
     int64_t ce_cached_addr;
+    struct ConstDef* cdef; // For SYM_CONST
 } Symbol;
 
 typedef struct SymbolTable {

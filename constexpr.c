@@ -1233,6 +1233,10 @@ static bool ce_eval_ident(ASTNode* node, int64_t* out) {
                     }
                 }
             }
+            // Forward references: if it wasn't resolved during parse, try resolving it against the global scope now
+            if (!node->ident.sym) {
+                node->ident.sym = SymTable_Find(Get_SymTable(), node->ident.name, node->ident.name_len);
+            }
             // First: a comptime param/local bound in the current call/block frame.
             if (node->ident.sym && ce_lookup_local(node->ident.sym, out)) return true;
             // A struct-typed const-generic param (`Length L`) materializes as a
@@ -1258,19 +1262,22 @@ static bool ce_eval_ident(ASTNode* node, int64_t* out) {
             }
             // Else: a global named constant (constants may build on earlier constants).
             // A real runtime variable (a sym not in the comptime env) is NOT foldable.
-            ConstDef* c = Const_Find(node->ident.name, node->ident.name_len);
-            if (!c) return false;
-            // A const that's still PENDING (its own initializer forward-referenced a
-            // later fn) has only a placeholder value — fail the fold so a const that
-            // depends on it (`const B = A * 2`) also defers, instead of capturing 0.
-            if (c->pending_expr) return false;
-            *out = c->value;
-            // LIFTED: a const of aggregate type carries an arena OFFSET as its
-            // value — flag it so `&P`, `P.f`, `P[i]` can address into the arena.
-            s_ce_isagg = (c->type && (c->type->cls == TYPE_STRUCT ||
-                                      c->type->cls == TYPE_ARRAY));
-            s_ce_isfloat = false;
-            return true;
+            if (node->ident.sym && node->ident.sym->kind == SYM_CONST) {
+                ConstDef* c = node->ident.sym->cdef;
+                if (!c) return false;
+                // A const that's still PENDING (its own initializer forward-referenced a
+                // later fn) has only a placeholder value — fail the fold so a const that
+                // depends on it (`const B = A * 2`) also defers, instead of capturing 0.
+                if (c->pending_expr) return false;
+                *out = c->value;
+                // LIFTED: a const of aggregate type carries an arena OFFSET as its
+                // value — flag it so `&P`, `P.f`, `P[i]` can address into the arena.
+                s_ce_isagg = (c->type && (c->type->cls == TYPE_STRUCT ||
+                                          c->type->cls == TYPE_ARRAY));
+                s_ce_isfloat = false;
+                return true;
+            }
+            return false;
 }
 
 static bool ce_eval_declaration(ASTNode* node, int64_t* out) {
