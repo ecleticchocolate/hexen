@@ -27,6 +27,7 @@ static ASTNode* parse_fn_decl(bool is_pub, bool is_extern,
                               StructDef* impl_sd);
 static ASTNode* parse_expr_prec(int min_prec);
 static ASTNode* parse_block_body(void);
+static void predeclare_binders(ASTNode* pat); // fwd: used by parse_unpack (defined below)
 static ASTNode* parse_alias_decl(void);
 static ASTNode* parse_const_decl(bool is_pub);
 static ASTNode* parse_const_block(void);
@@ -2663,6 +2664,11 @@ ASTNode* Lower_Match(ASTNode* node, Type* st) {
 
     MatchChain mc = matchchain_begin();
     ASTNode* outer = mc.outer;
+    // An `unpack` lowers to a TRANSPARENT block: its binders escape into the
+    // enclosing scope (that's unpack's defining difference from a match arm), and
+    // ConstEval must not scope them away either -- so `const K = f()` where f
+    // unpacks folds, matching the old parse-time lowering this replaced.
+    if (node->match_stmt.is_unpack) outer->block.transparent = true;
     matchchain_push_stmt(&mc, make_decl_stmt(st, mname, mn, msym, scrut));
     #define SREF() ({ ASTNode* r = new_node(AST_IDENT); r->ident.name = mname; \
                       r->ident.name_len = mn; r->ident.sym = msym; r; })
@@ -2695,6 +2701,24 @@ ASTNode* Lower_Match(ASTNode* node, Type* st) {
             }
         }
 
+        // An `unpack` arm carries all of parse_unpack's concrete-path logic here, so
+        // it runs at typecheck when `st` is concrete -- uniformly for a generic OR a
+        // concrete scrutinee (one path, not two). Pointer-to-aggregate auto-deref and
+        // positional brace-name-fill happen against the now-known type; proj_scrut/
+        // proj_type feed compile_pattern. (A refutable enum pattern is already rejected
+        // earlier -- pattern_covers_all for a variant pattern, resolve_brace_literal for
+        // a positional literal on an enum -- so no enum-specific check is needed here.)
+        ASTNode* proj_scrut = NULL; Type* proj_type = st;
+        if (node->match_stmt.is_unpack && !is_wildcard) {
+            proj_scrut = SREF();
+            if (st->cls == TYPE_POINTER && st->pointer_base && pat->type != AST_IDENT &&
+                Type_IsAggregate(st->pointer_base)) {
+                ASTNode* d = new_node(AST_DEREF); d->unary = proj_scrut; proj_scrut = d;
+                proj_type = st->pointer_base;
+            }
+            if (Type_IsAggregate(proj_type)) resolve_brace_literal(pat, proj_type);
+        }
+
         ASTNode* cond = NULL;
         if (!is_wildcard) {
             ASTNode** decls = NULL; size_t dc = 0, dcap = 0;
@@ -2703,8 +2727,20 @@ ASTNode* Lower_Match(ASTNode* node, Type* st) {
             // real projected types via compile_pattern's placeholder-patch leaf).
             SymbolTable* save = s_symtable;
             s_symtable = arm_scope;
-            compile_pattern(pat, SREF(), st, &cond, &decls, &dc, &dcap);
+            compile_pattern(pat, proj_scrut ? proj_scrut : SREF(), proj_type, &cond, &decls, &dc, &dcap);
             s_symtable = save;
+            // An unpack is unconditional: its binder decls go DIRECTLY into the
+            // transparent `outer` block, NOT inside an `if(1){}` arm block. The arm
+            // if-block is a real (non-transparent) scope, so at const-fold time it
+            // would unwind the binders before the statements AFTER the unpack (which
+            // reference them) run -- the runtime worked, comptime lost them. Emitting
+            // the decls into the transparent block keeps them alive both places, and
+            // matches the plain-decl block the old parse-time unpack produced.
+            if (node->match_stmt.is_unpack) {
+                for (size_t i = 0; i < dc; i++) matchchain_push_stmt(&mc, decls[i]);
+                if (decls) free(decls);
+                continue; // no if-chain arm: unpack always matches
+            }
             // Prepend the pattern's binding decls ahead of the arm body's own statements.
             if (dc > 0) {
                 ASTNode* merged = new_node(AST_BLOCK);
@@ -2746,7 +2782,9 @@ ASTNode* Lower_Match(ASTNode* node, Type* st) {
         matchchain_add_arm(&mc, ifn, body, false);
     }
 
-    if (!has_wildcard) {
+    // An `unpack` is irrefutable by construction (parse_unpack ran pattern_covers_all)
+    // -- its single arm always matches, so it needs no exhaustiveness check and no else.
+    if (!has_wildcard && !node->match_stmt.is_unpack) {
         bool exhaustive = is_bool && covered_true && covered_false;
         if (is_enum_match) {
             exhaustive = true;
@@ -2956,97 +2994,36 @@ static ASTNode* parse_unpack(void) {
     advance(); // '='
 
     ASTNode* scrut = parse_expr_prec(0);
-    // Inside a generic body, the scrutinee may reference the enclosing params (T)
-    // that are still abstract here; publish them so a call like `inner(v)` (v:T)
-    // can bind the callee's param to T -> inner[T]. Cleared right after.
-    Types_SetEnclosingParams(s_type_params, s_type_param_count);
-    Typecheck_Tree(scrut); // bottom-up generic inference for AST_CALL, same as match
-    Types_SetEnclosingParams(NULL, 0);
-    Type* st = Type_Infer(scrut);
 
-    ScrutKind k = classify_scrutinee_type(st);
-    if (k.is_enum) parse_error("unpack cannot bind an enum value -- an enum's payload is "
-                                "refutable per-variant, so use `match` instead");
-
-    if (!k.is_aggregate && !k.is_primitive && !k.is_ptr_or_fn)
-        parse_error("unpack scrutinee must be a struct, array, primitive, pointer, or function value");
-
-    // [GENERALIZE] Auto-deref a pointer-to-aggregate when the pattern is a
-    // destructure (brace/array), not a bare bind. `unpack {..} = pp` then means
-    // "descend through the pointer, then project" -- deref is just the first
-    // access step, same story structs already tell for .field / [i]. A bare
-    // `unpack w = pp` still binds the whole pointer (pat is AST_IDENT -> skipped).
-    bool auto_deref = false;
-    Type* proj_type = st;
-    if (k.is_ptr_or_fn && st->cls == TYPE_POINTER && st->pointer_base &&
-        pat->type != AST_IDENT) {
-        ScrutKind pk = classify_scrutinee_type(st->pointer_base);
-        if (pk.is_aggregate) {
-            auto_deref = true;
-            proj_type = st->pointer_base;
-            k = pk;  // reclassify against the pointee
-        }
-    }
-
-    // Positional `{a, b}` patterns need field names filled in the same way a
-    // positional struct/array LITERAL does -- reuse the exact same pass.
-    if (k.is_aggregate) resolve_brace_literal(pat, proj_type);
-
+    // ONE PATH. `unpack` desugars to a single irrefutable `match` arm, and ALL of its
+    // lowering -- scrutinee typing, enum-reject, pointer-to-aggregate auto-deref,
+    // positional brace-name-fill, the compile_pattern destructure -- happens in
+    // Lower_Match (the is_unpack branch), which runs at typecheck (runtime) AND from
+    // ConstEval (comptime), for a concrete OR a still-generic scrutinee alike. So the
+    // four cases (match/unpack x runtime/comptime) collapse to the one Lower_Match.
+    // parse_unpack does no classification: it only captures the pattern + scrutinee
+    // and pre-declares the pattern's binders into the ENCLOSING scope (unpack's
+    // binders escape, unlike a match arm's) so later statements can reference them.
     if (!pattern_covers_all(pat))
         parse_error("unpack pattern must always match -- no literal-pinned fields "
                      "(e.g. `{.x=3, .y=py}`) or enum-variant patterns are allowed here; "
                      "use `match` if the pattern can fail");
-
-    ASTNode* outer = new_node(AST_BLOCK);
-    outer->block.capacity = 4; outer->block.count = 0;
-    outer->block.statements = malloc(outer->block.capacity * sizeof(ASTNode*));
-    // This wrapper only exists because parse_statement must return a single
-    // node -- it is NOT a real scope. Bindings inside must survive past this
-    // block's end (that's the whole point of unpack vs. match). The symbol
-    // table already knows this (see the comment above), but ConstEval's
-    // AST_BLOCK case scopes every block it sees unless told otherwise -- mark
-    // this one transparent so comptime folding matches runtime semantics.
-    outer->block.transparent = true;
-
-    // Materialize the scrutinee into a temp first, exactly like match does --
-    // so a scrutinee with side effects (a call, an index into something
-    // mutating) is only evaluated once, no matter how many fields the pattern
-    // reads out of it.
-    SymbolKind kind = s_symtable->is_function_scope ? SYM_LOCAL : SYM_GLOBAL;
-    static int s_unpack_ctr = 0;
-    char* mname = malloc(32); int mn = snprintf(mname, 32, "$u%d", s_unpack_ctr++);
-    Symbol* msym = SymTable_Add(s_symtable, mname, mn, st, kind);
-
-    ASTNode* mdecl = make_decl_stmt(st, mname, mn, msym, scrut);
-    append_block_statement(outer, mdecl);
-
-    ASTNode* mref = new_node(AST_IDENT);
-    mref->ident.name = mname; mref->ident.name_len = mn; mref->ident.sym = msym;
-
-    // [GENERALIZE] If we auto-deref'd, the projection scrutinee is *mref, and
-    // the type handed to compile_pattern is the pointee type.
-    ASTNode* proj_scrut = mref;
-    if (auto_deref) {
-        ASTNode* d = new_node(AST_DEREF); d->unary = mref;
-        proj_scrut = d;
-    }
-
-    // No child scope here (unlike match arms): compile_pattern's SymTable_Add
-    // calls land directly in s_symtable, i.e. the scope unpack was written in,
-    // so the bound names are visible to every statement after this one.
-    ASTNode* cond = NULL;
-    ASTNode** decls = NULL;
-    size_t decl_count = 0, decl_cap = 0;
-    compile_pattern(pat, proj_scrut, proj_type, &cond, &decls, &decl_count, &decl_cap);
-    // cond is always NULL here: pattern_covers_all rejected anything that would
-    // set it (literals, enum variants). Nothing to check at runtime.
-
-    for (size_t i = 0; i < decl_count; i++) append_block_statement(outer, decls[i]);
-    if (decls) free(decls);
-
-    if (s_curr.type == TOK_SEMI) advance(); // optional separator
-
-    return outer;
+    predeclare_binders(pat);
+    ASTNode* node = new_node(AST_MATCH);
+    node->match_stmt.scrutinee = scrut;
+    node->match_stmt.is_type_match = false;
+    node->match_stmt.is_unpack = true;
+    node->match_stmt.arm_patterns = malloc(sizeof(ASTNode*));
+    node->match_stmt.arm_bodies   = malloc(sizeof(ASTNode*));
+    node->match_stmt.arm_scopes   = malloc(sizeof(SymbolTable*));
+    node->match_stmt.arm_patterns[0] = pat;
+    ASTNode* empty = new_node(AST_BLOCK);
+    empty->block.capacity = 0; empty->block.count = 0; empty->block.statements = NULL;
+    node->match_stmt.arm_bodies[0] = empty;
+    node->match_stmt.arm_scopes[0] = s_symtable; // enclosing scope: binders escape
+    node->match_stmt.arm_count = 1;
+    if (s_curr.type == TOK_SEMI) advance();
+    return node;
 }
 
 // Pre-declare a pattern's binder NAMES into the current scope at parse time, so an

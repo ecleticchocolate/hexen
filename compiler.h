@@ -519,6 +519,10 @@ typedef struct ASTNode {
                                              // reused verbatim by Lower_Match)
             size_t arm_count;
             bool is_type_match;            // scrutinee parsed as a bare type (AST_TYPE_EXPR)
+            bool is_unpack;                // a deferred `unpack` on an abstract scrutinee:
+                                           // one irrefutable arm, binders escape into the
+                                           // enclosing scope (arm_scopes[0] IS that scope),
+                                           // no exhaustiveness/else. See parse_unpack.
         } match_stmt;
         struct {
             struct ASTNode* condition;
