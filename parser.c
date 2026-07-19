@@ -3053,7 +3053,9 @@ static ASTNode* parse_match(void) {
         return parse_match_type(scrut);
     }
 
+    Types_SetEnclosingParams(s_type_params, s_type_param_count); // see parse_unpack
     Typecheck_Tree(scrut); // Run typecheck so bottom-up generic inference happens for AST_CALL
+    Types_SetEnclosingParams(NULL, 0);
     Type* st = Type_Infer(scrut);
 
     ScrutKind k = classify_scrutinee_type(st);
@@ -3108,7 +3110,12 @@ static ASTNode* parse_unpack(void) {
     advance(); // '='
 
     ASTNode* scrut = parse_expr_prec(0);
+    // Inside a generic body, the scrutinee may reference the enclosing params (T)
+    // that are still abstract here; publish them so a call like `inner(v)` (v:T)
+    // can bind the callee's param to T -> inner[T]. Cleared right after.
+    Types_SetEnclosingParams(s_type_params, s_type_param_count);
     Typecheck_Tree(scrut); // bottom-up generic inference for AST_CALL, same as match
+    Types_SetEnclosingParams(NULL, 0);
     Type* st = Type_Infer(scrut);
 
     ScrutKind k = classify_scrutinee_type(st);

@@ -1782,6 +1782,28 @@ Type* Type_Infer(ASTNode* node) {
 // resolved against it. Set when entering a function body, restored on exit.
 static Type* s_current_fn_return = NULL;
 
+// The type params in scope where the expression currently being type-inferred was
+// WRITTEN -- set by the parser around the eager parse-time typecheck of an
+// `auto`/`unpack` initializer inside a generic body (parse_unpack). It lets
+// unify_types tell "this arg is one of my enclosing generic's OWN params" (e.g.
+// `inner(v)` where v:T and T is outer_diff's own param -> bind U:=T, yielding the
+// inner instantiation inner[T], re-substituted concrete at monomorphization) apart
+// from "this arg is some other call's still-unresolved return param" (`make()` in
+// `wrap(make())`, which must stay unbound so top-down inference from the outer
+// Box[i32] context fills it in). Only the former is a genuine bound param in scope.
+static const char** s_encl_type_params = NULL;
+static size_t s_encl_type_param_count = 0;
+void Types_SetEnclosingParams(const char** params, size_t count) {
+    s_encl_type_params = params; s_encl_type_param_count = count;
+}
+static bool is_enclosing_param(Type* t) {
+    if (!t || t->cls != TYPE_PARAM || !t->param_name) return false;
+    for (size_t i = 0; i < s_encl_type_param_count; i++)
+        if (s_encl_type_params[i] && strcmp(s_encl_type_params[i], t->param_name) == 0)
+            return true;
+    return false;
+}
+
 // Callee param types for the call currently having its args typechecked, so a bare
 // `{...}` passed as an argument resolves against the matching parameter type.
 
@@ -1793,7 +1815,19 @@ static bool unify_types(Type* concrete, Type* generic, const char** type_params,
     // generic (e.g. the return type of an inner generic call whose T hasn't been
     // inferred yet). Binding from an unresolved param would poison the table with a
     // non-concrete type; skip and let a later top-down or outer pass fill it in.
-    if (concrete->cls == TYPE_PARAM) return false;
+    //
+    // Exception: when the concrete param is one of the ENCLOSING generic's OWN
+    // params (a real bound param in scope -- `inner(v)` with v:T inside
+    // `outer_diff[T]`) AND the callee's param is a bare TYPE_PARAM, binding it is
+    // correct: it produces the inner instantiation `inner[T]`, and clone_ast
+    // re-substitutes T to a concrete type when the enclosing generic is
+    // monomorphized. This is what makes `auto x = inner(v)` (which typechecks its
+    // initializer eagerly at parse time, while T is still abstract) work. A param
+    // from some OTHER unresolved call (`make()` in `wrap(make())`) is NOT enclosing,
+    // so it still bails here and waits for top-down inference. See s_encl_type_params.
+    if (concrete->cls == TYPE_PARAM &&
+        !(generic->cls == TYPE_PARAM && is_enclosing_param(concrete)))
+        return false;
     // A TYPE_FN_LITERAL binding DIRECTLY to a bare type param (`Cmp cmp`, generic
     // side is TYPE_PARAM) is the one case that should keep the literal's identity
     // -- that's the entire feature (see the TYPE_PARAM branch below, which stores
