@@ -1698,6 +1698,20 @@ static bool ConstEval_inner(ASTNode* node, int64_t* out) {
             return true;
         }
 
+        case AST_MATCH: {
+            // A value `match` in a comptime context (a `const` initializer
+            // folds before Typecheck_Tree runs, so the AST_MATCH hasn't been lowered
+            // yet). Lower it here the same way typecheck does -- resolve the scrutinee
+            // type, morph into the if-chain in place (once) -- then fall through to
+            // evaluate the resulting block.
+            infer_generic(node->match_stmt.scrutinee, NULL); // resolve a generic-call scrutinee, as typecheck does
+            Type* st = Type_Infer(node->match_stmt.scrutinee);
+            if (!st) return false;
+            ASTNode* lowered = Lower_Match(node, st);
+            *node = *lowered;
+            return ConstEval_inner(node, out);
+        }
+
         case AST_IF: {
             // `match T { ... }` used to reach here unresolved (a reflect_pattern
             // AST_IF whose "condition" isn't a real boolean expression at all),

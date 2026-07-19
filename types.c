@@ -2554,6 +2554,24 @@ void Typecheck_Tree(ASTNode* node) {
             Typecheck_Tree(node->while_stmt.body);
             return;
 
+        case AST_MATCH: {
+            // A value `match`: the scrutinee was captured raw at parse time. NOW its
+            // type is resolvable (generic params concrete at this point), so classify
+            // + lower here instead of during parsing -- which is what makes
+            // `match N + 1` / `match arr[N]` and any value expression work. infer_generic
+            // first (as parse_unpack does) so a generic-call scrutinee still infers.
+            ASTNode* scrut = node->match_stmt.scrutinee;
+            infer_generic(scrut, NULL);
+            Type* st = Type_Infer(scrut);
+            if (!st) { Error_AtNode(node, "cannot resolve match scrutinee type", NULL); return; }
+            ASTNode* lowered = Lower_Match(node, st);
+            // Morph this node into the lowered block in place so the parent's
+            // pointer stays valid, then typecheck the result normally.
+            *node = *lowered;
+            Typecheck_Tree(node);
+            return;
+        }
+
         case AST_FOR:
             Typecheck_Tree(node->for_stmt.init);
             Typecheck_Tree(node->for_stmt.cond);
@@ -3610,6 +3628,39 @@ ASTNode* clone_ast(ASTNode* n, const char** params, Type** args, size_t np, bool
             c->if_stmt.reflect_scrutinee = Type_Substitute(n->if_stmt.reflect_scrutinee, params, args, np);
             c->if_stmt.reflect_pattern   = Type_Substitute(n->if_stmt.reflect_pattern, params, args, np);
             break;
+        case AST_MATCH: {
+            // Clone the raw scrutinee + arms with substitution, so at
+            // this instantiation the scrutinee's generic params (a value param N,
+            // a type param T) are concrete BEFORE Lower_Match runs at typecheck.
+            c->match_stmt.scrutinee = clone_ast(n->match_stmt.scrutinee, params, args, np, clone_symbols);
+            size_t m = n->match_stmt.arm_count;
+            c->match_stmt.arm_patterns = malloc((m?m:1) * sizeof(ASTNode*));
+            c->match_stmt.arm_bodies   = malloc((m?m:1) * sizeof(ASTNode*));
+            c->match_stmt.arm_scopes   = malloc((m?m:1) * sizeof(SymbolTable*));
+            for (size_t i = 0; i < m; i++) {
+                // Each arm's pre-declared binder symbols must be CLONED per
+                // instantiation -- otherwise every instantiation shares (and
+                // clobbers) the template's `v`, and a generic payload type T comes
+                // out wrong. Clone the scope's symbols first (registering old->new in
+                // the clone map), so the arm body's idents remap to the fresh ones.
+                SymbolTable* os = n->match_stmt.arm_scopes[i];
+                SymbolTable* cs = SymTable_Create(os->parent);
+                cs->is_function_scope = os->is_function_scope;
+                if (clone_symbols) {
+                    for (size_t s = 0; s < os->count; s++) {
+                        Symbol* ns = clone_symbol(os->symbols[s], params, args, np, clone_symbols);
+                        cs->symbols = realloc(cs->symbols, (cs->count + 1) * sizeof(Symbol*));
+                        cs->symbols[cs->count++] = ns;
+                    }
+                }
+                c->match_stmt.arm_scopes[i] = clone_symbols ? cs : os;
+                c->match_stmt.arm_patterns[i] = n->match_stmt.arm_patterns[i]
+                    ? clone_ast(n->match_stmt.arm_patterns[i], params, args, np, clone_symbols) : NULL;
+                c->match_stmt.arm_bodies[i] = clone_ast(n->match_stmt.arm_bodies[i], params, args, np, clone_symbols);
+            }
+            c->match_stmt.arm_count = m;
+            break;
+        }
         case AST_WHILE:
             c->while_stmt.condition = clone_ast(n->while_stmt.condition, params, args, np, clone_symbols);
             c->while_stmt.body = clone_ast(n->while_stmt.body, params, args, np, clone_symbols);

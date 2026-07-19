@@ -716,13 +716,6 @@ static ASTNode* make_decl_stmt(Type* var_type, const char* name, size_t name_len
     return blk;
 }
 
-static Type* make_primitive_type(PrimitiveKind kind) {
-    Type* t = (Type*)calloc(1, sizeof(Type));
-    t->cls = TYPE_PRIMITIVE;
-    t->primitive = kind;
-    return t;
-}
-
 static Type* make_pointer_type(Type* base) {
     Type* t = (Type*)calloc(1, sizeof(Type));
     t->cls = TYPE_POINTER;
@@ -1333,13 +1326,6 @@ static ASTNodeType get_op_node_type(TokenType type) {
 static ASTNode* parse_expr_prec(int min_prec);
 static ASTNode* parse_statement(void);
 static ASTNode* parse_postfix(void);
-
-static void parse_block_body_inside(ASTNode* block) {
-    // Mark the alias table. Every alias declared inside this block is popped on exit,
-    // so a block-local `alias VT = struct { ... }` is invisible outside it -- and, via
-    // alias_lookup's backward scan, shadows any same-named outer alias while inside.
-    parse_braced_statements(block, true);
-}
 
 static ASTNode* parse_block_body(void) {
     return parse_braced_block(true, true);
@@ -2468,6 +2454,17 @@ static void compile_pattern(ASTNode* pat, ASTNode* scrut, Type* scrut_type, ASTN
         // var appear as a leaf alongside `*x`/`x[i]`/`x.f`.
         Symbol* existing = SymTable_Find(s_symtable, pat->ident.name, pat->ident.name_len);
         if (existing) {
+            // A switch pre-declared binder is registered with a NULL placeholder
+            // type (predeclare_binders). This is a fresh binding whose type we now
+            // know, not a destructure-assign into a pre-existing variable: patch the
+            // symbol's type and emit a real decl-init (matching the fresh-name path
+            // below), so the arm body sees a properly typed local.
+            if (existing->type == NULL) {
+                existing->type = scrut_type;
+                ASTNode* decl = make_decl_stmt(scrut_type, pat->ident.name, pat->ident.name_len, existing, scrut);
+                DA_PUSH(*out_decls, *decl_count, *decl_cap, decl);
+                return;
+            }
             ASTNode* asn = new_node(AST_ASSIGN);
             pat->ident.sym = existing;
             asn->binary.left = pat;
@@ -2648,84 +2645,50 @@ static bool matchchain_add_arm(MatchChain* mc, ASTNode* ifn, ASTNode* armblk, bo
     return !is_terminal;
 }
 
-static ASTNode* parse_match_value(ASTNode* scrut, Type* st) {
-    advance(); // '{'
-
-    uint64_t sz = Type_SizeOf(st);
-    if (sz == 0) sz = 1;
-
-    bool is_bool = (st->primitive == PRIM_BOOL);
+// Lower an already-parsed value AST_MATCH into an if-chain, now that the scrutinee
+// type `st` is known (typecheck time, generic params concrete). The arm bodies were
+// already parsed into their own scopes by parse_match, so any pattern BINDINGS
+// (enum payloads) are prepended to each arm body here via compile_pattern, whose
+// decls slot in ahead of the already-parsed statements. Reuses compile_pattern +
+// matchchain + the enum/bool exhaustiveness logic; the ONLY thing that moved is
+// WHEN this runs (after Type_Infer, not during parsing), which is what lets a
+// scrutinee like `N + 1` or `arr[N]` resolve at all.
+ASTNode* Lower_Match(ASTNode* node, Type* st) {
+    ASTNode* scrut = node->match_stmt.scrutinee;
+    size_t narms = node->match_stmt.arm_count;
+    uint64_t sz = Type_SizeOf(st); if (sz == 0) sz = 1;
+    bool is_bool = (st->cls == TYPE_PRIMITIVE && st->primitive == PRIM_BOOL);
 
     SymbolTable* prev_table = s_symtable;
     s_symtable = SymTable_Create(prev_table);
     s_symtable->is_function_scope = prev_table->is_function_scope;
     SymbolKind kind = s_symtable->is_function_scope ? SYM_LOCAL : SYM_GLOBAL;
 
-    static int s_match_ctr = 0;
-    char* mname = malloc(32); int mn = snprintf(mname, 32, "$m%d", s_match_ctr++);
+    static int s_switch_ctr = 0;
+    char* mname = malloc(32); int mn = snprintf(mname, 32, "$s%d", s_switch_ctr++);
     Symbol* msym = SymTable_Add(s_symtable, mname, mn, st, kind);
 
     MatchChain mc = matchchain_begin();
     ASTNode* outer = mc.outer;
-
-    ASTNode* mdecl = make_decl_stmt(st, mname, mn, msym, scrut);
-    matchchain_push_stmt(&mc, mdecl);
-
-    #define MREF() ({ ASTNode* r = new_node(AST_IDENT); r->ident.name = mname; \
+    matchchain_push_stmt(&mc, make_decl_stmt(st, mname, mn, msym, scrut));
+    #define SREF() ({ ASTNode* r = new_node(AST_IDENT); r->ident.name = mname; \
                       r->ident.name_len = mn; r->ident.sym = msym; r; })
 
-    uint8_t** seen = malloc(8 * sizeof(uint8_t*));
-    size_t seen_cap = 8, seen_count = 0;
-    bool covered_true = false, covered_false = false;
-    bool has_wildcard = false;
-
-    // Enum exhaustiveness (dot-variant syntax through this generic path):
-    // track which variants have been matched at the TOP level of a pattern,
-    // same idea as the old hardcoded enum path's covered[] array, so `.Some{v}`
-    // / `.None` matches can still be checked exhaustive without requiring an
-    // `else` arm -- just like the old syntax could.
     StructDef* enum_sd = (st->cls == TYPE_STRUCT) ? Struct_Find(st->struct_name) : NULL;
     bool is_enum_match = enum_sd && enum_sd->is_enum;
     bool* enum_covered = is_enum_match ? calloc(enum_sd->field_count, sizeof(bool)) : NULL;
+    bool covered_true = false, covered_false = false, has_wildcard = false;
+    uint8_t** seen = NULL; size_t seen_count = 0, seen_cap = 0; // folded constant arm values, for duplicate detection
 
-    while (s_curr.type != TOK_RBRACE && s_curr.type != TOK_EOF) {
-        bool is_wildcard = (s_curr.type == TOK_ELSE);
-        ASTNode* pat = NULL;
-        
-        if (is_wildcard) advance();
-        else if (s_curr.type == TOK_DOT) {
-            // Enum dot-variant pattern head `.Variant` or `.Variant(payload)`.
-            // Parsed by hand here rather than via the generic parse_expr_prec(0)
-            // dot-literal path because match arms need their own AST_STRUCT_LITERAL
-            // pattern node wired into compile_pattern/exhaustiveness below, not
-            // because of any remaining ambiguity: `(` never opens the arm's own
-            // body (that's always `{`), so a bare `.None { ... }` and a payload
-            // `.Some(v) { ... }` are told apart by construction, no lookahead
-            // needed -- unlike the old `{payload}{body}` double-brace shape this
-            // replaced, which required a depth-counting scan to tell whether one
-            // or two brace-groups followed the variant name.
-            advance(); // '.'
-            pat = parse_enum_variant_after_dot();
-            if (Type_IsAggregate(st)) {
-                resolve_brace_literal(pat, st);
-            }
-        }
-        else {
-            pat = parse_expr_prec(0);
-            if (Type_IsAggregate(st)) {
-                resolve_brace_literal(pat, st);
-            }
-        }
+    for (size_t a = 0; a < narms; a++) {
+        ASTNode* pat  = node->match_stmt.arm_patterns[a];
+        ASTNode* body = node->match_stmt.arm_bodies[a];
+        SymbolTable* arm_scope = node->match_stmt.arm_scopes[a];
+        bool is_wildcard = (pat == NULL);
 
-        // Two AST shapes reach here for the SAME thing -- `.Variant(payload)`
-        // (is_enum_variant=true, via make_enum_variant_node) and the designated-
-        // literal idiom `{.Variant = payload}` (is_enum_variant=false, resolved
-        // as an ordinary struct field whose owning sdef just happens to be the
-        // enum). Both must count toward exhaustiveness identically: `{.Some=v}`
-        // covering Some and `.None` covering None together IS a complete match,
-        // and requiring `else` anyway just because one arm took the designated-
-        // literal spelling would make the documented idiom worse than its
-        // alternate spelling for no reason.
+        if (!is_wildcard && Type_IsAggregate(st)) resolve_brace_literal(pat, st);
+
+        // Enum-variant exhaustiveness tracking (same rule as parse_match_value).
         bool is_variant_pattern = !is_wildcard && is_enum_match && pat->type == AST_STRUCT_LITERAL &&
             (pat->struct_lit.is_enum_variant ||
              (pat->struct_lit.sdef == enum_sd && pat->struct_lit.count == 1));
@@ -2733,119 +2696,81 @@ static ASTNode* parse_match_value(ASTNode* scrut, Type* st) {
             int vidx = Enum_VariantIndex(enum_sd, pat->struct_lit.field_names[0], pat->struct_lit.field_name_lens[0]);
             if (vidx >= 0) {
                 if (enum_covered[vidx]) parse_error("unreachable match arm: this variant is already fully covered by an earlier arm");
-                // A variant is FULLY covered only when its payload pattern can't
-                // reject any value of that variant -- no payload at all, or a bare
-                // identifier bind (matches anything). A refined payload pattern
-                // (a literal, or a nested struct/array/enum pattern that can fail)
-                // only covers SOME values of the variant, so later arms for the
-                // same variant (a catch-all, or a different refinement) are still
-                // legal and often necessary for exhaustiveness -- exactly the same
-                // "arms tried in order, first match wins" semantics every other
-                // match kind here already has.
                 bool covers_all = (pat->struct_lit.count == 0) ||
                                    (pat->struct_lit.count == 1 && pattern_covers_all(pat->struct_lit.values[0]));
                 if (covers_all) enum_covered[vidx] = true;
             }
         }
 
-        if (s_curr.type != TOK_LBRACE) parse_error("Expected '{' for match arm block");
-        advance();
-        SymbolTable* prev_table_arm = s_symtable;
-        s_symtable = SymTable_Create(prev_table_arm);
-        s_symtable->is_function_scope = prev_table_arm->is_function_scope;
-
         ASTNode* cond = NULL;
-        ASTNode** decls = NULL;
-        size_t decl_count = 0;
-        size_t decl_cap = 0;
-
         if (!is_wildcard) {
-            compile_pattern(pat, MREF(), st, &cond, &decls, &decl_count, &decl_cap);
-            
+            ASTNode** decls = NULL; size_t dc = 0, dcap = 0;
+            // Compile the pattern IN THE ARM'S OWN SCOPE, so its binders resolve to
+            // the exact symbols predeclare_binders registered (now getting their
+            // real projected types via compile_pattern's placeholder-patch leaf).
+            SymbolTable* save = s_symtable;
+            s_symtable = arm_scope;
+            compile_pattern(pat, SREF(), st, &cond, &decls, &dc, &dcap);
+            s_symtable = save;
+            // Prepend the pattern's binding decls ahead of the arm body's own statements.
+            if (dc > 0) {
+                ASTNode* merged = new_node(AST_BLOCK);
+                merged->block.capacity = dc + body->block.count;
+                merged->block.statements = malloc(merged->block.capacity * sizeof(ASTNode*));
+                merged->block.count = 0;
+                for (size_t i = 0; i < dc; i++) merged->block.statements[merged->block.count++] = decls[i];
+                for (size_t i = 0; i < body->block.count; i++) merged->block.statements[merged->block.count++] = body->block.statements[i];
+                body = merged;
+            }
+            if (decls) free(decls);
+            // Duplicate-arm / literal-fit checks for constant-valued patterns (same
+            // as parse_match_value): fold the pattern to bytes and compare against
+            // earlier arms. Covers primitives and constant aggregate/enum literals.
             uint8_t* bytes = (uint8_t*)calloc(1, sz);
             if (ConstEval_Bytes(pat, bytes, sz)) {
-                if (st->cls == TYPE_PRIMITIVE) {
-                    int64_t val = 0;
-                    ConstEval(pat, &val);
+                // Integer fit-check only for INTEGER scrutinees. Floats are allowed
+                // as scrutinees (unlike the old `match`, which arbitrarily banned
+                // them); an integer-range check is meaningless for a float literal.
+                if (st->cls == TYPE_PRIMITIVE && !Type_IsFloat(st)) {
+                    int64_t val = 0; ConstEval(pat, &val);
                     if (!Type_IntLiteralFits(val, st)) parse_error("match arm literal does not fit the scrutinee's type (use a cast to truncate, or widen the scrutinee)");
                 }
                 for (size_t i = 0; i < seen_count; i++)
                     if (memcmp(seen[i], bytes, sz) == 0) parse_error("duplicate match arm for this value");
-                if (seen_count >= seen_cap) { seen_cap *= 2; seen = realloc(seen, seen_cap * sizeof(uint8_t*)); }
-                seen[seen_count++] = bytes;
+                DA_PUSH(seen, seen_count, seen_cap, bytes);
                 if (is_bool) { if (bytes[0]) covered_true = true; else covered_false = true; }
             } else {
                 free(bytes);
             }
-        }
-
-        ASTNode* armblk = new_node(AST_BLOCK);
-        armblk->block.capacity = decl_count > 16 ? decl_count : 16;
-        armblk->block.statements = malloc(armblk->block.capacity * sizeof(ASTNode*));
-        armblk->block.count = 0;
-
-        for(size_t i = 0; i < decl_count; i++) {
-            armblk->block.statements[armblk->block.count++] = decls[i];
-        }
-        if (decls) free(decls);
-
-        parse_block_body_inside(armblk);
-        s_symtable = prev_table_arm;
-
-        if (is_wildcard) {
+        } else {
             has_wildcard = true;
-            matchchain_add_arm(&mc, NULL, armblk, true);
-            break;
         }
 
-        if (!cond) {
-            cond = new_node(AST_INT_LITERAL);
-            cond->lit_kind = LIT_BOOL; cond->int_value = 1;
-        }
-
+        if (is_wildcard) { matchchain_add_arm(&mc, NULL, body, true); break; }
+        if (!cond) { cond = new_node(AST_INT_LITERAL); cond->lit_kind = LIT_BOOL; cond->int_value = 1; }
         ASTNode* ifn = new_node(AST_IF);
-        ifn->if_stmt.condition = cond; ifn->if_stmt.true_block = armblk; ifn->if_stmt.false_block = NULL;
-        matchchain_add_arm(&mc, ifn, armblk, false);
+        ifn->if_stmt.condition = cond; ifn->if_stmt.true_block = body; ifn->if_stmt.false_block = NULL;
+        matchchain_add_arm(&mc, ifn, body, false);
     }
-    if (s_curr.type != TOK_RBRACE) parse_error("Expected '}' to end match");
-    advance();
 
     if (!has_wildcard) {
         bool exhaustive = is_bool && covered_true && covered_false;
         if (is_enum_match) {
             exhaustive = true;
-            for (size_t i = 0; i < enum_sd->field_count; i++) {
-                if (!enum_covered[i]) { exhaustive = false; break; }
-            }
+            for (size_t i = 0; i < enum_sd->field_count; i++) if (!enum_covered[i]) { exhaustive = false; break; }
         }
         if (!exhaustive) {
             s_symtable = prev_table;
-            if (is_enum_match) {
-                char errbuf[256];
-                snprintf(errbuf, sizeof(errbuf),
-                        "match on %s is not exhaustive -- add an `else` arm "
-                        "or handle every variant", enum_sd->name);
-                parse_error(errbuf);
-            } else if (st->cls == TYPE_PRIMITIVE && !is_bool) {
-                parse_error("match on this type is not exhaustive -- add an `else` arm "
-                                "(only bool can be exhaustive without one)");
-            } else {
-                parse_error("match on a struct/array/pointer/function value is not "
-                                "exhaustive -- add an `else` arm (these can't be enumerated)");
-            }
+            if (is_enum_match) parse_error("match on this enum is not exhaustive -- add an `else` arm or handle every variant");
+            else if (st->cls == TYPE_PRIMITIVE && !is_bool) parse_error("match on this type is not exhaustive -- add an `else` arm (only bool can be exhaustive without one)");
+            else parse_error("match on a struct/array/pointer/function value is not exhaustive -- add an `else` arm");
         }
-        // Exhaustive with no `else`: the final arm still carries a condition
-        // (`else if (tag == 2) { C }`), so it looks skippable to any structural pass even
-        // though every value reaches it. Mark it, so "does every path return?" can tell
-        // an exhaustive `match` apart from a bare `if` with no `else`. Codegen ignores
-        // this and still emits the compare -- the flag records a fact, it does not change
-        // what runs.
         if (mc.chain_tail_if) mc.chain_tail_if->if_stmt.exhaustive_tail = true;
     }
     if (enum_covered) free(enum_covered);
-    #undef MREF
     for (size_t i = 0; i < seen_count; i++) free(seen[i]);
     free(seen);
+    #undef SREF
     s_symtable = prev_table;
     return outer;
 }
@@ -3015,92 +2940,6 @@ static ScrutKind classify_scrutinee_type(Type* st) {
     return k;
 }
 
-static ASTNode* parse_match(void) {
-    advance(); // 'match'
-
-    // TYPE-scrutinee fast path for GROUPED types. A bare type scrutinee
-    // (`match u32`, `match Foo*`) already resolves through parse_expr_prec's
-    // curr_begins_type branch below. But a scrutinee that *starts with `(`*
-    // (a grouped type like `(fn() T)[4]`) would send the expression parser down
-    // the parenthesized-expression path and choke on the type content. So: if the
-    // scrutinee begins with `(`, try parse_type first with soft-fail — if it
-    // yields a type AND the next token is `{` (the arm block), it's a
-    // type-scrutinee match; otherwise restore and fall back untouched.
-    if (s_curr.type == TOK_LPAREN) {
-        LexerState msave;
-        Lexer_Save(&msave);
-        Token cur_save = s_curr;
-        Type* tt = parse_type();
-        if (tt && s_curr.type == TOK_LBRACE) {
-            ASTNode* te = new_node(AST_TYPE_EXPR);
-            te->sizeof_expr.type = tt;
-            return parse_match_type(te);
-        }
-        Lexer_Restore(&msave);
-        s_curr = cur_save;
-    }
-
-    ASTNode* scrut = parse_expr_prec(0);
-
-    // TYPE-scrutinee match: `match T { P* {..} E[N] {..} u32 {..} else {..} }`.
-    // The scrutinee parsed as a bare type (AST_TYPE_EXPR) rather than a value —
-    // this is reflection over the shape of a type, not a value match. It lowers
-    // to a type if-chain (AST_EQ over AST_TYPE_EXPR) whose arms structurally
-    // destructure the type, exactly parallel to the enum path below but comparing
-    // TYPES instead of reading a tag. Handled entirely in its own function so the
-    // value paths stay untouched.
-    if (scrut->type == AST_TYPE_EXPR) {
-        return parse_match_type(scrut);
-    }
-
-    // A bare scrutinee that is an in-scope VALUE generic param (`match N` where
-    // `N` is `[u32 N]`) has no symbol at parse time and would fail the eager
-    // Typecheck_Tree below with "undeclared identifier" -- the same abstract-in-a-
-    // -generic-body problem the enclosing-param dance above handles for calls.
-    // The parser already knows N's pinned type, so take it directly and skip the
-    // eager typecheck; N folds to its concrete value at instantiation, exactly as
-    // it already does in `if N == 0` (which never hits this parse-time path).
-    Type* st = NULL;
-    Type* vp_pin = NULL;
-    if (scrut->type == AST_IDENT &&
-        param_kind_lookup(scrut->ident.name, scrut->ident.name_len, &vp_pin) == 1) {
-        st = vp_pin;
-    } else {
-        Types_SetEnclosingParams(s_type_params, s_type_param_count); // see parse_unpack
-        Typecheck_Tree(scrut); // Run typecheck so bottom-up generic inference happens for AST_CALL
-        Types_SetEnclosingParams(NULL, 0);
-        st = Type_Infer(scrut);
-    }
-
-    ScrutKind k = classify_scrutinee_type(st);
-    bool is_enum = k.is_enum;
-    // Floats are deliberately excluded from the primitive path: `==` on floats
-    // doesn't mean what match's duplicate-arm/exhaustiveness checks assume it
-    // means (NaN != NaN; two "equal" values can differ after rounding). A match
-    // arm claiming to cover "this value" is a promise a float can't keep -- cast
-    // to an int type first if you need this. This is match-specific: unpack has
-    // no exhaustiveness/duplicate-arm reasoning to protect, so it never needed
-    // this exclusion.
-    bool is_matchable_primitive = k.is_primitive && !Type_IsFloat(st);
-    bool is_matchable_aggregate = k.is_aggregate;
-    bool is_matchable_ptr_or_fn = k.is_ptr_or_fn;
-
-    if (!is_enum && !is_matchable_primitive && !is_matchable_aggregate && !is_matchable_ptr_or_fn)
-        parse_error("match scrutinee must be an enum value, a non-float primitive, or a struct/array"
-                     " (or a pointer/function value)");
-
-    if (!is_enum) return parse_match_value(scrut, st);
-
-    // Enums route through the SAME generic pattern matcher as structs, arrays,
-    // and primitives: parse_match_value + compile_pattern. There is no separate
-    // enum-match path. Every arm is a `.Variant`/`.Variant(payload)` pattern (or
-    // `else`); the leading dot is what compile_pattern keys on. No forward peek
-    // here for a better error message on the deleted legacy `Variant binding {}`
-    // form -- that syntax now just falls through to parse_match_value's own
-    // arm parsing and errors there, same as any other malformed arm.
-    if (s_curr.type != TOK_LBRACE) parse_error("Expected '{' to begin match arms");
-    return parse_match_value(scrut, st);
-}
 
 // `unpack <pattern> = <expr>` -- sugar for a `match` whose pattern is known,
 // at compile time, to always match: no `else` is possible or needed, and the
@@ -3215,6 +3054,122 @@ static ASTNode* parse_unpack(void) {
     if (s_curr.type == TOK_SEMI) advance(); // optional separator
 
     return outer;
+}
+
+// Pre-declare a pattern's binder NAMES into the current scope at parse time, so an
+// arm body referencing them (`{.Some = v} { return v }`) parses without knowing the
+// scrutinee's type yet. Types are placeholders here; Lower_Match patches each
+// symbol's real type once st is known, and compile_pattern's "name already in
+// scope -> assign into it" leaf (GENERALIZE-LEAF) reuses these exact symbols. Only
+// fresh identifiers in binding position declare; literals / existing lvalues don't.
+static void predeclare_binders(ASTNode* pat) {
+    if (!pat) return;
+    if (pat->type == AST_IDENT) {
+        // A bare name that isn't already in scope is a fresh binder. (An existing
+        // name is a destructure-assignment target, not a new declaration.)
+        if (!SymTable_Find(s_symtable, pat->ident.name, pat->ident.name_len)) {
+            SymbolKind k = s_symtable->is_function_scope ? SYM_LOCAL : SYM_GLOBAL;
+            SymTable_Add(s_symtable, pat->ident.name, pat->ident.name_len, NULL, k);
+        }
+        return;
+    }
+    if (pat->type == AST_STRUCT_LITERAL) {
+        for (size_t i = 0; i < pat->struct_lit.count; i++) predeclare_binders(pat->struct_lit.values[i]);
+        return;
+    }
+    if (pat->type == AST_ARRAY_LITERAL) {
+        for (size_t i = 0; i < pat->array_lit.count; i++) predeclare_binders(pat->array_lit.values[i]);
+        return;
+    }
+    // literals, .Variant heads with no payload, lvalue accesses: nothing to declare.
+}
+
+// ── `match` ──────────────────────────────────────────────────────────────────
+// A previous value-match implementation resolved the scrutinee's TYPE at parse
+// time (to pick enum/primitive/aggregate lowering), which broke whenever the
+// scrutinee mentioned a still-abstract generic param (`match N + 1`, `match arr[N]`)
+// and forced a series of parse-time special-cases. This implementation instead
+// captures the scrutinee expression and the raw arm patterns/bodies into an
+// AST_MATCH node WITHOUT any Type_Infer, and defers all classification + lowering to
+// Lower_Match, which runs at typecheck time when generic params are concrete. The
+// only decision kept at parse time is the irreducible one: value-scrutinee vs
+// type-scrutinee, since their arm grammars differ. The type-scrutinee case delegates
+// to parse_match_type (which already resolves correctly at instantiation, via
+// reflect_unify); only the value case is captured as AST_MATCH.
+//
+// Because parse time makes NO type query on the value path, there is no parse-time
+// resolution that can fail against an abstract param -- the bug class that motivated
+// this rewrite is structurally absent, not merely handled.
+static ASTNode* parse_match(void) {
+    advance(); // 'match'
+
+    // Grouped-type scrutinee probe: `match (fn() T)[4] {...}`.
+    if (s_curr.type == TOK_LPAREN) {
+        LexerState msave; Lexer_Save(&msave);
+        Token cur_save = s_curr;
+        Type* tt = parse_type();
+        if (tt && s_curr.type == TOK_LBRACE) {
+            ASTNode* te = new_node(AST_TYPE_EXPR);
+            te->sizeof_expr.type = tt;
+            return parse_match_type(te); // type-match already resolves at instantiation
+        }
+        Lexer_Restore(&msave); s_curr = cur_save;
+    }
+
+    ASTNode* scrut = parse_expr_prec(0);
+
+    // A bare-type scrutinee (`match T`, `match Foo*`) parses as an AST_TYPE_EXPR:
+    // type reflection, handled by parse_match_type.
+    if (scrut->type == AST_TYPE_EXPR) return parse_match_type(scrut);
+
+    // Value scrutinee: capture arms raw, NO scrutinee typechecking here.
+    if (s_curr.type != TOK_LBRACE) parse_error("Expected '{' to begin match arms");
+    advance();
+
+    ASTNode* node = new_node(AST_MATCH);
+    node->match_stmt.scrutinee = scrut;
+    node->match_stmt.is_type_match = false;
+    ASTNode** pats = NULL; size_t np = 0, pcap = 0;
+    ASTNode** bodies = NULL; size_t nb = 0, bcap = 0;
+    SymbolTable** scopes = NULL; size_t ns = 0, scap = 0;
+
+    while (s_curr.type != TOK_RBRACE && s_curr.type != TOK_EOF) {
+        ASTNode* pat = NULL; // NULL => else arm
+        if (s_curr.type == TOK_ELSE) {
+            advance();
+        } else if (s_curr.type == TOK_DOT) {
+            advance(); // '.'
+            pat = parse_enum_variant_after_dot();
+        } else {
+            pat = parse_expr_prec(0);
+        }
+
+        // Each arm body parses in its OWN scope. Pre-declare the pattern's binders
+        // (name-only; types patched by Lower_Match) so `{.Some = v} { return v }`
+        // resolves. Stash the scope so Lower_Match reuses the same binder symbols.
+        if (s_curr.type != TOK_LBRACE) parse_error("Expected '{' for match arm block");
+        SymbolTable* prev = s_symtable;
+        s_symtable = SymTable_Create(prev);
+        s_symtable->is_function_scope = prev->is_function_scope;
+        if (pat) predeclare_binders(pat);
+        SymbolTable* arm_scope = s_symtable;
+        ASTNode* body = parse_block_body();
+        s_symtable = prev;
+
+        DA_PUSH(pats, np, pcap, pat);
+        DA_PUSH(bodies, nb, bcap, body);
+        DA_PUSH(scopes, ns, scap, arm_scope);
+
+        if (!pat) break; // else is terminal
+    }
+    if (s_curr.type != TOK_RBRACE) parse_error("Expected '}' to end match");
+    advance();
+
+    node->match_stmt.arm_patterns = pats;
+    node->match_stmt.arm_bodies = bodies;
+    node->match_stmt.arm_scopes = scopes;
+    node->match_stmt.arm_count = np;
+    return node;
 }
 
 static ASTNode* parse_while_statement(void) {
