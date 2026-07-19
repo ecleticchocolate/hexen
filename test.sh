@@ -74,19 +74,25 @@ fail() { echo "FAIL  $1  --  $2"; FAIL=$((FAIL+1)); ERRORS+=("$1"); }
 # Compile+run a source FILE. Sets _STDOUT, _STDERR, _EXIT.
 _run() {
     local file="$1"
+    # Per-test stderr file: a single fixed /tmp path was shared mutable global
+    # state -- one test's stderr could be read by another (or a stale read leak
+    # in), producing flaky false failures on error-expectation tests. mktemp
+    # per call removes the shared state entirely.
+    local err; err=$(mktemp /tmp/torrent_err_XXXXXX)
+    trap 'rm -f "$err"' RETURN   # cleaned up on every exit path, incl. early returns
     if $LLVM_MODE; then
         local ll bin cc_exit link_exit run_exit
         ll=$(mktemp /tmp/torrent_llvm_XXXXXX.ll)
         bin=$(mktemp /tmp/torrent_llvm_XXXXXX)
-        "$TORRENT" -llvm "$ll" "$file" >/dev/null 2>/tmp/_torrent_stderr && cc_exit=0 || cc_exit=$?
-        _STDERR=$(cat /tmp/_torrent_stderr)
+        "$TORRENT" -llvm "$ll" "$file" >/dev/null 2>"$err" && cc_exit=0 || cc_exit=$?
+        _STDERR=$(cat "$err")
         if [[ $cc_exit -ne 0 ]]; then
             rm -f "$ll" "$bin"; _STDOUT=""; _EXIT=$cc_exit; return
         fi
         # Hide clang warnings like "overriding the module target triple"
-        clang -o "$bin" "$SCRIPT_DIR/aot_shim.c" "$ll" -Wno-override-module >/dev/null 2>/tmp/_torrent_stderr && link_exit=0 || link_exit=$?
+        clang -o "$bin" "$SCRIPT_DIR/aot_shim.c" "$ll" -Wno-override-module >/dev/null 2>"$err" && link_exit=0 || link_exit=$?
         if [[ $link_exit -ne 0 ]]; then
-            _STDERR="link error: $(cat /tmp/_torrent_stderr)"
+            _STDERR="link error: $(cat "$err")"
             rm -f "$ll" "$bin"; _STDOUT=""; _EXIT=$link_exit; return
         fi
         _STDOUT=$("$bin" 2>/dev/null) && run_exit=0 || run_exit=$?
@@ -95,21 +101,21 @@ _run() {
         local obj bin cc_exit link_exit run_exit
         obj=$(mktemp /tmp/torrent_aot_XXXXXX.o)
         bin=$(mktemp /tmp/torrent_aot_XXXXXX)
-        "$TORRENT" -c -o "$obj" "$file" >/dev/null 2>/tmp/_torrent_stderr && cc_exit=0 || cc_exit=$?
-        _STDERR=$(cat /tmp/_torrent_stderr)
+        "$TORRENT" -c -o "$obj" "$file" >/dev/null 2>"$err" && cc_exit=0 || cc_exit=$?
+        _STDERR=$(cat "$err")
         if [[ $cc_exit -ne 0 ]]; then
             rm -f "$obj" "$bin"; _STDOUT=""; _EXIT=$cc_exit; return
         fi
-        gcc -o "$bin" "$AOT_SHIM" "$obj" 2>/tmp/_torrent_stderr && link_exit=0 || link_exit=$?
+        gcc -o "$bin" "$AOT_SHIM" "$obj" 2>"$err" && link_exit=0 || link_exit=$?
         if [[ $link_exit -ne 0 ]]; then
-            _STDERR="link error: $(cat /tmp/_torrent_stderr)"
+            _STDERR="link error: $(cat "$err")"
             rm -f "$obj" "$bin"; _STDOUT=""; _EXIT=$link_exit; return
         fi
         _STDOUT=$("$bin" 2>/dev/null) && run_exit=0 || run_exit=$?
         rm -f "$obj" "$bin"; _EXIT=0
     else
-        _STDOUT=$("$TORRENT" "$file" 2>/tmp/_torrent_stderr) && _EXIT=0 || _EXIT=$?
-        _STDERR=$(cat /tmp/_torrent_stderr)
+        _STDOUT=$("$TORRENT" "$file" 2>"$err") && _EXIT=0 || _EXIT=$?
+        _STDERR=$(cat "$err")
     fi
 }
 
