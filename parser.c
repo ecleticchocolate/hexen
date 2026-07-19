@@ -3000,6 +3000,13 @@ typedef struct {
 
 static ScrutKind classify_scrutinee_type(Type* st) {
     ScrutKind k = {0};
+    // A TYPE_PARAM is an unresolved generic placeholder (e.g. T) at template-
+    // parse time.  Accept it now — the concrete type will be substituted by
+    // clone_ast at instantiation, and Typecheck_Tree will re-validate then.
+    if (st && st->cls == TYPE_PARAM) {
+        k.is_primitive = true;
+        return k;
+    }
     k.is_enum = st && st->cls == TYPE_STRUCT && Struct_Find(st->struct_name)
                 && Struct_Find(st->struct_name)->is_enum;
     k.is_primitive = st && st->cls == TYPE_PRIMITIVE;
