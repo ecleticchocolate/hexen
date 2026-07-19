@@ -269,12 +269,8 @@ StructField* Struct_FindField(StructDef* sd, const char* name, size_t len) {
 // concrete enum (Struct_MakeAnon), whose fields[0] keeps its ORIGINAL absolute
 // tag instead of renumbering to 0. Returns -1 if not found.
 int Enum_VariantIndex(StructDef* sd, const char* name, size_t len) {
-    if (!sd) return -1;
-    for (size_t i = 0; i < sd->field_count; i++) {
-        if (strlen(sd->fields[i].name) == len && strncmp(sd->fields[i].name, name, len) == 0)
-            return (int)sd->fields[i].variant_tag;
-    }
-    return -1;
+    StructField* f = Struct_FindField(sd, name, len);
+    return f ? (int)f->variant_tag : -1;
 }
 
 uint64_t Type_SizeOf(const Type* t) {
