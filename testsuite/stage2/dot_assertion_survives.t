@@ -1,0 +1,5 @@
+//@ expect val 12
+struct S { i32 a }
+struct W { i32 q }
+fn p[T]() i32 { match T { struct { i32 a } { return 1 } else { return 2 } } return -1 }
+fn main() i32 { return p[S]()*10 + p[W]() }

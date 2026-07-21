@@ -734,6 +734,28 @@ void resolve_brace_literal(ASTNode* node, Type* target) {
 // Save/install/restore the comptime generic-substitution frame ConstEval
 // consults mid-fold.
 typedef struct { const char** params; Type** args; size_t n; } CeGenericFrame;
+// True iff `e` contains a sizeof/alignof whose operand type is a TYPE_PARAM that
+// the given substitution frame does not bind -- i.e. a hole no later instantiation
+// will fill. Used to turn a would-be silent 0 into a diagnostic.
+static bool expr_mentions_unbound_param(ASTNode* e, const char** params, Type** args, size_t n) {
+    if (!e) return false;
+    if (e->type == AST_SIZEOF || e->type == AST_ALIGNOF) {
+        Type* t = e->sizeof_expr.type;
+        if (t && t->cls == TYPE_PARAM) {
+            for (size_t i = 0; i < n; i++)
+                if (t->param_name && strcmp(t->param_name, params[i]) == 0) return false;
+            return true;
+        }
+    }
+    switch (e->type) {
+        case AST_ADD: case AST_SUB: case AST_MUL: case AST_DIV: case AST_MOD:
+        case AST_BIT_AND: case AST_BIT_OR: case AST_BIT_XOR: case AST_SHL: case AST_SHR:
+            return expr_mentions_unbound_param(e->binary.left,  params, args, n) ||
+                   expr_mentions_unbound_param(e->binary.right, params, args, n);
+        default: return false;
+    }
+}
+
 static CeGenericFrame ce_generic_frame_install(const char** params, Type** args, size_t n) {
     CeGenericFrame saved = { s_ce_generic_params, s_ce_generic_args, s_ce_generic_n };
     s_ce_generic_params = params; s_ce_generic_args = args; s_ce_generic_n = n;
@@ -768,14 +790,57 @@ static void fold_array_count(ASTNode* ce, const char** params, Type** args, size
 
 // One array-postfix dimension as a Type* type argument, or NULL if it's an
 // ordinary (non-type) array-size expression.
-static Type* count_expr_as_type_arg(ASTNode* count_expr, const char** params, Type** args, size_t n) {
-    if (!count_expr) return NULL;
-    if (count_expr->type == AST_TYPE_EXPR) {
-        return Type_Substitute(count_expr->sizeof_expr.type, params, args, n);
+// One bracket of an HKT application, resolved against the applied template's OWN
+// declared kind for that slot (`pin` = sd->param_kinds[k]: NULL for a type param,
+// non-NULL for a value param).
+//
+// `pin` is what lets a VALUE argument resolve here at all. `M[i32][30]` where M is
+// bound to `Vec[T, u32 N]` has a second bracket that is not type-shaped, so without
+// a kind to fold it against it was rejected and the whole application failed --
+// meaning a bound HKT head could only ever be applied to TYPE arguments, never to a
+// const-generic value. `folded` carries the already-folded literal for the common
+// case where the parser resolved `[30]` to a concrete array count and dropped the
+// expr (count_expr == NULL), which is exactly what a plain literal bracket does.
+static Type* count_expr_as_type_arg(ASTNode* count_expr, const char** params, Type** args, size_t n,
+                                     Type* pin, uint64_t folded, const char* size_param) {
+    // A size WILDCARD (`M[E][N]`): the parser leaves count==0/no expr and stashes the
+    // name in array.size_param. Hand it back as an unbound TYPE_PARAM so reflect_unify
+    // binds it exactly like any other hole -- the value-slot pin is irrelevant here
+    // because nothing is being folded, only bound.
+    if (size_param) {
+        Type* h = (Type*)calloc(1, sizeof(Type));
+        h->cls = TYPE_PARAM;
+        h->param_name = size_param;
+        return h;
     }
-    if (count_expr->type == AST_IDENT) {
-        for (size_t i = 0; i < n; i++) {
-            if (strcmp(count_expr->ident.name, params[i]) == 0) return args[i];
+    if (count_expr) {
+        if (count_expr->type == AST_TYPE_EXPR) {
+            return Type_Substitute(count_expr->sizeof_expr.type, params, args, n);
+        }
+        if (count_expr->type == AST_IDENT) {
+            for (size_t i = 0; i < n; i++) {
+                if (strcmp(count_expr->ident.name, params[i]) == 0) return args[i];
+            }
+        }
+    }
+    // VALUE slot: produce the pinned constant. Either fold the surviving expr (with
+    // the generic frame installed so an in-scope `N` resolves), or -- when the parser
+    // already folded it away -- use the count it left behind.
+    if (pin) {
+        int64_t v; bool ok = false;
+        if (count_expr) {
+            CeGenericFrame saved = ce_generic_frame_install(params, args, n);
+            ok = ConstEval(count_expr, &v);
+            ce_generic_frame_restore(saved);
+        } else if (folded > 0) {
+            v = (int64_t)folded; ok = true;
+        }
+        if (ok) {
+            Type* cv = (Type*)calloc(1, sizeof(Type));
+            cv->cls = TYPE_CONST_VALUE;
+            cv->cval.pin = pin;
+            cv->cval.scalar = v;
+            return cv;
         }
     }
     return NULL;
@@ -794,13 +859,19 @@ static Type* array_substitute_maybe_hkt(Type* t, const char** params, Type** arg
     if (depth == 0) return NULL;
 
     ASTNode** count_exprs = (ASTNode**)malloc(depth * sizeof(ASTNode*));
+    uint64_t* count_vals = (uint64_t*)malloc(depth * sizeof(uint64_t));
+    const char** size_params = (const char**)malloc(depth * sizeof(const char*));
     size_t i = 0;
-    for (Type* cur = t; cur->cls == TYPE_ARRAY; cur = cur->array.element) count_exprs[i++] = cur->array.count_expr;
+    for (Type* cur = t; cur->cls == TYPE_ARRAY; cur = cur->array.element) {
+        count_vals[i] = cur->array.count;
+        size_params[i] = cur->array.size_param;
+        count_exprs[i++] = cur->array.count_expr;
+    }
     Type* base_sub = Type_Substitute(base, params, args, n);
 
-    if (!base_sub || base_sub->cls != TYPE_STRUCT) { free(count_exprs); return NULL; }
+    if (!base_sub || base_sub->cls != TYPE_STRUCT) { free(count_exprs); free(count_vals); free(size_params); return NULL; }
     StructDef* esd = Struct_Find(base_sub->struct_name);
-    if (!esd || !esd->is_generic || esd->type_param_count == 0) { free(count_exprs); return NULL; }
+    if (!esd || !esd->is_generic || esd->type_param_count == 0) { free(count_exprs); free(count_vals); free(size_params); return NULL; }
     if (esd->type_param_count > depth) {
         // A bare, deliberately-unapplied template (struct_unapplied, from an
         // HKT slot) with FEWER brackets than its arity is under-applied -- an
@@ -813,13 +884,15 @@ static Type* array_substitute_maybe_hkt(Type* t, const char** params, Type** arg
                             esd->name, esd->type_param_count, depth);
             exit(1);
         }
-        free(count_exprs); return NULL;
+        free(count_exprs); free(count_vals); free(size_params); return NULL;
     }
 
     size_t arity = esd->type_param_count;
     Type** type_args = (Type**)malloc(arity * sizeof(Type*));
     for (size_t k = 0; k < arity; k++) {
-        Type* ta = count_expr_as_type_arg(count_exprs[k], params, args, n);
+        Type* ta = count_expr_as_type_arg(count_exprs[k], params, args, n,
+                                          esd->param_kinds ? esd->param_kinds[k] : NULL,
+                                          count_vals[k], size_params[k]);
         if (!ta) {
             // A confirmed template short on type-shaped brackets (e.g. M[T][N]
             // with M arity-2 and N a real value) is an arity error, not a
@@ -850,7 +923,7 @@ static Type* array_substitute_maybe_hkt(Type* t, const char** params, Type** arg
         fold_array_count(count_exprs[k - 1], params, args, n, &outer->array.count, &outer->array.count_expr);
         result = outer;
     }
-    free(count_exprs);
+    free(count_exprs); free(count_vals); free(size_params);
     return result;
 }
 
@@ -883,6 +956,19 @@ Type* Type_Substitute(Type* t, const char** params, Type** args, size_t n) {
         } else {
             int64_t v;
             if (ConstEval(t->cval.defer, &v)) { r->cval.scalar = v; }
+            else if (expr_mentions_unbound_param(t->cval.defer, params, args, n)) {
+                // The expression names a type hole this frame cannot fill -- a
+                // `match T` wildcard (`sizeof(H)`) bound by reflect_unify rather
+                // than by the enclosing generic's param list. Deferring again is
+                // the trap the parser's own comments describe: nothing downstream
+                // revisits it, so it reads back as a silent scalar 0 and bakes a
+                // wrong size into a type. Say so instead of miscompiling.
+                fprintf(stderr, "Error: const-generic value argument references a type "
+                                "that is not bound by this generic's parameter list "
+                                "(a `match` pattern wildcard cannot be used in a "
+                                "const-generic argument)\n");
+                exit(1);
+            }
             else                              { r->cval.defer = t->cval.defer; }
         }
         ce_generic_frame_restore(saved);
@@ -977,8 +1063,14 @@ Type* Type_Substitute(Type* t, const char** params, Type** args, size_t n) {
                 off += snprintf(namebuf + off, sizeof(namebuf) - off, "%s", kw);
                 for (size_t i = 0; i < fc; i++) {
                     char tn[128]; Type_ToString(newf[i], tn, sizeof(tn));
-                    off += snprintf(namebuf + off, sizeof(namebuf) - off, "%s%s%s",
+                    // An ASSERTED field name (`.a`) is part of the pattern's identity,
+                    // exactly as it is in the parser's own key-building path -- rebuild
+                    // it here too, or the substituted twin dedups onto the assertion-free
+                    // `struct{i32}` and the `.name` check silently stops firing.
+                    off += snprintf(namebuf + off, sizeof(namebuf) - off, "%s%s%s%s%s",
                                     (int)i == sd->pack_field_index ? "..." : "", tn,
+                                    sd->fields[i].name_asserted ? " ." : "",
+                                    sd->fields[i].name_asserted ? sd->fields[i].name : "",
                                     (i + 1 < fc) ? "," : "");
                 }
                 snprintf(namebuf + off, sizeof(namebuf) - off, "}");
@@ -994,6 +1086,7 @@ Type* Type_Substitute(Type* t, const char** params, Type** args, size_t n) {
                         nsd->fields[i].name = sd->fields[i].name;
                         nsd->fields[i].type = newf[i];
                         nsd->fields[i].offset = 0;
+                        nsd->fields[i].name_asserted = sd->fields[i].name_asserted;
                         nsd->fields[i].variant_tag = sd->fields[i].variant_tag;
                     }
                 }
@@ -2433,12 +2526,28 @@ static void Resolve_Reflect_Matches(ASTNode* n);
 // follow-up. A NULL scrutinee is NOT "still generic": it's also the genuine
 // resolved value of an omitted type (a no-payload enum variant's H) -- only
 // bail on an ACTUAL TYPE_PARAM node.
+// Forward decl: defined below (materialize_agg_param), reused here so an
+// aggregate wildcard bound by a `match T` pattern (e.g. `N` in `Stack[E, N]`
+// where N's concrete arg is a struct/array value) gets the same synthetic
+// const-global treatment Generic_Instantiate already gives an ordinary
+// aggregate value-param -- otherwise `N.field` / `sizeof(N)` in the arm body
+// see a bare TYPE_CONST_VALUE with no addressable storage behind it.
+static void materialize_agg_param(const char* pname, Type* pin, uint32_t agg_off, ASTNode* err_node);
+
 static bool reflect_match_select(ASTNode* node) {
     Type* scrut = node->if_stmt.reflect_scrutinee;
     if (scrut && scrut->cls == TYPE_PARAM) return false;
     ReflectBindings binds = {0};
     if (reflect_unify(scrut, node->if_stmt.reflect_pattern, &binds)) {
         ASTNode* body = node->if_stmt.true_block;
+        // Same materialize-before-clone step Generic_Instantiate runs for an
+        // ordinary aggregate value-param (see its own comment) -- a match-bound
+        // aggregate wildcard needs identical treatment before substitution.
+        for (size_t i = 0; i < binds.count; i++) {
+            Type* a = binds.args[i];
+            if (a && a->cls == TYPE_CONST_VALUE && a->cval.is_agg && Type_IsAggregate(a->cval.pin))
+                materialize_agg_param(binds.names[i], a->cval.pin, a->cval.agg_off, node);
+        }
         if (binds.count > 0) body = clone_ast(body, binds.names, binds.args, binds.count, false);
         reflect_bindings_free(&binds);
         *node = *body;

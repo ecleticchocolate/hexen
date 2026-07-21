@@ -7,10 +7,10 @@ fn shape_cost[T]() u32 {
         u8   { return 1 }
         P*   { return 8 }
         E[N] { return N * shape_cost[E]() }
-        struct { H h  Rest... r } {
+        struct { H; Rest... } {
             return shape_cost[H]() + shape_cost[Rest]()
         }
-        struct {} { return 0 }
+        struct {  } { return 0 }
         else { return 0 }
     }
 }

@@ -14,13 +14,46 @@
 static void prescan_structs(const char* filename, const char* source) {
     Lexer_Init(filename, source);
     Token t = Lexer_NextToken();
+    // Type DECLARATIONS are only legal at top level. This pass is a flat token
+    // scan, so it must track brace depth itself: with C-style optional tags, a
+    // `struct M[X] {` inside a function body is a match ARM (M is a wildcard,
+    // `{` opens the arm body) and is lexically indistinguishable from a real
+    // declaration. Registering it would turn the wildcard into a real struct,
+    // silently killing the pattern. Depth is the discriminator.
+    int brace_depth = 0;
     while (t.type != TOK_EOF) {
+        if (t.type == TOK_LBRACE) { brace_depth++; t = Lexer_NextToken(); continue; }
+        if (t.type == TOK_RBRACE) { if (brace_depth > 0) brace_depth--; t = Lexer_NextToken(); continue; }
         // skip 'pub' if present
         if (t.type == TOK_PUB) t = Lexer_NextToken();
         if (t.type != TOK_STRUCT && t.type != TOK_ENUM) { t = Lexer_NextToken(); continue; }
+        if (brace_depth > 0) { t = Lexer_NextToken(); continue; }
         bool is_enum = (t.type == TOK_ENUM);
         t = Lexer_NextToken();
         if (t.type != TOK_IDENTIFIER) continue;
+
+        // `struct IDENT` is only a DECLARATION if a body (or a generic param list
+        // followed by one) follows. With C-style optional tags, the same two tokens
+        // also occur as a mere tag -- `struct Vector v`, or `struct M[X]` in a match
+        // pattern -- and registering those would invent an empty struct named after
+        // a tag'd type or, worse, after a pattern WILDCARD, which then stops being a
+        // wildcard at all. Look ahead for the `{` before committing.
+        {
+            LexerState ls; Lexer_Save(&ls);
+            Token la = Lexer_NextToken();
+            if (la.type == TOK_LBRACKET) {           // skip a generic param list
+                int d = 1;
+                while (d > 0 && la.type != TOK_EOF) {
+                    la = Lexer_NextToken();
+                    if (la.type == TOK_LBRACKET) d++;
+                    else if (la.type == TOK_RBRACKET) { d--; if (d == 0) break; }
+                }
+                la = Lexer_NextToken();   // token after the closing ']'
+            }
+            bool is_decl = (la.type == TOK_LBRACE);
+            Lexer_Restore(&ls);
+            if (!is_decl) { t = Lexer_NextToken(); continue; }
+        }
 
         // Register the name (idempotent if already registered)
         StructDef* sd = Struct_Register(t.start, t.length);

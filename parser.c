@@ -37,9 +37,12 @@ static bool token_is_type_start(TokenType t);
 static bool curr_begins_type(void); // token_is_type_start + registered struct/generic names
 static Type* parse_type(void);
 static void parse_generic_param_list(const char*** names_out, Type*** kinds_out, size_t* count_out);
+static void parse_function_type_signature(Type* base_t);
 static Type* parse_generic_value_arg(Type* pin);
 static void parse_generic_arg_list(const char** param_names, Type** param_kinds, size_t param_count,
                                     Type*** out_targs, size_t* out_tcount);
+static void parse_generic_arg_list_packed(const char** param_names, Type** param_kinds, size_t param_count,
+                                    int pack_index, Type*** out_targs, size_t* out_tcount);
 static ASTNode* make_ident_node(const char* name, size_t len, Symbol* sym);
 static Type* make_const_value_type(Type* pin);
 // Generic FUNCTION headers recorded by pass 0b (Parse_Signatures). Defined here rather
@@ -51,6 +54,7 @@ struct GenericSig {
     const char** tparams;
     Type**       pkinds;
     size_t       pcount;
+    int          ppack;   // index of a `Ts...` generic param, or -1
 };
 static struct GenericSig* gsig_find(const char* name, size_t len);
 static Type* parse_type_ex(bool allow_array);
@@ -81,6 +85,7 @@ typedef struct {
     const char** params;   // TYPE_PARAM hole names (NULL if non-generic)
     Type**       kinds;    // per-param: NULL = type param, non-NULL = value-param pin
     size_t param_count;
+    int    pack_param_index; // index of a `Ts...` param, or -1 for none
     Type*  body;           // body type with TYPE_PARAM (and const-value) holes
 } AliasDef;
 static AliasDef* s_aliases = NULL;
@@ -334,11 +339,21 @@ static bool expr_mentions_generic_param(ASTNode* n) {
 // (s_type_params/s_param_kinds) incrementally as we parse. On return, the scope
 // arrays point at the freshly built list; the caller is responsible for saving
 // and restoring the previous scope around this call.
+// `Ts...` in a generic parameter list marks the ONE parameter that absorbs every
+// surplus bracket argument at each application site, bundled into a single
+// synthesized anonymous struct (see bundle_pack_args). `Ts` itself stays an
+// ordinary TYPE param -- nothing downstream learns a new kind of thing; the
+// `...` is a binding rule at the application site, not a kind annotation on the
+// parameter. This is the bracket-position sibling of `T... args`, which does
+// exactly the same bundling for call arguments.
+static int s_last_pack_param_index = -1;
+
 static void parse_generic_param_list_impl(const char** inherited_names, Type** inherited_kinds,
                                           size_t inherited_count,
                                           const char*** names_out, Type*** kinds_out,
                                           size_t* count_out) {
     advance(); // consume '['
+    s_last_pack_param_index = -1;
     size_t cap = inherited_count + 4;
     size_t count = inherited_count;
     const char** names = (const char**)malloc(cap * sizeof(char*));
@@ -354,8 +369,15 @@ static void parse_generic_param_list_impl(const char** inherited_names, Type** i
     s_param_kinds = kinds;
     s_type_param_count = count;
 
+    // Generic parameter declarations are declarations (not pattern match sites),
+    // so temporarily disable s_in_match_pattern so curr_begins_type() doesn't
+    // treat undeclared identifiers as wildcards.
+    bool saved_match_pattern = s_in_match_pattern;
+    s_in_match_pattern = false;
+
     while (s_curr.type != TOK_RBRACKET && s_curr.type != TOK_EOF) {
         Type* pin = NULL;
+
         // A VALUE param begins with a type (primitive keyword, or a name that
         // resolves to a struct/generic/earlier-type-param). A bare identifier that
         // is NOT itself a type start is a TYPE param being declared.
@@ -374,14 +396,32 @@ static void parse_generic_param_list_impl(const char** inherited_names, Type** i
         }
         names[count] = strndup(s_curr.start, s_curr.length);
         kinds[count] = pin;      // NULL => type param; non-NULL => value param pin
+        advance();
+        // `Ts...` -- this param absorbs the surplus bracket args as one bundle.
+        // Only meaningful for a TYPE param: a value param is pinned to a single
+        // concrete type, so there is nothing for a bundle to be.
+        if (s_curr.type == TOK_ELLIPSIS) {
+            if (pin) parse_error("a `...` pack parameter must be a TYPE parameter, "
+                                 "not a pinned value parameter (write `[Ts...]`, not `[u32 Ns...]`)");
+            if (s_last_pack_param_index != -1)
+                parse_error("at most one `Ts...` pack parameter is allowed per generic parameter list");
+            s_last_pack_param_index = (int)count;
+            advance();
+        }
         count++;
         s_type_param_count = count;   // publish this param before parsing the next pin
-        advance();
         if (s_curr.type == TOK_COMMA) advance();
         else break;
     }
     if (s_curr.type != TOK_RBRACKET) parse_error("Expected ']' after generic parameters");
+    // The bundle absorbs "every argument from here on", so anything declared
+    // after it could never receive one. Rejecting it here keeps the arity rule
+    // trivial (args before the pack bind positionally; the rest bundle) instead
+    // of needing a bind-from-the-right pass.
+    if (s_last_pack_param_index != -1 && (size_t)s_last_pack_param_index != count - 1)
+        parse_error("a `Ts...` pack parameter must be the LAST generic parameter");
     advance();
+    s_in_match_pattern = saved_match_pattern;
     *names_out = names; *kinds_out = kinds; *count_out = count;
 }
 
@@ -534,11 +574,32 @@ static Type* parse_generic_value_arg(Type* pin) {
 // arity check, since the three call sites want different error wording there.
 static void parse_generic_arg_list(const char** param_names, Type** param_kinds, size_t param_count,
                                     Type*** out_targs, size_t* out_tcount) {
+    parse_generic_arg_list_packed(param_names, param_kinds, param_count, -1, out_targs, out_tcount);
+}
+
+// `pack_index` is the position of a `Ts...` parameter in the generic's own
+// declared list, or -1 if it has none. Arguments before it bind positionally;
+// every remaining argument is bundled into ONE synthesized anonymous struct
+// bound to that slot -- the same Struct_MakeAnon call the `T... args` call-site
+// path already uses, so `Def[i32,u8,f64]` and `Def[struct{i32,u8,f64}]` produce
+// the identical instantiation and dedup against each other for free.
+static void parse_generic_arg_list_packed(const char** param_names, Type** param_kinds, size_t param_count,
+                                    int pack_index,
+                                    Type*** out_targs, size_t* out_tcount) {
     size_t tcap = param_count ? param_count : 4;
     Type** targs = (Type**)malloc(tcap * sizeof(Type*));
     size_t tcount = 0;
+    // Surplus args destined for the pack slot, collected before bundling.
+    Type** packed = NULL; size_t packed_n = 0, packed_cap = 0;
+    // Index of a `Rest...` tail wildcard among the packed args, or -1. In a
+    // PATTERN, `Def[H, Rest...]` peels the constructed carrier exactly like
+    // `struct { H; Rest... }` peels a written anon struct -- same construct,
+    // same meaning, so the carrier is built with pack_field_index set and
+    // reflect_unify's existing pack_tail_unify does the rest.
+    int pat_pack_idx = -1;
     while (s_curr.type != TOK_RBRACKET && s_curr.type != TOK_EOF) {
-        Type* pin = (param_kinds && tcount < param_count) ? param_kinds[tcount] : NULL;
+        bool in_pack = (pack_index >= 0 && tcount >= (size_t)pack_index);
+        Type* pin = (!in_pack && param_kinds && tcount < param_count) ? param_kinds[tcount] : NULL;
         // A later param's pin type may itself reference an EARLIER param in the
         // same list (`Container[T, Box[T] val]` -- the second param's pin is
         // `Box[T]`, naming the first). Substitute using the args already parsed
@@ -557,10 +618,104 @@ static void parse_generic_arg_list(const char** param_names, Type** param_kinds,
                                   "argument requires the parameter to be declared "
                                   "with a pinned type, e.g. `[T, u32 N]`, not `[T, N]`)");
         }
-        if (tcount >= tcap) { tcap *= 2; targs = realloc(targs, tcap * sizeof(Type*)); }
-        targs[tcount++] = ta;
+        if (in_pack) {
+            // `Def[H, Rest...]` -- the trailing `...` marks this arg as the tail
+            // wildcard, the bracket-position spelling of `struct { H; Rest... }`.
+            if (s_in_match_pattern && s_curr.type == TOK_ELLIPSIS) {
+                if (pat_pack_idx != -1)
+                    parse_error("at most one `...` tail wildcard is allowed in a generic argument pattern");
+                pat_pack_idx = (int)packed_n;
+                advance();
+            }
+            if (packed_n >= packed_cap) {
+                packed_cap = packed_cap ? packed_cap * 2 : 4;
+                packed = (Type**)realloc(packed, packed_cap * sizeof(Type*));
+            }
+            packed[packed_n++] = ta;
+            if (pat_pack_idx != -1 && (size_t)pat_pack_idx == packed_n - 1 &&
+                s_curr.type == TOK_COMMA)
+                parse_error("a `...` tail wildcard must be the LAST generic argument in a pattern");
+        } else {
+            if (tcount >= tcap) { tcap *= 2; targs = realloc(targs, tcap * sizeof(Type*)); }
+            targs[tcount++] = ta;
+        }
         if (s_curr.type == TOK_COMMA) advance();
         else break;
+    }
+    if (pack_index >= 0) {
+        // Zero surplus args still bundles -- to the empty anon struct, so
+        // `Def[]` is a well-formed instantiation rather than an arity error.
+        //
+        // ONE surplus arg that is ALREADY an anonymous struct passes through
+        // unwrapped, so the sugar and the longhand name the same instantiation:
+        // `Def[i32,u8]` and `Def[struct{i32;u8}]` must be the SAME type, not
+        // Def[struct{i32,u8}] vs Def[struct{struct{i32,u8}}]. Only ANONYMOUS
+        // structs pass through -- a named one-field struct (`Def[Point]`) is a
+        // real type argument the user means to bundle, and re-wrapping it is
+        // correct.
+        // `Ts...` CONSTRUCTS the carrier from the arguments supplied here. It
+        // does not pass an argument through: `Def[struct{i32;u8}]` is a ONE-
+        // argument application whose single argument happens to be an anonymous
+        // struct, so its carrier is struct{struct{i32,u8}} -- arity 1 -- exactly
+        // as `Def[Point]` is arity 1. Making an anonymous argument collapse into
+        // the carrier would have meant `Def[struct{i32;u8}]` and `Def[i32,u8]`
+        // named the same type, so a one-argument application would report arity
+        // 2 while `Def[Point]` reported 1: the same syntax meaning different
+        // things based on whether the argument was anonymous.
+        //
+        // The one genuine pass-through is a lone TYPE_PARAM, and it is not an
+        // exception to this: `Def[Rest]` in an arm body re-supplies a carrier
+        // that `Def[H, Rest...]` just took apart, so nothing is being
+        // constructed -- the tail IS the argument list. Without it a recursive
+        // walk adds a layer per step and never reaches `Def[]`.
+        Type* bt = NULL;
+        if (packed_n == 1 && packed[0] && packed[0]->cls == TYPE_PARAM)
+            bt = packed[0];
+        if (!bt && pat_pack_idx != -1) {
+            // Pattern carrier WITH a tail: build the same shape the anonymous-
+            // aggregate parser builds for `struct { H; Rest... }` -- the `...`
+            // marker in the name key and pack_field_index set -- so the existing
+            // reflect_unify pack path binds Rest to the rebundled remainder.
+            char nb[1024]; size_t o = 0;
+            o += snprintf(nb + o, sizeof(nb) - o, "struct{");
+            for (size_t i = 0; i < packed_n; i++) {
+                char tn[128];
+                Type_ToString(packed[i], tn, sizeof(tn));
+                o += snprintf(nb + o, sizeof(nb) - o, "%s%s%s",
+                              (int)i == pat_pack_idx ? "..." : "", tn,
+                              (i + 1 < packed_n) ? "," : "");
+            }
+            snprintf(nb + o, sizeof(nb) - o, "}");
+            StructDef* psd = Struct_Register(nb, strlen(nb));
+            if (psd->field_count == 0 && !psd->laid_out) {
+                psd->is_enum = false;
+                psd->is_overlapping = false;
+                psd->is_anonymous = true;
+                psd->pack_field_index = pat_pack_idx;
+                psd->fields = (StructField*)calloc(packed_n ? packed_n : 1, sizeof(StructField));
+                psd->field_count = packed_n;
+                for (size_t i = 0; i < packed_n; i++) {
+                    char fnbuf[16];
+                    snprintf(fnbuf, sizeof(fnbuf), "_%zu", i);
+                    psd->fields[i].name = strdup(fnbuf);
+                    psd->fields[i].type = packed[i];
+                    psd->fields[i].offset = 0;
+                }
+                Struct_Layout(psd);
+            }
+            bt = (Type*)calloc(1, sizeof(Type));
+            bt->cls = TYPE_STRUCT;
+            bt->struct_name = psd->name;
+        }
+        if (!bt) {
+            StructDef* bsd = Struct_MakeAnon(packed, packed_n, false);
+            bt = (Type*)calloc(1, sizeof(Type));
+            bt->cls = TYPE_STRUCT;
+            bt->struct_name = bsd->name;
+        }
+        if (tcount >= tcap) { tcap = tcount + 1; targs = realloc(targs, tcap * sizeof(Type*)); }
+        targs[tcount++] = bt;
+        free(packed);
     }
     *out_targs = targs;
     *out_tcount = tcount;
@@ -823,29 +978,28 @@ static bool parse_impl_pattern_type(Type* base_t) {
         Token mname = s_curr;
         advance();
 
-        if (s_curr.type != TOK_LPAREN) parse_error("Expected '(' after the method name in an `impl {...}` pattern");
-        advance();
-        Type** ptypes = NULL; size_t pcount = 0, pcap = 0;
-        while (s_curr.type != TOK_RPAREN && s_curr.type != TOK_EOF) {
-            Type* pt = parse_type();
-            if (!pt) parse_error("Expected a parameter type in an `impl {...}` pattern");
-            if (pcount >= pcap) { pcap = pcap ? pcap * 2 : 4; ptypes = realloc(ptypes, pcap * sizeof(Type*)); }
-            ptypes[pcount++] = pt;
-            if (s_curr.type == TOK_COMMA) advance(); else break;
+        // Generic parameter list: impl { fn map[U](U) Box[U] }
+        const char** prev_tparams = s_type_params;
+        Type**       prev_pkinds  = s_param_kinds;
+        size_t prev_tparam_count = s_type_param_count;
+        if (s_curr.type == TOK_LBRACKET) {
+            const char** tparams = NULL;
+            Type**       pkinds  = NULL;
+            size_t tparam_count = 0;
+            parse_generic_param_list_with_prefix(prev_tparams, prev_pkinds, prev_tparam_count,
+                                                 &tparams, &pkinds, &tparam_count);
+            s_type_params = tparams;
+            s_param_kinds = pkinds;
+            s_type_param_count = tparam_count;
         }
-        if (s_curr.type != TOK_RPAREN) parse_error("Expected ')' in an `impl {...}` pattern");
-        advance();
-
-        Type* ret = NULL;
-        if (s_curr.type != TOK_RBRACE && !Lexer_NewlineBefore && curr_begins_type())
-            ret = parse_type_ex(true);
 
         Type* sig = (Type*)calloc(1, sizeof(Type));
-        sig->cls = TYPE_FUNCTION;
-        sig->function.return_type = ret;
-        sig->function.param_types = ptypes;
-        sig->function.param_count = pcount;
-        sig->function.is_vararg = false;
+        parse_function_type_signature(sig);
+
+        // Restore active generic scope
+        s_type_params = prev_tparams;
+        s_param_kinds = prev_pkinds;
+        s_type_param_count = prev_tparam_count;
 
         if (mcount >= mcap) {
             mcap = mcap ? mcap * 2 : 4;
@@ -882,7 +1036,7 @@ static bool parse_anonymous_aggregate_type(Type* base_t) {
     advance(); // '{'
 
     Type* ftypes[64];
-    const char* fnames[64];
+    const char* fnames[64]; bool fasserted[64] = {0}; bool fnamed[64] = {0};
     size_t fcount = 0;
     int pack_idx = -1;
     
@@ -901,7 +1055,15 @@ static bool parse_anonymous_aggregate_type(Type* base_t) {
                 // identifier) and wrongly concluded "not a payload type after all,
                 // this must be a bare no-payload variant literally named Rest",
                 // silently eating the wildcard as a variant name instead of a type.
-                if (spec && (s_curr.type == TOK_IDENTIFIER || s_curr.type == TOK_ELLIPSIS)) {
+                // STAGE 2: a payload type in a PATTERN no longer carries a trailing
+                // name, so it can also be followed by the field separator `;` or by
+                // `}`. Without these, `enum { H; Rest... }` re-read `H` as a bare
+                // no-payload variant literally named "H" -- the exact failure mode
+                // the `...` case above was added to fix, one separator later.
+                if (spec && (s_curr.type == TOK_IDENTIFIER || s_curr.type == TOK_ELLIPSIS ||
+                             (s_in_match_pattern && (s_curr.type == TOK_SEMI ||
+                                                     s_curr.type == TOK_RBRACE ||
+                                                     s_curr.type == TOK_DOT)))) {
                     ft = spec;
                 } else {
                     Lexer_Restore(&save);
@@ -930,13 +1092,42 @@ static bool parse_anonymous_aggregate_type(Type* base_t) {
         // callers doing `.q`/`.r` -- so an explicit name must never be discarded).
         // enum payload variants are different: the variant name IS identity, so
         // it stays required there.
-        if (anon_is_enum) {
+        if (anon_is_enum && !s_in_match_pattern) {
+            // A DECLARATION's variant name is its identity, so it stays required.
+            // In a PATTERN it is as meaningless as a struct field's name -- matching
+            // is positional -- so stage 2 drops it there for the same reason.
             if (s_curr.type != TOK_IDENTIFIER) parse_error("Expected variant name in anonymous enum");
         }
         if (fcount >= 64) parse_error("too many fields in anonymous aggregate");
         ftypes[fcount] = ft;
+        // `.name` marks the name as a MATCH ASSERTION rather than documentation:
+        // in a type pattern the concrete field must actually be called that, or the
+        // arm fails. A bare `name` keeps its existing meaning (a label; struct
+        // patterns unify positionally and ignore it). The dot is only meaningful in
+        // a pattern -- in an ordinary anonymous struct TYPE there is nothing to
+        // assert against, so it is rejected there rather than silently ignored.
+        // A leading `.` used to be the assertion marker. A bare name in a pattern
+        // now means exactly that, so the dot is redundant -- rejected rather than
+        // quietly accepted, so there is one spelling and not two.
+        if (s_curr.type == TOK_DOT) {
+            if (!s_in_match_pattern)
+                parse_error("a field name here is part of an ordinary anonymous "
+                            "struct type; drop the '.'");
+            parse_error("drop the '.' -- in a match type pattern a bare field name "
+                        "already asserts the concrete field's name");
+        }
+        // In a match PATTERN a trailing name is an ASSERTION on the concrete
+        // field's name -- the only meaning it can have, since a pattern matches
+        // positionally and has no binding site. Omit it (`struct { A; B }`) for a
+        // purely positional slot. This is the same spelling a declaration uses,
+        // read the only way that makes sense in a pattern, so there is no separate
+        // marker to remember and no silently-discarded name to hide a typo.
+        if (s_curr.type == TOK_IDENTIFIER && s_in_match_pattern) {
+            fasserted[fcount] = true;
+        }
         if (s_curr.type == TOK_IDENTIFIER) {
             fnames[fcount] = strndup(s_curr.start, s_curr.length);
+            fnamed[fcount] = true;
             advance(); // field/variant name
         } else {
             char fnbuf[16];
@@ -950,7 +1141,11 @@ static bool parse_anonymous_aggregate_type(Type* base_t) {
                         "(anonymous struct identity is its field types; use a named struct for defaults)");
         }
         if (s_curr.type == TOK_SEMI) advance();
-        else if (pack_idx == (int)(fcount - 1) && s_curr.type != TOK_RBRACE)
+        // The pack tail must be LAST, checked after the separator is consumed --
+        // as an `else` it only ever fired for the old `A... a  B b` spelling and
+        // silently accepted `struct { A...; B }`, because the `;` branch ate the
+        // separator and skipped the check.
+        if (pack_idx == (int)(fcount - 1) && s_curr.type != TOK_RBRACE)
             parse_error("a `T...` pack-tail field must be the last field in the anonymous struct");
     }
     
@@ -964,8 +1159,24 @@ static bool parse_anonymous_aggregate_type(Type* base_t) {
         char tn[128];
         if (ftypes[i]) Type_ToString(ftypes[i], tn, sizeof(tn));
         else           snprintf(tn, sizeof(tn), "#%s", fnames[i]);
-        off += snprintf(namebuf + off, sizeof(namebuf) - off, "%s%s%s",
+        // Field names are part of an anonymous struct's identity, matching every
+        // other struct-like type in the language (and how field names work
+        // everywhere else): `struct{i32 x}` and `struct{i32 y}` are different
+        // types. The two exceptions:
+        //   - a MATCH PATTERN's bare slot name (`struct { A a }` inside `match T`)
+        //     is a wildcard binder/label, not part of the shape being matched --
+        //     folding it in would make `struct { A a }` and `struct { A zzz }`
+        //     silently stop unifying against the same concrete type, breaking
+        //     the whole point of a pattern name being "don't care, just bind".
+        //   - a field written with NO name at all (fnamed[i]==false) has a
+        //     synthesized `_N` placeholder, not a real name, so it stays out of
+        //     the key too -- otherwise an unnamed field and a pack-expanded `_N`
+        //     field (Struct_MakeAnon uses the same scheme) could fail to dedup
+        //     for no reason the user wrote.
+        bool include_name = fasserted[i] || (!s_in_match_pattern && fnamed[i]);
+        off += snprintf(namebuf + off, sizeof(namebuf) - off, "%s%s%s%s%s",
                         (int)i == pack_idx ? "..." : "", tn,
+                        include_name ? " ." : "", include_name ? fnames[i] : "",
                         (i + 1 < fcount) ? "," : "");
     }
     snprintf(namebuf + off, sizeof(namebuf) - off, "}");
@@ -982,6 +1193,7 @@ static bool parse_anonymous_aggregate_type(Type* base_t) {
             sd->fields[i].name = fnames[i];
             sd->fields[i].type = ftypes[i];
             sd->fields[i].offset = 0;
+            sd->fields[i].name_asserted = fasserted[i];
         }
         Struct_Layout(sd);
     } else {
@@ -993,13 +1205,20 @@ static bool parse_anonymous_aggregate_type(Type* base_t) {
     return true;
 }
 
-static void parse_function_type(Type* base_t) {
-    advance();
+static void parse_function_type_signature(Type* base_t) {
     if (s_curr.type != TOK_LPAREN) parse_error("Expected '(' after 'fn' for function type");
     advance();
     Type** param_types = NULL;
     size_t param_count = 0;
     size_t param_cap = 0;
+    // Prototype: `fn(Fixed, Rest...) R` pack-tail, MATCH-PATTERN ONLY (mirrors the
+    // anon-struct/enum pack-tail parse above -- same TOK_ELLIPSIS-after-a-type
+    // detection, same "at most one, must be last" rules). Gated on
+    // s_in_match_pattern so an ordinary function type (an extern decl, a
+    // variable's declared type, ...) never has to consider this; `...` there
+    // already means something else (C-style vararg, is_vararg) and must keep
+    // meaning that.
+    int pack_idx = -1;
     if (s_curr.type != TOK_RPAREN) {
         while (1) {
             if (param_count >= param_cap) {
@@ -1007,7 +1226,25 @@ static void parse_function_type(Type* base_t) {
                 param_types = realloc(param_types, param_cap * sizeof(Type*));
             }
             param_types[param_count++] = parse_type();
-            if (s_curr.type == TOK_COMMA) advance();
+            // An optional parameter NAME after the type, discarded. Anonymous
+            // struct types already accept-and-ignore field names
+            // (`struct { i32 a }` and `struct { i32 }` are the same type, and a
+            // struct PATTERN's field names are ignored -- matching is positional);
+            // function types rejected them outright, which made the two field-list
+            // grammars gratuitously different. One rule now: in a TYPE, a name is
+            // documentation -- accepted everywhere, significant nowhere.
+            if (s_curr.type == TOK_IDENTIFIER) advance();
+            if (s_in_match_pattern && s_curr.type == TOK_ELLIPSIS) {
+                if (pack_idx != -1)
+                    parse_error("at most one `Rest...` pack-tail parameter is allowed per fn(...) pattern");
+                pack_idx = (int)(param_count - 1);
+                advance();
+            }
+            if (s_curr.type == TOK_COMMA) {
+                if (pack_idx == (int)(param_count - 1))
+                    parse_error("a `Rest...` pack-tail parameter must be the last parameter in the fn(...) pattern");
+                advance();
+            }
             else break;
         }
     }
@@ -1021,6 +1258,114 @@ static void parse_function_type(Type* base_t) {
     base_t->function.return_type = ret_type;
     base_t->function.param_types = param_types;
     base_t->function.param_count = param_count;
+    base_t->function.pack_param_index = pack_idx;
+}
+
+static void parse_function_type(Type* base_t) {
+    advance();
+    parse_function_type_signature(base_t);
+}
+
+static Type* parse_alias_or_type_param_type(Type* base_t);
+
+// A nominal type written with an explicit `struct`/`enum`/`union` tag.
+//
+// The tag means the same thing in every type position; nothing here is special
+// to `match`. Two cases, decided by whether the NAME is already known:
+//
+//   KNOWN name   -- the tag is redundant, so it is a no-op. It is still CHECKED
+//                   against the declaration's actual kind, because a tag that
+//                   can lie is worse than no tag.
+//   UNKNOWN name -- only reachable inside a pattern, where it is a wildcard. The
+//                   tag is REQUIRED here: it is the sole statement of intent that
+//                   distinguishes `struct M[X]` (template applied to X) from the
+//                   untagged `M[X]` (array of M sized X). Brackets are ambiguous;
+//                   tags are not. The asserted kind rides along on the node so
+//                   reflect_unify can check it against the concrete type.
+static const char* nominal_tag_name(unsigned char tag) {
+    return tag == 1 ? "struct" : tag == 2 ? "enum" : "union";
+}
+
+static Type* parse_tagged_nominal_type(Type* base_t, unsigned char tag) {
+    StructDef* sd = struct_find_by_token_text(s_curr.start, s_curr.length);
+
+    if (!sd && s_in_match_pattern &&
+        !type_param_lookup(s_curr.start, s_curr.length) &&
+        !alias_lookup(s_curr.start, s_curr.length)) {
+        // Unknown name under a tag: a nominal-head wildcard.
+        const char* wname = match_wildcard_lookup(s_curr.start, s_curr.length);
+        if (!wname) wname = register_match_wildcard(s_curr.start, s_curr.length);
+        advance();
+        base_t->cls = TYPE_PARAM;
+        base_t->param_name = wname;
+        base_t->nominal_tag = tag;
+        // Bracket arguments, if any, are the application's type arguments. They
+        // are ordinary pattern types, so each may itself be concrete, a wildcard,
+        // or another tagged application -- recursion falls out for free.
+        if (s_curr.type == TOK_LBRACKET) {
+            Type** args = NULL; size_t n = 0, cap = 0;
+            while (s_curr.type == TOK_LBRACKET) {
+                advance();
+                for (;;) {
+                // A bracket argument is a TYPE in the general case, but a template
+                // may declare a const-generic VALUE param (`Vec[T, u32 N]`), so a
+                // literal like `[30]` must be accepted here and pinned as a value.
+                // Which slots are value slots is only knowable from the head, which
+                // is a wildcard -- so accept both spellings and let reflect_unify
+                // decide against the concrete instantiation's own type_args.
+                Type* a = NULL;
+                if (s_curr.type == TOK_INTEGER) {
+                    Type* pin = Type_MakePrim(PRIM_U32);
+                    a = parse_generic_value_arg(pin);
+                } else {
+                    // Everything else is an ordinary type production, parsed by the
+                    // one shared entry point -- so postfix (`E*`, `E[N]`), function
+                    // types, anonymous aggregates and further tagged applications
+                    // all compose here for free. Hand-rolling the wildcard case
+                    // instead would silently drop the postfix loop.
+                    a = parse_type();
+                }
+                if (!a) parse_error("Expected a type or value argument after '[' in a tagged nominal pattern");
+                if (n >= cap) { cap = cap ? cap * 2 : 4; args = (Type**)realloc(args, cap * sizeof(Type*)); }
+                args[n++] = a;
+                // `struct M[X, Y]` -- the ordinary comma-separated argument list,
+                // same as every other generic use site in the language. The stacked
+                // `struct M[X][Y]` spelling means exactly the same thing; both are
+                // accepted so the tagged form does not need a grammar of its own.
+                if (s_curr.type == TOK_COMMA) { advance(); continue; }
+                if (s_curr.type != TOK_RBRACKET)
+                    parse_error("Expected ']' or ',' after a tagged nominal type argument");
+                advance();
+                break;
+                }
+                break;   // ONE argument group only -- see below
+            }
+            // Exactly one `[...]` carries the arguments; any further brackets are
+            // ordinary POSTFIX and belong to the shared grammar, exactly as they do
+            // for a concrete head. `Box[E][N]` means array-of-Box[E], so
+            // `struct M[E][N]` must mean the same thing -- letting the tagged form
+            // eat a second bracket as a second argument would make it the only
+            // production in the language where `[` changes meaning by position.
+            // Multi-argument templates use the comma list: `struct M[E,F]`.
+            base_t->app_args = args;
+            base_t->app_arg_count = n;
+        }
+        return base_t;
+    }
+
+    if (sd) {
+        // Known name: the tag must agree with how the type was actually declared.
+        unsigned char actual = sd->is_enum ? 2 : sd->is_overlapping ? 3 : 1;
+        if (actual != tag) {
+            char msg[256];
+            snprintf(msg, sizeof msg,
+                     "'%s' is declared as a %s, not a %s -- the tag must match the declaration",
+                     sd->name, nominal_tag_name(actual), nominal_tag_name(tag));
+            parse_error(msg);
+        }
+    }
+    // Redundant tag on a known name (or an alias / type param): plain no-op.
+    return parse_alias_or_type_param_type(base_t);
 }
 
 static Type* parse_alias_or_type_param_type(Type* base_t) {
@@ -1042,7 +1387,8 @@ static Type* parse_alias_or_type_param_type(Type* base_t) {
                 parse_error("generic alias used without type arguments");
             advance();
             Type** targs; size_t tcount;
-            parse_generic_arg_list(al->params, al->kinds, al->param_count, &targs, &tcount);
+            parse_generic_arg_list_packed(al->params, al->kinds, al->param_count,
+                                          al->pack_param_index, &targs, &tcount);
             if (s_curr.type != TOK_RBRACKET) parse_error("Expected ']' after alias type arguments");
             advance();
             if (tcount != al->param_count) parse_error("wrong number of type arguments for alias");
@@ -1078,7 +1424,13 @@ static Type* parse_alias_or_type_param_type(Type* base_t) {
         }
         advance();
         Type** targs; size_t tcount;
-        parse_generic_arg_list(sd->type_params, sd->param_kinds, sd->type_param_count, &targs, &tcount);
+        // Bundling applies in PATTERN position too, so an arm may be written in
+        // the same sugar as the use site (`match X { Def[i32, u8] {...} }`).
+        // The one carve-out lives in parse_generic_arg_list_packed: a lone
+        // wildcard (`Def[E]`) binds the ALREADY-bundled struct rather than being
+        // wrapped into struct{E}, which is what makes one arm cover every arity.
+        parse_generic_arg_list_packed(sd->type_params, sd->param_kinds, sd->type_param_count,
+                                      sd->pack_type_param_index, &targs, &tcount);
         if (s_curr.type != TOK_RBRACKET) parse_error("Expected ']' after generic struct type arguments");
         advance();
         StructDef* inst = Struct_Instantiate(sd, targs, tcount);
@@ -1113,9 +1465,25 @@ static Type* parse_type_ex(bool allow_array) {
             break;
         case TOK_STRUCT:
         case TOK_UNION:
-        case TOK_ENUM:
+        case TOK_ENUM: {
+            // C-style optional nominal tag: `struct Foo`, `enum Bar`, `union Baz`.
+            // Followed by `{` it is an anonymous aggregate instead, so look ahead
+            // one token to tell the two apart.
+            unsigned char tag = (s_curr.type == TOK_STRUCT) ? 1
+                              : (s_curr.type == TOK_ENUM)   ? 2 : 3;
+            LexerState tag_save; Lexer_Save(&tag_save);
+            Token nxt = Lexer_NextToken();
+            Lexer_Restore(&tag_save);
+            if (nxt.type == TOK_IDENTIFIER) {
+                advance(); // consume the tag
+                Type* res = parse_tagged_nominal_type(base_t, tag);
+                if (!res) return NULL;
+                base_t = res;
+                break;
+            }
             if (!parse_anonymous_aggregate_type(base_t)) { free(base_t); return NULL; }
             break;
+        }
         case TOK_LPAREN: {
             // Parenthesized type: `(type)`. Grouping closes a `fn(...)` return
             // type explicitly so postfix can bind to the whole function type,
@@ -1826,6 +2194,7 @@ static ASTNode* parse_explicit_generic_call(Symbol* sym, Token id_tok, bool* out
     const char** call_tparams = NULL;
     Type**       call_pkinds  = NULL;
     size_t       call_pcount  = 0;
+    int          call_ppack   = -1;
     bool         is_gcall     = false;
     if (s_curr.type == TOK_LBRACKET && !s_curr_newline_before) {
         if (sym && sym->kind == SYM_FUNCTION && sym->generic_decl) {
@@ -1833,6 +2202,7 @@ static ASTNode* parse_explicit_generic_call(Symbol* sym, Token id_tok, bool* out
             call_tparams = gd->func_decl.type_params;
             call_pkinds  = gd->func_decl.param_kinds;
             call_pcount  = gd->func_decl.type_param_count;
+            call_ppack   = gd->func_decl.pack_type_param_index;
             is_gcall     = true;
         } else if (!sym) {
             struct GenericSig* gs = gsig_find(id_tok.start, id_tok.length);
@@ -1840,6 +2210,7 @@ static ASTNode* parse_explicit_generic_call(Symbol* sym, Token id_tok, bool* out
                 call_tparams = gs->tparams;
                 call_pkinds  = gs->pkinds;
                 call_pcount  = gs->pcount;
+                call_ppack   = gs->ppack;
                 is_gcall     = true;
             }
         }
@@ -1849,7 +2220,7 @@ static ASTNode* parse_explicit_generic_call(Symbol* sym, Token id_tok, bool* out
 
     advance(); // consume '['
     Type** targs; size_t tcount;
-    parse_generic_arg_list(call_tparams, call_pkinds, call_pcount, &targs, &tcount);
+    parse_generic_arg_list_packed(call_tparams, call_pkinds, call_pcount, call_ppack, &targs, &tcount);
     if (s_curr.type != TOK_RBRACKET) parse_error("Expected ']' after explicit generic call arguments");
     advance();
     if (call_pcount && tcount != call_pcount)
@@ -2879,9 +3250,15 @@ static ASTNode* parse_match_type(ASTNode* scrut) {
                 // it from its bound TYPE_CONST_VALUE to a pinned literal — the exact
                 // path const generics already use. A bare type wildcard (`P`, `E`)
                 // stays a type param (NULL pin).
-                merged_kinds[prev_tpc + i] =
-                    (s_match_wc_is_size && s_match_wc_is_size[wc_start + i])
-                        ? Type_MakePrim(PRIM_U32) : NULL;
+                // Whether a TAGGED application's bracket wildcard (`struct M[X][N]`)
+                // is a type slot or a const-generic VALUE slot depends on the
+                // template the head binds to -- unknown here, since the head is
+                // itself a wildcard. Publish those as u32-pinned VALUE params too:
+                // clone_ast lowers a binding that turns out to be a TYPE_CONST_VALUE
+                // to a literal, and leaves a genuine type binding alone, so the pin
+                // costs nothing when the slot was a type after all.
+                bool is_val = (s_match_wc_is_size && s_match_wc_is_size[wc_start + i]);
+                merged_kinds[prev_tpc + i] = is_val ? Type_MakePrim(PRIM_U32) : NULL;
             }
             s_type_params = merged_names;
             s_param_kinds = merged_kinds;
@@ -3648,6 +4025,8 @@ static ASTNode* parse_return_statement(void) {
     return node;
 }
 
+static ASTNode* parse_const_stmt(void);
+
 static ASTNode* parse_defer_statement(void) {
     advance();
     ASTNode* node = new_node(AST_DEFER);
@@ -3819,9 +4198,18 @@ static ASTNode* parse_statement(void) {
         {
             LexerState csave; Lexer_Save(&csave); Token ccur_save = s_curr;
             advance(); // 'const'
-            bool is_block = (s_curr.type == TOK_LBRACE);
+            // `const` prefixes a STATEMENT, the same way `defer` does -- the
+            // braces are not part of the `const` grammar, they are just one of
+            // the statements `parse_statement` accepts. The only form that is
+            // NOT a statement is the declaration `const TYPE name = expr`,
+            // which is disambiguated by a following type; everything else
+            // (`{`, `if`, `while`, `for`, a bare assignment) is a statement.
+            bool is_stmt = (s_curr.type == TOK_LBRACE ||
+                            s_curr.type == TOK_IF ||
+                            s_curr.type == TOK_WHILE ||
+                            s_curr.type == TOK_FOR);
             Lexer_Restore(&csave); s_curr = ccur_save;
-            if (is_block) return parse_const_block();
+            if (is_stmt) return parse_const_stmt();
         }
         return parse_const_decl(false);
     }
@@ -3858,6 +4246,7 @@ static ASTNode* parse_struct_decl_ex(bool is_enum, bool is_overlapping, bool is_
         sd->type_params = tparams;
         sd->param_kinds = pkinds;
         sd->type_param_count = pcount;
+        sd->pack_type_param_index = s_last_pack_param_index;
         s_type_params = tparams;        // resolve T within field types
         s_param_kinds  = pkinds;
         s_type_param_count = pcount;
@@ -4025,22 +4414,45 @@ static ASTNode* parse_struct_decl_ex(bool is_enum, bool is_overlapping, bool is_
 // (the template body is parsed once, before any instantiation exists), so
 // it's wrapped in AST_CONST_EXPR -- the SAME node clone_ast already re-folds
 // per instantiation (see its AST_CONST_EXPR case) -- instead of failing.
-static ASTNode* parse_const_block(void) {
-    advance(); // consume 'const'
-    ASTNode* block = parse_block_body();
+// Fold one statement in place. Recurses through the statement forms that
+// merely CONTAIN statements (blocks, if-arms, loop bodies) rather than
+// special-casing the block form -- `const` applies to whatever statement
+// follows it, exactly like `defer`, and reaches every assignment inside.
+static void const_fold_stmt(ASTNode* stmt);
+static ASTNode* parse_const_stmt(void);
 
-    for (size_t i = 0; i < block->block.count; i++) {
-        ASTNode* stmt = block->block.statements[i];
-        if (stmt->type != AST_ASSIGN) continue; // only bare `x = expr` folds; anything
-                                                   // else (if/while/nested block/decl)
-                                                   // is left as an ordinary statement.
+static void const_fold_block(ASTNode* block) {
+    if (!block) return;
+    for (size_t i = 0; i < block->block.count; i++)
+        const_fold_stmt(block->block.statements[i]);
+}
+
+static ASTNode* parse_const_stmt(void) {
+    advance(); // consume 'const'
+    ASTNode* stmt = parse_statement();
+    const_fold_stmt(stmt);
+    return stmt;
+}
+
+static void const_fold_stmt(ASTNode* stmt) {
+    if (!stmt) return;
+    if (stmt->type == AST_BLOCK) { const_fold_block(stmt); return; }
+    if (stmt->type == AST_IF) {
+        const_fold_stmt(stmt->if_stmt.true_block);
+        const_fold_stmt(stmt->if_stmt.false_block);
+        return;
+    }
+    if (stmt->type == AST_WHILE) { const_fold_stmt(stmt->while_stmt.body); return; }
+    if (stmt->type == AST_FOR)   { const_fold_stmt(stmt->for_stmt.body);   return; }
+    {
+        if (stmt->type != AST_ASSIGN) return; // only bare `x = expr` folds
         ASTNode* rhs = stmt->binary.right;
 
         if (s_type_param_count > 0 && expr_mentions_generic_param(rhs)) {
             ASTNode* deferred = new_node(AST_CONST_EXPR);
             deferred->const_expr.inner = rhs;
             stmt->binary.right = deferred;
-            continue;
+            return;
         }
 
         int64_t value = 0;
@@ -4059,8 +4471,6 @@ static ASTNode* parse_const_block(void) {
         }
         stmt->binary.right = lit;
     }
-
-    return block;
 }
 
 static ASTNode* parse_const_decl(bool is_pub) {
@@ -4228,11 +4638,11 @@ static ASTNode* parse_alias_decl(void) {
     // Optional [P, ...] type params -> installed into scope so the body's
     // holes resolve to TYPE_PARAM. Prototype supports type params only.
     const char** prev_tp = s_type_params; Type** prev_pk = s_param_kinds; size_t prev_c = s_type_param_count;
-    const char** aparams = NULL; Type** akinds = NULL; size_t apc = 0;
+    const char** aparams = NULL; Type** akinds = NULL; size_t apc = 0; int apack = -1;
     if (s_curr.type == TOK_LBRACKET) {
         const char** names = NULL; Type** kinds = NULL; size_t cnt = 0;
         parse_generic_param_list(&names, &kinds, &cnt);
-        aparams = names; akinds = kinds; apc = cnt;
+        aparams = names; akinds = kinds; apc = cnt; apack = s_last_pack_param_index;
         s_type_params = names; s_param_kinds = kinds; s_type_param_count = cnt;
     }
 
@@ -4270,7 +4680,7 @@ static ASTNode* parse_alias_decl(void) {
         s_alias_cap = s_alias_cap ? s_alias_cap * 2 : 8;
         s_aliases = realloc(s_aliases, s_alias_cap * sizeof(AliasDef));
     }
-    s_aliases[s_alias_count++] = (AliasDef){ aname, alen, aparams, akinds, apc, body };
+    s_aliases[s_alias_count++] = (AliasDef){ aname, alen, aparams, akinds, apc, apack, body };
 
     if (s_curr.type == TOK_SEMI) advance(); // optional separator, same as every sibling declaration
 
@@ -4586,12 +4996,14 @@ static ASTNode* parse_fn_decl(bool is_pub, bool is_extern,
         const char** tparams = NULL;
         Type**       pkinds  = NULL;
         size_t tparam_count = 0;
+        int    tpack = -1;
         const char** prev_tparams = s_type_params;
         Type**       prev_pkinds  = s_param_kinds;
         size_t prev_tparam_count = s_type_param_count;
         if (s_curr.type == TOK_LBRACKET) {
             parse_generic_param_list_with_prefix(prev_tparams, prev_pkinds, prev_tparam_count,
                                                 &tparams, &pkinds, &tparam_count);
+            tpack = s_last_pack_param_index;
             s_type_params = tparams;
             s_param_kinds = pkinds;
             s_type_param_count = tparam_count;
@@ -4710,6 +5122,7 @@ static ASTNode* parse_fn_decl(bool is_pub, bool is_extern,
         ftype->function.return_type = ret_type;
         ftype->function.param_count = node->func_decl.param_count;
         ftype->function.is_vararg = is_vararg;
+        ftype->function.pack_param_index = -1; // calloc zero-inits to 0, not -1 -- must set explicitly
         ftype->function.param_types = (Type**)malloc(node->func_decl.param_count * sizeof(Type*));
         for (size_t i = 0; i < node->func_decl.param_count; i++) {
             ftype->function.param_types[i] = node->func_decl.param_syms[i]->type;
@@ -4726,6 +5139,7 @@ static ASTNode* parse_fn_decl(bool is_pub, bool is_extern,
         node->func_decl.type_params = tparams;
         node->func_decl.param_kinds = pkinds;
         node->func_decl.type_param_count = tparam_count;
+        node->func_decl.pack_type_param_index = tpack;
         if (tparam_count > 0) {
             // Mark generic: not compiled at definition; the backend clones+substitutes
             // and compiles each [T] instantiation on demand. Stash the decl AST on the
@@ -4783,14 +5197,14 @@ static GenericSig* s_gsigs = NULL;
 static size_t s_gsig_count = 0, s_gsig_cap = 0;
 
 static void gsig_register(const char* name, size_t len,
-                          const char** tparams, Type** pkinds, size_t pcount) {
+                          const char** tparams, Type** pkinds, size_t pcount, int ppack) {
     for (size_t i = 0; i < s_gsig_count; i++)          // idempotent across files
         if (s_gsigs[i].name_len == len && strncmp(s_gsigs[i].name, name, len) == 0) return;
     if (s_gsig_count >= s_gsig_cap) {
         s_gsig_cap = s_gsig_cap ? s_gsig_cap * 2 : 16;
         s_gsigs = (GenericSig*)realloc(s_gsigs, s_gsig_cap * sizeof(GenericSig));
     }
-    s_gsigs[s_gsig_count++] = (GenericSig){ name, len, tparams, pkinds, pcount };
+    s_gsigs[s_gsig_count++] = (GenericSig){ name, len, tparams, pkinds, pcount, ppack };
 }
 static struct GenericSig* gsig_find(const char* name, size_t len) {
     for (size_t i = 0; i < s_gsig_count; i++)
@@ -4850,6 +5264,7 @@ void Parse_Signatures(const char* filename, const char* source) {
         size_t       prev_tpc = s_type_param_count;
         const char** tparams = NULL; Type** pkinds = NULL; size_t pcount = 0;
         parse_generic_param_list(&tparams, &pkinds, &pcount);
+        int gpack = s_last_pack_param_index;
         s_type_params = prev_tp; s_param_kinds = prev_pk; s_type_param_count = prev_tpc;
 
         if (is_struct) {
@@ -4875,7 +5290,7 @@ void Parse_Signatures(const char* filename, const char* source) {
             // declaration and turn every generic fn into a "already declared" error.
             // The call site consults this table only as a fallback, when the symbol is
             // not yet visible (i.e. exactly the forward-reference case).
-            gsig_register(name.start, name.length, tparams, pkinds, pcount);
+            gsig_register(name.start, name.length, tparams, pkinds, pcount, gpack);
         }
         skip_braced_body();
     }

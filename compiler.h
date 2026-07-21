@@ -2,6 +2,9 @@
 #define COMPILER_H
 
 #include <stdint.h>
+#include <stdio.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <stdbool.h>
 #include <stddef.h>
 
@@ -110,6 +113,20 @@ typedef enum {
     PRIM_BOOL, PRIM_F32, PRIM_F64, PRIM_V, PRIM_VOID
 } PrimitiveKind;
 
+// ── Debug trace channel (fd 3) ────────────────────────────────────────────
+// stdout carries program output and stderr carries diagnostics; test.sh matches
+// against BOTH, so tracing on either corrupts the thing being tested. fd 3 is
+// closed by default, so these writes vanish unless explicitly opened:
+//     ./torrent x.t 3>trace.log      (capture)
+//     ./torrent x.t 3>&2             (watch live)
+// Never use printf for tracing -- use TRACE.
+#define TRACE(...) do { \
+    static int _tfd = -2; \
+    if (_tfd == -2) _tfd = (fcntl(3, F_GETFD) != -1) ? 3 : -1; \
+    if (_tfd == 3) { char _b[512]; int _n = snprintf(_b, sizeof _b, __VA_ARGS__); \
+                     if (_n > 0) { ssize_t _w = write(3, _b, (size_t)_n); (void)_w; } } \
+} while (0)
+
 typedef struct Type {
     TypeClass cls;
     // TYPE_STRUCT only: true iff this node names a still-generic template left
@@ -120,6 +137,20 @@ typedef struct Type {
     // avoid its `Box*` self-param auto-completion firing by NAME COINCIDENCE on a
     // node that was never meant to be completed at all.
     bool struct_unapplied;
+    // A NOMINAL TAG (`struct`/`enum`/`union`) written before a type name.
+    // Optional and purely a no-op when the name is already known -- but still
+    // CHECKED, so `struct E` on an enum is an error rather than silently fine.
+    // When the name is UNKNOWN (a match wildcard), the tag is what makes the
+    // name readable as a nominal head at all: untagged `M[X]` stays an array
+    // pattern, tagged `struct M[X]` is a template application. The tag is the
+    // only place the kind can be stated, so it is required there, never guessed.
+    //   0 = no tag, 1 = struct, 2 = enum, 3 = union
+    unsigned char nominal_tag;
+    // TYPE_PARAM head of a tagged application (`struct M[X][Y]`): the bracket
+    // arguments, kept as pattern types so reflect_unify binds them pairwise
+    // against the concrete instantiation's own type_args.
+    struct Type** app_args;
+    size_t        app_arg_count;
     union {
         PrimitiveKind primitive;
         struct Type* pointer_base;
@@ -151,6 +182,15 @@ typedef struct Type {
             struct Type** param_types;
             size_t param_count;
             bool is_vararg;
+            // Prototype: `fn(A...) R` MATCH-PATTERN tracking, mirrors StructDef's
+            // pack_field_index. -1 on every ordinary function type (concrete
+            // signatures, non-pack patterns); >= 0 only on a pattern parsed from
+            // `fn(Fixed, Rest...) R` in a `match T` arm, naming which param slot is
+            // the pack tail. Not used by codegen/calling-convention logic at all —
+            // a real function's TYPE_FUNCTION never sets this. See reflections.c's
+            // TYPE_FUNCTION case for the peel-then-rebundle unification this drives,
+            // same shape as the struct-field pack tail immediately above it there.
+            int pack_param_index;
         } function;
         // TYPE_CONST_VALUE: a constexpr-folded VALUE carried as a generic argument.
         // Not "an int in the type system" any more — it's a value of type `pin`,
@@ -219,6 +259,11 @@ typedef struct StructField {
     // Single storage: writing d.x and reading d.base.x hit the same bytes.
     bool is_super_alias;
     uint32_t super_prefix_span;
+    // Set only on a `match` TYPE-PATTERN field written as `.name`: the concrete
+    // field at this position must actually carry this name for the arm to fire.
+    // A plain (documentation) name leaves this false and unifies positionally,
+    // which is the long-standing behaviour and stays the default.
+    bool name_asserted;
 } StructField;
 
 typedef struct StructDef {
@@ -265,6 +310,11 @@ typedef struct StructDef {
                                 //   param pinned to that Type (e.g. u32 for `[T, u32 N]`).
                                 //   NULL for the whole array on a legacy all-type generic.
     size_t type_param_count;    // 0 for an ordinary struct
+    // Index of the `Ts...` pack parameter in type_params, or -1 if the generic
+    // has none. Set explicitly at every creation site (calloc would zero it,
+    // which would wrongly mean "param 0 is the pack") -- same footgun as
+    // pack_field_index above.
+    int pack_type_param_index;
     
     // For instantiated structs (e.g. Queue$TT, Queue$p2), keep track of the base and args
     struct StructDef* generic_base;
@@ -551,6 +601,12 @@ typedef struct ASTNode {
                                         //   VALUE param pinned to that Type. NULL array
                                         //   for a legacy all-type generic function.
             size_t type_param_count;    // 0 for an ordinary (non-generic) function
+            // Index of a `Ts...` pack in type_params (the GENERIC list), or -1.
+            // Distinct from pack_param_index below, which is the `T... name`
+            // pack in the VALUE list: `fn f[Ts...](Ts v)` bundles TYPE arguments
+            // written in brackets, `fn g[T](T... args)` bundles VALUE arguments
+            // written in parens. Same construction, two different argument lists.
+            int pack_type_param_index;
             // Prototype pack support: index of a `T... name` value-parameter in
             // param_syms, or -1 if this function has none. At most one, and it
             // must be the last value-parameter (enforced at parse time).

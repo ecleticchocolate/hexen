@@ -11,8 +11,8 @@ enum Shape { i32 Circle  i32[2] Rect  bool Flag }
 
 fn count_variants[T](u32 acc) u32 {
     match T {
-        enum { H h  Rest... r } { return count_variants[Rest](acc + 1) }
-        enum {} { return acc }
+        enum { H; Rest... } { return count_variants[Rest](acc + 1) }
+        enum {  } { return acc }
     }
 }
 

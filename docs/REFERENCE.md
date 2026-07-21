@@ -305,7 +305,7 @@ match T {
     Stack[E, N] { }   // generic + const-generic together
     u32         { }   // compared, same rule as `0` above
     S           { }   // bare wildcard — binds the whole type
-    struct { A x  B y } { }   // struct destructure, positional on types
+    struct { A; B }     { }   // struct destructure, positional on types
     impl { fn free() }  { }   // structural capability query — yes/no, no binding
     else        { }
 }
@@ -420,7 +420,7 @@ struct, not a count you track yourself:
 fn pack_len[T](T dummy) u32 {
     match T {
         struct {} { return 0 }              // base case: no fields left
-        struct { A a  Rest... r } {
+        struct { A; Rest... } {
             Rest r2 = {}                    // an empty instance of the tail type
             return 1 + pack_len(r2)          // recurse on it
         }

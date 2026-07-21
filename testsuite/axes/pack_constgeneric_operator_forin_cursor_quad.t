@@ -9,8 +9,8 @@ enum Option[T] { T Some  None }
 
 fn pack_count[T](u32 acc) u32 {
     match T {
-        struct {} { return acc }
-        struct { H head  Rest... rest } { return pack_count[Rest](acc + 1) }
+        struct {  } { return acc }
+        struct { H; Rest... } { return pack_count[Rest](acc + 1) }
     }
 }
 fn count_args[T](T... args) u32 { return pack_count[T](0) }

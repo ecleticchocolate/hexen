@@ -19,14 +19,14 @@ struct Order { u8* item  Money price  Point ship_to }
 
 fn fields[Orig, Walk, u32 N](Orig* p) void {
     match Walk {
-        struct { H h  Rest... r } {
+        struct { H; Rest... } {
             if N > 0 { printf(", ") }
             printf("\"%s\": ", nameof(Orig, N))
             H* fp = (H*)((u8*)p + offsetof(Orig, N))
             emit(fp)
             fields[Orig, Rest, N + 1](p)
         }
-        struct {} {}
+        struct {  } {}
     }
 }
 fn emit[T](T* p) void {
@@ -35,7 +35,7 @@ fn emit[T](T* p) void {
         i32  { printf("%d", *p) }
         i64  { printf("%d", *p) }
         u8*  { printf("\"%s\"", *p) }
-        struct { H h  Rest... r } {
+        struct { H; Rest... } {
             printf("{")
             fields[T, T, 0](p)
             printf("}")

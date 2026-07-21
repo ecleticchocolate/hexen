@@ -28,11 +28,11 @@ fn safe_printf_impl[T](u8* fmt, T args) i32 {
             
             // Consume an argument by recursively calling with (Rest)args
             match T {
-                struct { H head  Rest... tail } {
+                struct { H; Rest... } {
                     i32 d = print_val(args._0)
                     return safe_printf_impl(fmt + i + 1, (Rest) args)
                 }
-                struct {} {
+                struct {  } {
                     // We hit a '%' but ran out of variadic arguments!
                     i32 dummy = printf("[MISSING_ARG]")
                     i = i + 1
@@ -47,10 +47,10 @@ fn safe_printf_impl[T](u8* fmt, T args) i32 {
     
     // We reached the end of the format string. Check if there are unused arguments!
     match T {
-        struct { H head  Rest... tail } {
+        struct { H; Rest... } {
             i32 dummy = printf("[EXTRA_ARGS]")
         }
-        struct {} {
+        struct {  } {
             // All arguments consumed perfectly!
         }
     }

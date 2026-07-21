@@ -12,7 +12,7 @@ enum Shape3 { u32 Circle }
 
 fn probe[T]() i32 {
     match T {
-        enum { u32 h } { return 1 }
+        enum { u32 } { return 1 }
         else { return 999 }
     }
 }

@@ -2,7 +2,7 @@
 struct S { f32[4] arr }
 fn main() i32 {
     match S {
-        struct { E[N] a } { return (i32)N*10 + (i32)sizeof(E) }
+        struct { E[N] } { return (i32)N*10 + (i32)sizeof(E) }
         else { return 99 }
     }
 }

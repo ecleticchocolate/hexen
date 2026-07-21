@@ -13,13 +13,13 @@ union U { i32 a  i32 b  i32 c }
 
 fn read_offset0[Walk](Walk* p) i32 {
     match Walk {
-        union { H h  Rest... r } { return *(i32*)p }
+        union { H; Rest... } { return *(i32*)p }
         else { return -1 }
     }
 }
 fn peel_one[Walk](Walk* p) i32 {
     match Walk {
-        union { H h  Rest... r } { return read_offset0[Rest]((Rest*)p) }
+        union { H; Rest... } { return read_offset0[Rest]((Rest*)p) }
         else { return -1 }
     }
 }

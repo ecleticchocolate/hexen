@@ -15,20 +15,21 @@
 // -- its OWN early-return (right after the pack-expansion step) already
 // makes this a no-op for the type-arg-inference part once args are explicit,
 // so this only ever ADDS the missing pack expansion.
-alias Getter = struct { (fn(void*) i32) get }
+alias Getter = struct { fn(void*) i32 }
+alias Obj[V] = struct { void* obj  V vt }
 fn t_get[T](void* p) i32 {
     T* o = (T*)p
     return o.get()
 }
-fn dyn_obj[T, V](T* o, V... fns) struct { void* obj  V vt } {
+fn dyn_obj[T, V](T* o, V... fns) Obj[V] {
     return { .obj = (void*)o, .vt = fns }
 }
 struct HasGet { i32 val }
 impl HasGet { fn get() i32 { return self.val } }
 fn test() i32 {
     HasGet hg = {.val = 15}
-    struct { void* obj  Getter vt } d = dyn_obj[HasGet, Getter](&hg, t_get[HasGet])
-    return d.vt.get(d.obj)
+    Obj[Getter] d = dyn_obj[HasGet, Getter](&hg, t_get[HasGet])
+    return d.vt._0(d.obj)
 }
 fn main() i32 {
     i32 res = 0

@@ -3,10 +3,10 @@
 fn sum_impl[T](T args) i32 {
     i32 result = 0
     match T {
-        struct { i32 v  Rest... r } {
+        struct { i32; Rest... } {
             result = args._0 + sum_impl((Rest) args)
         }
-        struct {} {
+        struct {  } {
             result = 0
         }
     }

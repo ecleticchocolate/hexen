@@ -1474,6 +1474,15 @@ static bool ConstEval_inner(ASTNode* node, int64_t* out) {
             if (s_ce_generic_params) {
                 t = Type_Substitute(t, s_ce_generic_params, s_ce_generic_args, s_ce_generic_n);
             }
+            // Still a bare TYPE_PARAM after substitution => the operand names a
+            // hole this frame can't fill (e.g. a `match T` wildcard `H`, bound by
+            // reflect_unify, not by the enclosing generic's param list). Type_SizeOf
+            // would answer 8 -- its deliberate "a param is a word inside a template"
+            // rule -- which is right there and wrong here: in a CONST-GENERIC ARGUMENT
+            // (`walk[Rest, OFF + sizeof(H)]()`) the value is baked into a type, so a
+            // placeholder 8 silently miscompiles into a wrong layout with no
+            // diagnostic. Refuse to fold instead; the caller defers or errors.
+            if (t && t->cls == TYPE_PARAM) return false;
             *out = (int64_t)Type_SizeOf(t);
             s_ce_isfloat = false;
             return true;
@@ -1487,6 +1496,7 @@ static bool ConstEval_inner(ASTNode* node, int64_t* out) {
             if (s_ce_generic_params) {
                 t = Type_Substitute(t, s_ce_generic_params, s_ce_generic_args, s_ce_generic_n);
             }
+            if (t && t->cls == TYPE_PARAM) return false; // same rule as AST_SIZEOF above
             *out = (int64_t)Type_AlignOf(t);
             s_ce_isfloat = false;
             return true;

@@ -14,11 +14,11 @@ enum Five { i32 V0  i32 V1  i32 V2  i32 V3  i32 V4 }
 
 fn tag_after_n_peels[Walk, u32 N](Walk* p) u32 {
     match Walk {
-        enum { H h  Rest... r } {
+        enum { H; Rest... } {
             if N == 0 { return *(u32*)p }
             return tag_after_n_peels[Rest, N - 1]((Rest*)p)
         }
-        enum {} { return 999 }
+        enum {  } { return 999 }
     }
 }
 

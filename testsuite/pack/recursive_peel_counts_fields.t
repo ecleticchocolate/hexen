@@ -1,8 +1,8 @@
 //@ expect val 4
 fn pack_len[T](T dummy) u32 {
     match T {
-        struct {} { return 0 }
-        struct { A a  Rest... r } {
+        struct {  } { return 0 }
+        struct { A; Rest... } {
             Rest r2 = {}
             return 1 + pack_len(r2)
         }

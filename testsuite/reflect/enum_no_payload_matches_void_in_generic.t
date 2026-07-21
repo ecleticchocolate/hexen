@@ -1,7 +1,7 @@
 //@ expect val 100
 // A no-payload enum variant's payload type is stored as NULL (see parser.c:
 // "f->type = ftype // NULL for a no-payload variant"). Bound to a wildcard
-// (`enum { H h  Rest... r }`), H correctly carries that NULL through --
+// (`enum { H; Rest... }`), H correctly carries that NULL through --
 // nameof(H) already printed "void" for it -- but comparing it against a literal
 // `void` pattern inside a NESTED generic match silently always failed, even
 // though the two are meant to be the same concept.
@@ -26,8 +26,8 @@ fn inner_probe[H]() i32 {
 
 fn outer_probe[Walk]() i32 {
     match Walk {
-        enum { H h  Rest... r } { return inner_probe[H]() }
-        enum {} { return 999 }
+        enum { H; Rest... } { return inner_probe[H]() }
+        enum {  } { return 999 }
     }
 }
 

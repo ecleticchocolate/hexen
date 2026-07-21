@@ -33,6 +33,7 @@
 //     into array sizes / arithmetic / method bodies in the arm with no
 //     special-casing.
 //
+
 // reflect_unify returns false on a structural-shape mismatch (pointer vs array,
 // different primitive, different struct name, arity mismatch), which is what
 // drives dead-branch elimination: the arm whose pattern does NOT unify with the
@@ -100,8 +101,112 @@ static Type* const_value_u32(uint64_t v) {
 // pointer concrete, an array pattern an array, etc. — so the two functions stay
 // in obvious correspondence, and a shape the pattern can't destructure fails the
 // same way a type inequality already does.
+// Shared core of every pack-tail: given `count` concrete element types, a
+// fixed prefix length, and the pack-tail's pattern hole, bundle every
+// remaining concrete element (zero or more, past the fixed prefix, which
+// each caller has already unified positionally itself -- struct fields and
+// fn params don't share a common unify-one-element accessor, so that part
+// stays in each case) into ONE freshly synthesized anon struct and bind it
+// to the tail hole. `is_overlapping` lets a union's Rest tail stay a union
+// rather than becoming a plain struct (see the struct case's own comment on
+// this below) -- the function case always passes false, since fn params
+// have no such concept.
+//
+// This is the one routine both TYPE_STRUCT's field-list pack tail and
+// TYPE_FUNCTION's param-list pack tail drive, rather than each hand-rolling
+// its own copy of "rebundle rest / bind" -- they differ only in how a
+// concrete element type is fetched at index i, which the caller supplies as
+// get_elem_type(ctx, i).
+typedef Type* (*PackElemGetter)(void* ctx, size_t i);
+
+static bool pack_tail_unify(size_t concrete_count, size_t fixed,
+                            Type* tail_pat, PackElemGetter get_elem_type,
+                            void* ctx, bool is_overlapping,
+                            ReflectBindings* out) {
+    if (concrete_count < fixed) return false;
+    if (!is_hole(tail_pat)) return false; // pack-tail slot must be a bare wildcard
+    size_t rest_n = concrete_count - fixed;
+    Type** rest_types = (Type**)malloc((rest_n ? rest_n : 1) * sizeof(Type*));
+    for (size_t i = 0; i < rest_n; i++) rest_types[i] = get_elem_type(ctx, fixed + i);
+    StructDef* rest_sd = Struct_MakeAnon(rest_types, rest_n, is_overlapping);
+    free(rest_types);
+    Type* rest_type = (Type*)calloc(1, sizeof(Type));
+    rest_type->cls = TYPE_STRUCT;
+    rest_type->struct_name = rest_sd->name;
+    return bind(out, tail_pat->param_name, rest_type);
+}
+
+static Type* fn_param_getter(void* ctx, size_t i) {
+    return ((Type*)ctx)->function.param_types[i];
+}
+
+// Build the DECLARED view of a struct's field list for type-pattern matching.
+// Struct_Layout stores a `super A base` field as its PROMOTED PREFIX (A's own
+// fields, spliced inline) followed by the packaged alias field, which shares the
+// prefix's storage. That dual representation is right for layout and for `d.tag`
+// lookup, but it makes reflection show a struct that does not exist:
+// `struct Derived { super Base info  u32 extra }` reflects as THREE fields
+// (u32, Base, u32) whose sizes sum to more than sizeof(Derived), because the
+// prefix and its package are both counted. A pattern should see the struct the
+// way it was written -- `Base`, then `u32` -- so collapse each alias's promoted
+// prefix back into the single `super` field it came from.
+static size_t declared_fields(StructDef* sd, StructField** out) {
+    size_t n = 0;
+    for (size_t i = 0; i < sd->field_count; i++) {
+        StructField* f = &sd->fields[i];
+        if (f->is_super_alias) {
+            uint32_t span = f->super_prefix_span;
+            if ((size_t)span <= n) n -= span;   // drop the prefix already emitted
+        }
+        out[n++] = f;
+    }
+    return n;
+}
+
+// One field slot of a struct type-pattern against one concrete field. Shared by
+// both anon-struct unify paths (pack-tail and strict-arity) so the `.name`
+// assertion rule lives in exactly one place rather than being inlined twice --
+// and so a later fn-param version can call the same routine.
+static bool field_slot_unify(StructField* concrete, StructField* pat, ReflectBindings* out) {
+    if (pat->name_asserted) {
+        if (!concrete->name || !pat->name) return false;
+        if (strcmp(concrete->name, pat->name) != 0) return false;
+    }
+    return reflect_unify(concrete->type, pat->type, out);
+}
+
 bool reflect_unify(Type* concrete, Type* pattern, ReflectBindings* out) {
     if (!concrete && !pattern) return true;
+
+    // ── Tagged nominal pattern: `struct M`, `struct M[X]`, `enum M[X]`, ... ──
+    // The tag states the KIND, which is the one fact brackets can never carry, so
+    // it is checked against the concrete declaration. The head then binds to the
+    // concrete's own template (left UNAPPLIED, so it stays usable as `M[u8]`
+    // later), and each bracket argument unifies pairwise against the concrete
+    // instantiation's type_args -- ordinary reflect_unify recursion, so nested
+    // tagged applications, wildcards and concrete args all work at any depth.
+    if (pattern && concrete && is_hole(pattern) && pattern->nominal_tag) {
+        if (concrete->cls != TYPE_STRUCT || !concrete->struct_name) return false;
+        StructDef* csd = Struct_Find(concrete->struct_name);
+        if (!csd) return false;
+
+        unsigned char actual = csd->is_enum ? 2 : csd->is_overlapping ? 3 : 1;
+        if (actual != pattern->nominal_tag) return false;   // kind assertion
+
+        StructDef* tmpl_sd = csd->generic_base ? csd->generic_base : csd;
+        size_t nargs = csd->generic_base ? csd->type_arg_count : 0;
+        if (pattern->app_arg_count != nargs) return false;  // arity from concrete
+
+        Type* tmpl = (Type*)calloc(1, sizeof(Type));
+        tmpl->cls = TYPE_STRUCT;
+        tmpl->struct_name = tmpl_sd->name;
+        tmpl->struct_unapplied = (nargs > 0);
+        if (!bind(out, pattern->param_name, tmpl)) return false;
+
+        for (size_t i = 0; i < nargs; i++)
+            if (!reflect_unify(csd->type_args[i], pattern->app_args[i], out)) return false;
+        return true;
+    }
 
     // Pattern hole: bind it to whatever the concrete side is here, and succeed.
     if (pattern && is_hole(pattern)) {
@@ -254,6 +359,28 @@ bool reflect_unify(Type* concrete, Type* pattern, ReflectBindings* out) {
         }
 
         case TYPE_FUNCTION: {
+            // Prototype: `fn(Fixed, Rest...) R` pack-tail, driven by the shared
+            // pack_tail_unify core above -- same routine the struct-field pack
+            // tail below drives, just fed function params via fn_param_getter
+            // instead of struct fields. Unify the fixed prefix positionally here
+            // first (pack_tail_unify only handles the rebundle+bind of the tail),
+            // then hand off.
+            if (pattern->function.pack_param_index >= 0) {
+                size_t fixed = (size_t)pattern->function.pack_param_index;
+                if (concrete->function.param_count < fixed) return false;
+                for (size_t i = 0; i < fixed; i++) {
+                    if (!reflect_unify(concrete->function.param_types[i],
+                                       pattern->function.param_types[i], out))
+                        return false;
+                }
+                if (!pack_tail_unify(concrete->function.param_count, fixed,
+                                     pattern->function.param_types[fixed],
+                                     fn_param_getter, (void*)concrete, false, out))
+                    return false;
+                return reflect_unify(concrete->function.return_type,
+                                     pattern->function.return_type, out);
+            }
+
             // `fn(A) B`: arg and return types unify positionally; arity must match.
             if (concrete->function.param_count != pattern->function.param_count)
                 return false;
@@ -309,14 +436,16 @@ bool reflect_unify(Type* concrete, Type* pattern, ReflectBindings* out) {
                 // needs no special-casing here.
                 if (ps->pack_field_index >= 0) {
                     size_t fixed = (size_t)ps->pack_field_index;
-                    if (cs->field_count < fixed) return false;
+                    StructField** dfs = (StructField**)malloc((cs->field_count ? cs->field_count : 1) * sizeof(StructField*));
+                    size_t dcount = declared_fields(cs, dfs);
+                    if (dcount < fixed) { free(dfs); return false; }
                     for (size_t i = 0; i < fixed; i++) {
-                        if (!reflect_unify(cs->fields[i].type, ps->fields[i].type, out))
-                            return false;
+                        if (!field_slot_unify(dfs[i], &ps->fields[i], out))
+                            { free(dfs); return false; }
                     }
-                    size_t rest_n = cs->field_count - fixed;
+                    size_t rest_n = dcount - fixed;
                     Type** rest_types = (Type**)malloc((rest_n ? rest_n : 1) * sizeof(Type*));
-                    for (size_t i = 0; i < rest_n; i++) rest_types[i] = cs->fields[fixed + i].type;
+                    for (size_t i = 0; i < rest_n; i++) rest_types[i] = dfs[fixed + i]->type;
                     StructDef* rest_sd;
                     if (cs->is_enum) {
                         // The tail of an ENUM's variant list is a smaller enum, not a
@@ -326,7 +455,7 @@ bool reflect_unify(Type* concrete, Type* pattern, ReflectBindings* out) {
                         // a valid reinterpretation of the SAME bytes as the concrete
                         // type, exactly like a struct-tail already is.
                         uint32_t* rest_tags = (uint32_t*)malloc((rest_n ? rest_n : 1) * sizeof(uint32_t));
-                        for (size_t i = 0; i < rest_n; i++) rest_tags[i] = cs->fields[fixed + i].variant_tag;
+                        for (size_t i = 0; i < rest_n; i++) rest_tags[i] = dfs[fixed + i]->variant_tag;
                         rest_sd = Struct_MakeAnonEnum(rest_types, rest_tags, rest_n);
                         free(rest_tags);
                     } else {
@@ -338,21 +467,24 @@ bool reflect_unify(Type* concrete, Type* pattern, ReflectBindings* out) {
                         // (is_overlapping is already false there).
                         rest_sd = Struct_MakeAnon(rest_types, rest_n, cs->is_overlapping);
                     }
-                    free(rest_types);
+                    free(rest_types); free(dfs);
                     Type* rest_type = (Type*)calloc(1, sizeof(Type));
                     rest_type->cls = TYPE_STRUCT;
                     rest_type->struct_name = rest_sd->name;
                     return reflect_unify(rest_type, ps->fields[fixed].type, out);
                 }
-                if (cs->field_count != ps->field_count) {
-                    return false;
-                }
-                for (size_t i = 0; i < ps->field_count; i++) {
-                    if (!reflect_unify(cs->fields[i].type, ps->fields[i].type, out)) {
-                        return false;
+                {
+                    StructField** dfs = (StructField**)malloc((cs->field_count ? cs->field_count : 1) * sizeof(StructField*));
+                    size_t dcount = declared_fields(cs, dfs);
+                    if (dcount != ps->field_count) { free(dfs); return false; }
+                    for (size_t i = 0; i < ps->field_count; i++) {
+                        if (!field_slot_unify(dfs[i], &ps->fields[i], out)) {
+                            free(dfs); return false;
+                        }
                     }
+                    free(dfs);
+                    return true;
                 }
-                return true;
             }
 
             if (cs && ps && cs->generic_base && ps->generic_base &&

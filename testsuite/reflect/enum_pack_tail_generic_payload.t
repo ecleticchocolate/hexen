@@ -12,16 +12,16 @@ enum Deep { Vec[i32, 4] Fixed4  Vec[i32, 8] Fixed8  bool Flag  u8* Name }
 
 fn count[T](u32 acc) u32 {
     match T {
-        enum { H h  Rest... r } { return count[Rest](acc + 1) }
-        enum {} { return acc }
+        enum { H; Rest... } { return count[Rest](acc + 1) }
+        enum {  } { return acc }
     }
 }
 
 fn find_const_generic[T](u32 acc) u32 {
     match T {
-        enum { Vec[E, N] h  Rest... r } { return acc }
-        enum { H h  Rest... r } { return find_const_generic[Rest](acc + 1) }
-        enum {} { return 999 }
+        enum { Vec[E, N]; Rest... } { return acc }
+        enum { H; Rest... } { return find_const_generic[Rest](acc + 1) }
+        enum {  } { return 999 }
     }
 }
 

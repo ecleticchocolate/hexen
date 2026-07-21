@@ -21,7 +21,7 @@ fn rebuilt[T]() u32 {
 }
 fn swap_shape[T]() u32 {
     match T {
-        struct { A a  B b } {
+        struct { A; B } {
             struct { B x  A y } flipped
             return sizeof(flipped)
         }
@@ -31,6 +31,6 @@ fn swap_shape[T]() u32 {
 fn main() i32 {
     printf("sizeof captured E   : %d\n", unwrapped_size[Box[i32]]())
     printf("construct Box[E]*N  : %d\n", rebuilt[u8[5]]())
-    printf("swapped field shape : %d\n", swap_shape[struct{i32 a  u8 b}]())
+    printf("swapped field shape : %d\n", swap_shape[struct{ i32; u8 }]())
     return 0
 }

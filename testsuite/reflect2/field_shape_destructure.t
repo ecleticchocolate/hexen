@@ -7,17 +7,17 @@ extern fn printf(u8* fmt, ...) i32
 struct Box[T] { T v }
 fn describe[T]() u32 {
     match T {
-        struct { Box[E] b } { return 1 }
-        struct { E[N] a }   { return 2 }
-        struct { P* p }     { return 3 }
-        struct { fn(A) B f }{ return 4 }
+        struct { Box[E] } { return 1 }
+        struct { E[N] }   { return 2 }
+        struct { P* }     { return 3 }
+        struct { fn(A) B }{ return 4 }
         else { return 0 }
     }
 }
 fn main() i32 {
-    printf("box field : %d\n", describe[struct{ Box[i32] b }]())
-    printf("arr field : %d\n", describe[struct{ u8[4] a }]())
-    printf("ptr field : %d\n", describe[struct{ i32* p }]())
-    printf("fn  field : %d\n", describe[struct{ fn(i32) u8 f }]())
+    printf("box field : %d\n", describe[struct{ Box[i32] }]())
+    printf("arr field : %d\n", describe[struct{ u8[4] }]())
+    printf("ptr field : %d\n", describe[struct{ i32* }]())
+    printf("fn  field : %d\n", describe[struct{ fn(i32) u8 }]())
     return 0
 }

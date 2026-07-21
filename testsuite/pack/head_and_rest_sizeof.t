@@ -1,7 +1,7 @@
 //@ expect val 6
 fn fields3[T](T x) u32 {
     match T {
-        struct { A a  Rest... r } { return (u32)sizeof(A) + (u32)sizeof(Rest) }
+        struct { A; Rest... } { return (u32)sizeof(A) + (u32)sizeof(Rest) }
         else { return 0 }
     }
 }

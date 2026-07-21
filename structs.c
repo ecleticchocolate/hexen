@@ -26,6 +26,9 @@ StructDef* Struct_Register(const char* name, size_t len) {
     StructDef* sd = calloc(1, sizeof(StructDef));
     sd->name = key;
     sd->laid_out = false;
+    // calloc would leave this 0, which reads as "type param 0 is the pack".
+    // Every struct starts with NO pack param; the parser sets it if it sees one.
+    sd->pack_type_param_index = -1;
     s_structs[s_struct_count++] = sd;
     return sd;
 }
@@ -225,9 +228,20 @@ StructDef* Struct_Instantiate(StructDef* gen, Type** targs, size_t targ_count) {
                 continue;
             }
 
+            // A `super BaseG[T] base` field was ALREADY spliced at parse time (its
+            // type is a TYPE_STRUCT, not a TYPE_PARAM, so the is_super_param path
+            // above never fires) -- the template therefore carries the promoted
+            // prefix plus the packaged alias, and the alias's is_super_alias /
+            // super_prefix_span are what tell Struct_Layout to point it at the
+            // prefix instead of giving it its own storage. Dropping them here made
+            // the instance lay the prefix and the package out SEQUENTIALLY: two
+            // copies of the base, silently diverging (d.base.x and the promoted d.x
+            // became different memory), and sizeof over-reporting by sizeof(Base).
             StructField f = { .name = gf->name, .type = subst_type,
                 .has_default = gf->has_default, .default_val_buf = gf->default_val_buf,
-                .variant_tag = gf->variant_tag };
+                .variant_tag = gf->variant_tag,
+                .is_super_alias = gf->is_super_alias,
+                .super_prefix_span = gf->super_prefix_span };
             Struct_AppendField(&inst->fields, &inst->field_count, &icap, f);
         }
     }

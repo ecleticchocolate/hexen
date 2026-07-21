@@ -18,14 +18,14 @@ enum Shape { i32 Circle  Point Rect  bool Flag  None }
 
 fn dump_fields[Orig, Walk, u32 N](Orig* p) void {
     match Walk {
-        struct { H h  Rest... r } {
+        struct { H; Rest... } {
             if N > 0 { printf(", ") }
             printf("%s=", nameof(Orig, N))
             H* fp = (H*)((u8*)p + offsetof(Orig, N))
             dump(fp)
             dump_fields[Orig, Rest, N + 1](p)
         }
-        struct {} {}
+        struct {  } {}
     }
 }
 
@@ -34,7 +34,7 @@ fn dump_fields[Orig, Walk, u32 N](Orig* p) void {
 // payload type/name (via Orig+N) and when to stop.
 fn dump_variant[Orig, Walk, u32 N](Orig* p, u32 tag) void {
     match Walk {
-        enum { H h  Rest... r } {
+        enum { H; Rest... } {
             if tag == N {
                 printf("%s", nameof(Orig, N))
                 match H {
@@ -50,7 +50,7 @@ fn dump_variant[Orig, Walk, u32 N](Orig* p, u32 tag) void {
                 dump_variant[Orig, Rest, N + 1](p, tag)
             }
         }
-        enum {} {}
+        enum {  } {}
     }
 }
 
@@ -62,11 +62,11 @@ fn dump[T](T* p) void {
         f32  { printf("%f", *p) }
         u8*  { printf("\"%s\"", *p) }
         impl { fn dump_self() } { p.dump_self() }
-        enum { H h  Rest... r } {
+        enum { H; Rest... } {
             u32 tag = *(u32*)p
             dump_variant[T, T, 0](p, tag)
         }
-        struct { H h  Rest... r } {
+        struct { H; Rest... } {
             printf("%s{", nameof(T))
             dump_fields[T, T, 0](p)
             printf("}")

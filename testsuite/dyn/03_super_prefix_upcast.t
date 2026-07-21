@@ -19,7 +19,7 @@ pub impl Derived { fn get() i32 { return self.x + self.extra } }
 
 struct Dyn[V] { void* obj  V vt }
 fn dyn[T, V](T* o, V... fns) Dyn[V] { return { .obj = (void*)o, .vt = fns } }
-alias Getter = struct { (fn(void*) i32) get }
+alias Getter = struct { fn(void*) i32 }
 fn t_get[T](void* p) i32 { T* o = (T*)p  return o.get() }
 
 fn main() i32 {
@@ -34,6 +34,6 @@ fn main() i32 {
     items[2] = dyn[Base, Getter]((Base*)&d, t_get[Base])       // upcast: Base_get reads d's prefix -> 20
 
     i32 sum = 0
-    for u32 i = 0 to 3 { sum = sum + items[i].vt.get(items[i].obj) }
+    for u32 i = 0 to 3 { sum = sum + items[i].vt._0(items[i].obj) }
     return sum      // 10 + 23 + 20 = 53
 }

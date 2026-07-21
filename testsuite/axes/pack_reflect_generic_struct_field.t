@@ -5,10 +5,10 @@
 struct Box[T] { T v }
 fn count_generic_fields[Walk, u32 N](u32 acc) u32 {
     match Walk {
-        struct { H head  Rest... rest } {
+        struct { H; Rest... } {
             return count_generic_fields[Rest, N + 1](acc + (u32)sizeof(H))
         }
-        struct {} { return acc }
+        struct {  } { return acc }
     }
 }
 struct Combo { Box[i32] a  Box[i32] b }

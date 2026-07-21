@@ -1,13 +1,13 @@
 //@ expect val 1233
 fn strict2[T](T x) u32 {
     match T {
-        struct { A a  Rest b } { return 1 }
+        struct { A; Rest } { return 1 }
         else { return 2 }
     }
 }
 fn peel2[T](T x) u32 {
     match T {
-        struct { A a  Rest... r } { return 3 }
+        struct { A; Rest... } { return 3 }
         else { return 4 }
     }
 }

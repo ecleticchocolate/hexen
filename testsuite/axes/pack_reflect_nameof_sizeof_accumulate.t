@@ -7,11 +7,11 @@ extern fn printf(u8* fmt, ...) i32
 // in the same recursive walk, not just one or the other as existing tests do.
 fn total_size[Orig, Walk, u32 N](u32 acc) u32 {
     match Walk {
-        struct { H head  Rest... rest } {
+        struct { H; Rest... } {
             printf("field %u: %s (size %u)\n", N, nameof(Orig, N), (u32)sizeof(H))
             return total_size[Orig, Rest, N + 1](acc + (u32)sizeof(H))
         }
-        struct {} { return acc }
+        struct {  } { return acc }
     }
 }
 struct Mixed { i32 a  f64 b  u8 c }
