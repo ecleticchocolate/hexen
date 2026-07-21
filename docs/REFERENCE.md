@@ -1,4 +1,4 @@
-# Hexen Language Reference
+"# Hexen Language Reference
 
 Terse, complete, no rationale. One construct per entry: signature, then a
 minimal example. For "why," see `specs.md`. For workflow, see `GUIDE.md`.
@@ -310,6 +310,21 @@ match T {
     else        { }
 }
 ```
+
+**Field names in a struct pattern ASSERT the field's name.** A bare name after a
+field type is not a label — it is a *comparison* on that field's real name, the
+same known-thing-compares rule applied to names:
+```
+match T {
+    struct { i32 count }  { }   // matches only a struct whose field 0 is named `count`
+    struct { i32 }        { }   // no name -> positional: field 0 is i32, any name
+    struct { E count }    { }   // E BINDS the type AND asserts the name is `count`
+    struct { A; B }       { }   // `;`-separated, no names -> pure positional/structural
+    struct { H; Rest... } { }   // structural peel: bind H, rebundle the tail
+}
+```
+Because names assert, a structural peel that must match *any* field names uses the
+no-name form (`struct { H; Rest... }`), not named fields.
 A repeated wildcard binds consistently (`fn(A) A` matches only when arg and
 return are the same type — the identical "already bound, now check" rule a
 repeated value in a value pattern would need).
@@ -888,7 +903,7 @@ struct Pair[T] { T a  T b }
 struct Widget { u8 tag  Pair[i32] data }
 fn dump[Orig, Walk, u32 N](i32 depth) void {
     match Walk {
-        struct { H head  Rest... rest } {
+        struct { H; Rest... } {                  // no-name form: names would ASSERT
             printf("%s %s\n", nameof(H), nameof(Orig, N))
             dump[Orig, Rest, N + 1](depth)
         }
@@ -1059,3 +1074,4 @@ gcc -o out aot_shim.c out.o          # link with the C entry-point shim to get a
 ./torrent file.t -- arg1 arg2        # args after -- go to your program's argv
 ./torrent -emit-mod out.tmod file.t  # write pub interface file
 ```
+"
