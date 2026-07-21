@@ -581,8 +581,14 @@ static void parse_generic_arg_list(const char** param_names, Type** param_kinds,
 // declared list, or -1 if it has none. Arguments before it bind positionally;
 // every remaining argument is bundled into ONE synthesized anonymous struct
 // bound to that slot -- the same Struct_MakeAnon call the `T... args` call-site
-// path already uses, so `Def[i32,u8,f64]` and `Def[struct{i32,u8,f64}]` produce
-// the identical instantiation and dedup against each other for free.
+// path already uses.
+//
+// The bundle is built from the arguments AS WRITTEN: `Def[i32,u8,f64]` bundles
+// three args into struct{i32,u8,f64}, while `Def[struct{i32;u8;f64}]` is a
+// ONE-arg application whose sole arg happens to be anonymous, bundled into
+// struct{struct{i32,u8,f64}}. These are DIFFERENT types and must stay so -- a
+// lone anonymous argument is never collapsed into the carrier (that would make
+// arity depend on an argument's anonymity; see construction_is_not_passthrough).
 static void parse_generic_arg_list_packed(const char** param_names, Type** param_kinds, size_t param_count,
                                     int pack_index,
                                     Type*** out_targs, size_t* out_tcount) {
