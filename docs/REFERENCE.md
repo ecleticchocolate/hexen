@@ -562,13 +562,29 @@ fn describe[M, T](HKT[M, T] h) i32 {
     }
 }
 ```
-A bound head applied to a **const-generic value** works too, via the stacked
-spelling `M[E][N]` — the second bracket is folded against the template's own
-declared parameter kind (so a value param is reachable through an HKT slot):
+**Const-generic value under a wildcard head.** A concrete head supplies each
+slot's kind from its declaration, so `Vec[E, N]` knows `N` is a value with no
+annotation. A **wildcard head** (`struct M[...]`) supplies no declaration — so to
+*use* a value slot as a value in the arm body, the pattern must state the value's
+type, with the same type-then-value grammar a declaration uses. Two spellings,
+the ordinary pin-vs-bind duality:
 ```
 struct Vec[T, u32 N] { T[N] e }
-match Vec[i32, 30] { M[E][N] { /* N is the value 30 */ } else { } }
+match S {
+    struct M[E, u32 N]  { /* PIN:  value-type u32 written; N usable as a value  */ }
+}
+struct Row[VT, T, VT N] { T[3] e }
+match S {
+    struct M[VT, E, VT N] { /* BIND: value-type -> VT; both VT (as type) and N   */ }
+}                          /*        (as value) usable in the body               */
 ```
+The trailing name binds the value; the type before it is its pin — checked
+against the concrete (`M[E, u32 N]` will not match a `u64`-typed slot). This is
+the one place in `match` where a type annotation is *required* rather than
+inferred, and for the same reason a `struct` tag is required on a wildcard head:
+the head cannot supply the fact, so the pattern must. A bare `struct M[E, N]`
+still matches and binds `N`, but `N` cannot be read as a value without the
+annotation.
 
 ### Nominal-kind tags in patterns
 
