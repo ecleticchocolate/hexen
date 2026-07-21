@@ -151,6 +151,11 @@ typedef struct Type {
     // against the concrete instantiation's own type_args.
     struct Type** app_args;
     size_t        app_arg_count;
+    // Index of a `Rest...` pack-tail among app_args (`struct M[H, Rest...]`), or
+    // -1 for none. The args before it bind positionally; every remaining concrete
+    // type-arg bundles into the tail hole, exactly as `Def[H, Rest...]` does for a
+    // named head. Set at parse time, consumed by reflect_unify's tagged-head path.
+    int           app_pack_idx;
     union {
         PrimitiveKind primitive;
         struct Type* pointer_base;

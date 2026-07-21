@@ -1310,6 +1310,7 @@ static Type* parse_tagged_nominal_type(Type* base_t, unsigned char tag) {
         // or another tagged application -- recursion falls out for free.
         if (s_curr.type == TOK_LBRACKET) {
             Type** args = NULL; size_t n = 0, cap = 0;
+            int pack_idx = -1;   // index of a `Rest...` tail among the args, or -1
             while (s_curr.type == TOK_LBRACKET) {
                 advance();
                 for (;;) {
@@ -1361,6 +1362,18 @@ static Type* parse_tagged_nominal_type(Type* base_t, unsigned char tag) {
                 if (!a) parse_error("Expected a type or value argument after '[' in a tagged nominal pattern");
                 if (n >= cap) { cap = cap ? cap * 2 : 4; args = (Type**)realloc(args, cap * sizeof(Type*)); }
                 args[n++] = a;
+                // `Rest...` -- a pack-tail wildcard, the bracket-position spelling
+                // of `struct { H; Rest... }`, now reaching the wildcard-head path
+                // too: `struct M[H, Rest...]`. The args before it bind positionally;
+                // every remaining concrete type-arg bundles into this tail.
+                if (s_in_match_pattern && s_curr.type == TOK_ELLIPSIS) {
+                    if (pack_idx != -1)
+                        parse_error("at most one `...` tail wildcard is allowed in a generic argument pattern");
+                    pack_idx = (int)(n - 1);
+                    advance();
+                    if (s_curr.type != TOK_RBRACKET)
+                        parse_error("a `...` tail wildcard must be the LAST generic argument in a pattern");
+                }
                 // `struct M[X, Y]` -- the ordinary comma-separated argument list,
                 // same as every other generic use site in the language. The stacked
                 // `struct M[X][Y]` spelling means exactly the same thing; both are
@@ -1382,6 +1395,7 @@ static Type* parse_tagged_nominal_type(Type* base_t, unsigned char tag) {
             // Multi-argument templates use the comma list: `struct M[E,F]`.
             base_t->app_args = args;
             base_t->app_arg_count = n;
+            base_t->app_pack_idx = pack_idx;
         }
         return base_t;
     }
