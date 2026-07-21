@@ -310,9 +310,27 @@ bool reflect_unify(Type* concrete, Type* pattern, ReflectBindings* out) {
     if (pattern->cls == TYPE_CONST_VALUE && pattern->cval.defer &&
         pattern->cval.defer->type == AST_IDENT) {
         const char* wname = pattern->cval.defer->ident.name;
-        if (concrete->cls == TYPE_CONST_VALUE)
-            return bind(out, wname, concrete);
-        return false; // value slot vs non-value concrete: shape mismatch
+        if (concrete->cls != TYPE_CONST_VALUE)
+            return false; // value slot vs non-value concrete: shape mismatch
+        // The value slot's TYPE is part of the type's identity: Vec[..u32 N..]
+        // and Wec[..u64 N..] are different types even at the same value. An
+        // explicit CONCRETE pin (`M[E, u32 N]`) must be CHECKED against the
+        // concrete's own value-type -- otherwise `M[E, u64 N]` wrongly matches a
+        // u32 slot. A bare/inferred pin (array-size `E[N]`) already carries the
+        // right type, so the check is a no-op there. A pin that is itself a
+        // WILDCARD (`M[VT, E, VT N]` -- bind the value-type to VT) is NOT checked
+        // here; it unifies as an ordinary type hole so VT binds the concrete's
+        // value-type, exactly like any other wildcard.
+        if (pattern->cval.pin && concrete->cval.pin) {
+            if (is_hole(pattern->cval.pin)) {
+                // bind the value-type wildcard (VT) to the concrete's value-type
+                if (!reflect_unify(concrete->cval.pin, pattern->cval.pin, out))
+                    return false;
+            } else if (!Type_Equals(pattern->cval.pin, concrete->cval.pin)) {
+                return false;   // explicit concrete pin must match
+            }
+        }
+        return bind(out, wname, concrete);
     }
 
     // A concrete param on the LEFT means the scrutinee itself is still abstract —

@@ -1330,6 +1330,33 @@ static Type* parse_tagged_nominal_type(Type* base_t, unsigned char tag) {
                     // all compose here for free. Hand-rolling the wildcard case
                     // instead would silently drop the postfix loop.
                     a = parse_type();
+                    // EXPLICIT VALUE SLOT: `<pin-type> <name>` -- the one
+                    // compromise. Under a WILDCARD head the parser cannot know a
+                    // slot is a const-generic value slot (the head M supplies no
+                    // declaration), so bare `M[E, N]` cannot use N as a value in
+                    // the arm body. Writing the value's type explicitly -- `M[E,
+                    // u32 N]` (pin) or `M[E, VT N]` (bind the value-type to VT) --
+                    // states the kind the head can't, mirroring the DECLARATION
+                    // spelling `Vec[T, u32 N]`. The trailing name is the value
+                    // binder; the parsed type `a` is its pin. Same type-then-value
+                    // grammar every binding site uses, reaching the one pattern
+                    // slot that could not otherwise express it.
+                    if (a && s_in_match_pattern && s_curr.type == TOK_IDENTIFIER) {
+                        Type* dummy;
+                        bool known = (param_kind_lookup(s_curr.start, s_curr.length, &dummy) >= 0);
+                        LexerState save; Lexer_Save(&save);
+                        Token idtok = s_curr;
+                        Token nxt = Lexer_NextToken();
+                        Lexer_Restore(&save);
+                        if (!known && (nxt.type == TOK_COMMA || nxt.type == TOK_RBRACKET)) {
+                            const char* wname = match_wildcard_lookup(idtok.start, idtok.length);
+                            if (!wname) wname = register_match_wildcard_kind(idtok.start, idtok.length, true);
+                            advance(); // consume the value-binder name
+                            Type* v = make_const_value_type(a);   // pin = the written type `a`
+                            v->cval.defer = make_ident_node(wname, strlen(wname), NULL);
+                            a = v;
+                        }
+                    }
                 }
                 if (!a) parse_error("Expected a type or value argument after '[' in a tagged nominal pattern");
                 if (n >= cap) { cap = cap ? cap * 2 : 4; args = (Type**)realloc(args, cap * sizeof(Type*)); }
