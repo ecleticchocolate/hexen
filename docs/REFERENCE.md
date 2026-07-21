@@ -407,12 +407,12 @@ fn matmul[T, u32 R, u32 K, u32 Cc](M[T, R, K] a, M[T, K, Cc] b) M[T, R, Cc] {
 }
 ```
 
-### Variadic packs
+### Variadic packs — `T... args` (value/call pack)
 
 ```
 fn f[T](T... args) i32 { ... }
 ```
-`T... args` bundles every trailing call argument into one synthesized
+`T... args` bundles every trailing **call argument** into one synthesized
 anonymous struct value. Peel one at a time via type-level `match`, recursing
 on the tail (`Rest`) until it's empty — the base case is the zero-field
 struct, not a count you track yourself:
@@ -429,6 +429,154 @@ fn pack_len[T](T dummy) u32 {
 ```
 The tail (`Rest...`) must be the last field in the pattern — it can't be
 followed by anything.
+
+### Type packs — `[Ts...]` (bracket pack)
+
+The bracket sibling of `T... args`. Where `T... args` bundles trailing *value*
+arguments written in **parens**, `Ts...` bundles trailing *type* arguments
+written in **brackets** — same construction, the other argument list. It is
+declared on every form that takes a generic list — `struct`, `enum`, `union`,
+`alias`, and `fn`:
+```
+struct Def[Ts...]      { Ts field  u32 n }
+enum   Sum[Ts...]      { Ts variant  None }
+alias  Row[Ts...]      = Def[Ts]
+fn     tuple[Ts...]()  u32 { ... }
+```
+`Ts` stays an ordinary **type** parameter; the `...` is a binding rule at the
+application site, not a new kind. Surplus bracket arguments bundle into one
+synthesized anonymous struct bound to that slot, so a single declaration serves
+**every arity** — `Def[i32]`, `Def[i32, u8, f64]`, `Def[]` all instantiate the
+one template. An `impl Def[T]` likewise covers every arity (bind the whole
+bundle as `T`).
+
+Three rules, all enforced at parse time:
+- the pack must be the **last** generic parameter (nothing after it could ever
+  receive an argument),
+- **at most one** pack per generic list,
+- it must be a **type** parameter — `[u32 Ns...]` (a pinned value pack) is
+  rejected; there is no value for a bracket pack to bundle (see the asymmetry
+  note below).
+
+Fixed parameters may precede the pack and bind positionally; a const-generic
+value parameter may too (`[u32 N, Ts...]`). Everything after the fixed prefix
+bundles.
+
+**A lone anonymous argument never collapses into the carrier.** The bundle is
+built from the arguments *as written*, so arity is how many arguments you wrote,
+never a function of one being anonymous:
+```
+Def[i32, u8, f64]        // 3 args -> carrier struct{i32,u8,f64}         -> arity 3
+Def[struct{i32;u8;f64}]  // 1 arg  -> carrier struct{struct{i32,u8,f64}} -> arity 1
+```
+These are **different types** and are never equated.
+
+**Destructuring** — `Def[H, Rest...]` peels the constructed carrier exactly like
+`struct { H; Rest... }` peels a written anon struct (same construct). `H` binds
+the first type argument, `Rest` rebundles the remainder, and `Def[Rest]`
+re-applies the generic to the tail, so a walk over an argument list recurses to
+the empty base case `Def[]`:
+```
+fn arity[X]() u32 {
+    match X {
+        Def[]           { return 0 }
+        Def[H, Rest...] { return 1 + arity[Def[Rest]]() }   // peel + recurse on tail
+        else            { return 999 }
+    }
+}
+```
+A lone type wildcard in a pack slot (`Def[E]`) binds the *whole* already-bundled
+carrier, so one arm still covers every arity — that is why `Def[E]` and
+`Def[H, Rest...]` mean different things, and why arm order matters (`Def[E]`
+above an explicit-tail arm shadows it).
+
+**Mixing value and type in one pattern.** A const-generic slot in a `match` on a
+type is matched **as a value** — there is no mode switch or keyword. The slot's
+world is decided *positionally, per slot*, from what the declaration made it: a
+slot the declaration wrote as `u32 N` is a value slot; a slot written as a type
+param is a type slot. So one arm can pin a value, bind a value, bind a type, and
+bind a type-pack tail all at once:
+```
+struct Def[u32 N, Us...] { Us fields }
+match X {
+    Def[0, Us...]       { }   // N pinned to the VALUE 0 ; Us binds the type pack
+    Def[N, Head, Rest...] { } // N value-bound ; Head type-bound ; Rest type-tail
+                             // (matches every N != 0 with at least one type arg;
+                             //  Rest may be empty)
+    Def[N, All]         { }   // N value-bound ; All binds the WHOLE bundle
+    else                { }
+}
+```
+One arm pins a value (`0`), binds a value (`N`), binds a type (`Head`), and binds
+a type-pack tail (`Rest`) — all decided per slot. This is the same "known thing
+is compared, unbound identifier is bound" rule the value and type matchers
+already share: value-match and type-match are not two features, they are one
+matcher whose slots take their kind from the declaration. (Arms are ordered,
+first match wins — a `Def[N, Head, Rest...]` with an empty `Rest` already covers
+the 1-argument case, so it shadows a later `Def[N, All]`; order accordingly.)
+
+**The asymmetry (why there is no value bracket pack).** `T... args` can bundle
+values because every value carries its own type; nothing is lost. `Ts...`
+bundles types, and a type has no value — so `Nums[1, 2, 3]` (values into a
+bracket pack) is a category error, not a missing feature. Value-parameterize
+with a const-generic before the pack (`[u32 N, Ts...]`) instead.
+
+### Higher-kinded parameters (unapplied templates)
+
+A generic parameter can bind a **still-generic template**, unapplied — no
+`[args]` — and the body applies it later:
+```
+struct Box[T]    { T val }
+struct HKT[M, T] { M[T] data }     // M binds a bare template; M[T] applies it
+
+HKT[Box, i32] h                    // M = Box (unapplied), then Box[i32] inside
+h.data = { .val = 5 }
+```
+`M` here is higher-kinded: it stands for a type *constructor*, not a type. `M[T]`
+in the body is the deferred application, routed through instantiation (not read
+as an array size). Arity is checked — a template applied to the wrong number of
+arguments is rejected.
+
+**Matching the head.** `match` on a higher-kinded parameter distinguishes *which*
+template it is bound to — the head is a first-class thing to pattern on:
+```
+fn describe[M, T](HKT[M, T] h) i32 {
+    match M {
+        Box  { return 1 }      // M is genuinely the bare template Box
+        else { return 0 }
+    }
+}
+```
+A bound head applied to a **const-generic value** works too, via the stacked
+spelling `M[E][N]` — the second bracket is folded against the template's own
+declared parameter kind (so a value param is reachable through an HKT slot):
+```
+struct Vec[T, u32 N] { T[N] e }
+match Vec[i32, 30] { M[E][N] { /* N is the value 30 */ } else { } }
+```
+
+### Nominal-kind tags in patterns
+
+A pattern can pin the **nominal kind** of a slot. Position decides what the
+keyword means: in a **type position** (`fn(struct Point)`, `struct Point p`) a
+leading `struct`/`enum`/`union` is a redundant C-style tag on an already-known
+type — accepted, carries no information. In a **match pattern** the *same*
+keyword is a meaningful **kind assertion**: `struct M[X]` matches only when the
+head is a struct, binds the head to `M` and its argument to `X`; `enum M[X]`
+matches only enums, and so on:
+```
+struct Box[T] { T v }
+enum   Opt[T] { T Some  None }
+match S {
+    enum   M[X] { }   // fires only if S's head is an ENUM  (Opt[..] yes, Box[..] no)
+    struct M[X] { }   // fires only if S's head is a STRUCT (Box[..] yes, Opt[..] no)
+    else        { }
+}
+```
+Tagged applications nest — the argument of one may be another tagged application,
+inner wildcards binding normally: `struct M[struct N[X]]` matches
+`Box[Wrap[u64]]` with `M=Box`, `N=Wrap`, `X=u64`. Where the kind is already
+known from context the tag is a no-op, so it never *hurts* to write it.
 
 ### Repeated wildcards and back-inference
 
