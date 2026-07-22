@@ -156,6 +156,14 @@ typedef struct Type {
     // type-arg bundles into the tail hole, exactly as `Def[H, Rest...]` does for a
     // named head. Set at parse time, consumed by reflect_unify's tagged-head path.
     int           app_pack_idx;
+    // True iff a `[...]` (even empty, `M[]`) followed the tagged wildcard head in
+    // source. Distinguishes `struct M` (bare -- "any struct, don't care about type
+    // args") from `struct M[]` (explicit -- "a struct with exactly zero type
+    // args"). Both parse to app_arg_count == 0 with app_args == NULL, so without
+    // this flag they are indistinguishable to reflect_unify. calloc'd false by
+    // default, so anywhere this Type node is built by any OTHER path it correctly
+    // reads as "no brackets were written."
+    bool          app_has_brackets;
     union {
         PrimitiveKind primitive;
         struct Type* pointer_base;
@@ -776,6 +784,7 @@ ConstDef* Const_GetAll(size_t* out_count);
 // Resolve any consts whose initializer was deferred (forward-referenced a later
 // fn). Returns false (and reports) if one still can't fold. Call after parsing.
 bool Const_ResolvePending(void);
+bool base_is_lvalue(ASTNode* node);
 
 // ─── globals needing byte-baking, regardless of which scope they were declared in ──
 // A `const` AGGREGATE is emitted as read-only global storage (it needs an address,

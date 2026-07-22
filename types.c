@@ -933,7 +933,35 @@ Type* Type_Substitute(Type* t, const char** params, Type** args, size_t n) {
     if (t->cls == TYPE_PARAM) {
         for (size_t i = 0; i < n; i++) {
             if (t->param_name && strcmp(t->param_name, params[i]) == 0) {
-                return args[i]; // replace with concrete type
+                Type* bound = args[i];
+                // Higher-kinded APPLICATION `M[A, B]`: M binds to a template
+                // (carried as a still-generic / deliberately-unapplied struct),
+                // and app_args are the type/value arguments to apply to it. Now
+                // that M's binding is known, substitute the args under the same
+                // frame and instantiate the template. Comma is the ONLY spelling
+                // (the chained `M[T][U]` form is gone).
+                if (t->app_has_brackets && bound && bound->cls == TYPE_STRUCT && bound->struct_name) {
+                    StructDef* tmpl = Struct_Find(bound->struct_name);
+                    if (tmpl && tmpl->is_generic && tmpl->type_param_count > 0) {
+                        size_t arity = tmpl->type_param_count;
+                        if (t->app_arg_count != arity) {
+                            fprintf(stderr, "Error: higher-kinded application of '%s' "
+                                            "expects %zu argument(s), got %zu\n",
+                                            tmpl->name, arity, t->app_arg_count);
+                            exit(1);
+                        }
+                        Type** sub_args = (Type**)malloc(arity * sizeof(Type*));
+                        for (size_t k = 0; k < arity; k++)
+                            sub_args[k] = Type_Substitute(t->app_args[k], params, args, n);
+                        StructDef* inst = Struct_Instantiate(tmpl, sub_args, arity);
+                        free(sub_args);
+                        Type* r = (Type*)calloc(1, sizeof(Type));
+                        r->cls = TYPE_STRUCT;
+                        r->struct_name = inst->name;
+                        return r;
+                    }
+                }
+                return bound; // replace with concrete type
             }
         }
         return t; // unbound param
@@ -1067,10 +1095,31 @@ Type* Type_Substitute(Type* t, const char** params, Type** args, size_t n) {
                     // exactly as it is in the parser's own key-building path -- rebuild
                     // it here too, or the substituted twin dedups onto the assertion-free
                     // `struct{i32}` and the `.name` check silently stops firing.
+                    // Preserve the field's real name here, not just a match-pattern's
+                    // `.name` assertion (name_asserted). A field that got a genuine
+                    // name at declaration (`struct { T name }`, incl. through an
+                    // `alias`) must keep it through substitution -- this is a
+                    // CONCRETE type rebuild (never a pattern; patterns go through
+                    // reflect_unify, not Type_Substitute), so name_asserted is
+                    // always false here even for perfectly ordinary named fields.
+                    // Gating on it alone silently demoted every such field to
+                    // positional the moment its type needed reallocating during
+                    // substitution (e.g. any function-pointer field always does,
+                    // since TYPE_FUNCTION is never returned unchanged). The only
+                    // fields that should stay nameless are the ones that truly
+                    // have no name -- the synthesized "_<index>" placeholder
+                    // parse_anonymous_aggregate_type/Struct_MakeAnon give an
+                    // omitted field, which this checks for explicitly so a real
+                    // field the user happened to call "_0" isn't misdetected.
+                    char synth[16];
+                    snprintf(synth, sizeof(synth), "_%zu", i);
+                    bool has_real_name = sd->fields[i].name &&
+                                          strcmp(sd->fields[i].name, synth) != 0;
+                    bool keep_name = sd->fields[i].name_asserted || has_real_name;
                     off += snprintf(namebuf + off, sizeof(namebuf) - off, "%s%s%s%s%s",
                                     (int)i == sd->pack_field_index ? "..." : "", tn,
-                                    sd->fields[i].name_asserted ? " ." : "",
-                                    sd->fields[i].name_asserted ? sd->fields[i].name : "",
+                                    keep_name ? " ." : "",
+                                    keep_name ? sd->fields[i].name : "",
                                     (i + 1 < fc) ? "," : "");
                 }
                 snprintf(namebuf + off, sizeof(namebuf) - off, "}");
@@ -2361,6 +2410,30 @@ Type* Type_MakePrim(int primitive_kind) { return make_prim((PrimitiveKind)primit
 // this fit?" without crashing the compiler on a "no" answer. check_assignable
 // itself (below) is the thin, fatal wrapper every existing call site keeps
 // using unchanged -- no dual logic, one real implementation.
+// Two ANONYMOUS structs/unions with the same field TYPES in the same order
+// (ignoring field names, and requiring the same overlapping-ness so a struct
+// never matches a union) are the same *shape* per REFERENCE.md's Type
+// grammar section, even though Type_Equals treats them as distinct types by
+// name (see that function's TYPE_STRUCT case, and parser.c's anonymous
+// struct naming comment, for why identity stays nominal-by-name elsewhere).
+// Used only to widen ASSIGNABILITY between two anonymous aggregates, never
+// to widen Type_Equals itself.
+static bool anon_structs_field_type_compatible(const Type* dst, const Type* src) {
+    if (dst->cls != TYPE_STRUCT || src->cls != TYPE_STRUCT) return false;
+    StructDef* dsd = Struct_Find(dst->struct_name);
+    StructDef* ssd = Struct_Find(src->struct_name);
+    if (!dsd || !ssd) return false;
+    if (!dsd->is_anonymous || !ssd->is_anonymous) return false;
+    if (dsd->is_overlapping != ssd->is_overlapping) return false;
+    if (dsd->field_count != ssd->field_count) return false;
+    for (size_t i = 0; i < dsd->field_count; i++) {
+        Type* dft = dsd->fields[i].type;
+        Type* sft = (dft->cls != TYPE_FN_LITERAL) ? fn_lit_shape(ssd->fields[i].type) : ssd->fields[i].type;
+        if (!Type_Equals(dft, sft)) return false;
+    }
+    return true;
+}
+
 static bool check_assignable_ne(Type* dst, ASTNode* src, const char* where) {
     // Type_Infer itself now hard-errors on AST_TYPE_EXPR (a bare type used in
     // value position -- see its case there for the full explanation), so this
@@ -2390,7 +2463,14 @@ static bool check_assignable_ne(Type* dst, ASTNode* src, const char* where) {
     // catches mismatches like Option[u32] = Option[bool].
 
     // tier 2: direct untyped literals adapt to dst if they fit.
-    if (is_null_literal(src)) return dst->cls == TYPE_POINTER;
+    // Function pointers (TYPE_FUNCTION) are pointer-like -- REFERENCE.md's
+    // "null is valid for any pointer type" doesn't carve out fn pointers,
+    // and they already support null-comparable identity (`==`/`!=`) and
+    // integer<->fnptr casts elsewhere in the type system. Previously only
+    // TYPE_POINTER was accepted here, so `fn(...) T x = null` and a null
+    // fn-pointer struct field both wrongly failed as "requires a pointer
+    // type" -- fixed by accepting TYPE_FUNCTION alongside TYPE_POINTER.
+    if (is_null_literal(src)) return dst->cls == TYPE_POINTER || dst->cls == TYPE_FUNCTION;
     if (is_untyped_int_literal(src)) {
         if (coerce_literal_to_target(src, dst)) return true; // int literal -> float slot
         if (dst->cls == TYPE_PRIMITIVE) return int_fits((int64_t)src->int_value, dst);
@@ -2409,6 +2489,24 @@ static bool check_assignable_ne(Type* dst, ASTNode* src, const char* where) {
     // nominal check below, since THAT position is exactly where identity is
     // supposed to matter.
     Type* cmp_st = (dst->cls != TYPE_FN_LITERAL) ? fn_lit_shape(st) : st;
+
+    // Two ANONYMOUS structs whose field TYPES match positionally are the
+    // same shape per REFERENCE.md's Type grammar section ("Identity is
+    // structural (keyed on field types): two anonymous structs with the
+    // same field types are the same type"). Type_Equals's nominal-by-name
+    // check (correct for every OTHER struct kind, and intentional even for
+    // anonymous structs at the type-identity/dedup level -- see its comment
+    // in parser.c) is stricter than that: `struct{run: fn(void*)i32}` and a
+    // pack-synthesized `struct{_0: fn(void*)i32}` get different struct_names
+    // even though the spec says they're the same type. That gap breaks
+    // REFERENCE.md's own "hand-built existential" showcase (a `V... fns`
+    // pack assigned into a named-field alias struct target), so treat it as
+    // an assignability relaxation here (like the primitive-coercion one
+    // below) rather than touching Type_Equals identity, which other code
+    // relies on for dedup and nominal named-struct behavior.
+    if (dst->cls == TYPE_STRUCT && cmp_st->cls == TYPE_STRUCT &&
+        anon_structs_field_type_compatible(dst, cmp_st)) return true;
+
     if (Type_Equals(dst, cmp_st)) return true;
     // User requested to relax the strict assignability check.
     // Allow implicit primitive coercions (like C).

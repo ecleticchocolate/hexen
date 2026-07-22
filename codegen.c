@@ -143,7 +143,7 @@ int Agg_Lanes(Type* t, uint64_t base, uint64_t* offs, uint64_t* ws, int n, int c
             if ((n = Agg_Lanes(sd->fields[f].type, base + sd->fields[f].offset, offs, ws, n, cap)) < 0) return -1;
         return n;
     }
-    if (t->cls != TYPE_PRIMITIVE || Type_IsFloat(t) || n >= cap) return -1;
+    if (t->cls != TYPE_PRIMITIVE || n >= cap) return -1;
     offs[n] = base; ws[n] = Type_Width(t);
     return n + 1;
 }

@@ -1305,14 +1305,21 @@ static Type* parse_tagged_nominal_type(Type* base_t, unsigned char tag) {
         base_t->cls = TYPE_PARAM;
         base_t->param_name = wname;
         base_t->nominal_tag = tag;
+        base_t->app_pack_idx = -1;  // no pack unless a bracket list below says so
         // Bracket arguments, if any, are the application's type arguments. They
         // are ordinary pattern types, so each may itself be concrete, a wildcard,
         // or another tagged application -- recursion falls out for free.
         if (s_curr.type == TOK_LBRACKET) {
+            base_t->app_has_brackets = true;
             Type** args = NULL; size_t n = 0, cap = 0;
             int pack_idx = -1;   // index of a `Rest...` tail among the args, or -1
             while (s_curr.type == TOK_LBRACKET) {
                 advance();
+                // `struct M[]` -- the empty base case a peeling recursion needs to
+                // terminate on, mirroring `Def[]` for a named head (n stays 0, no
+                // pack). Must be checked before the inner loop unconditionally
+                // tries to parse an argument.
+                if (s_curr.type == TOK_RBRACKET) { advance(); break; }
                 for (;;) {
                 // A bracket argument is a TYPE in the general case, but a template
                 // may declare a const-generic VALUE param (`Vec[T, u32 N]`), so a
@@ -1415,11 +1422,89 @@ static Type* parse_tagged_nominal_type(Type* base_t, unsigned char tag) {
     return parse_alias_or_type_param_type(base_t);
 }
 
+// Peek: with s_curr sitting on `[`, does THIS bracket group contain a
+// top-level comma before its matching `]`? Used to disambiguate a higher-kinded
+// application (`M[T, U]`, comma present) from an array-of-type-param (`T[N]`, no
+// comma) without consuming input. Nested `[`/`]` and `(`/`)` are skipped so an
+// inner array size or function type does not produce a false positive.
+static bool bracket_group_has_comma(void) {
+    ParseCheckpoint cp; parser_save(&cp);
+    bool found = false;
+    int depth = 0;
+    // s_curr is the opening '['.
+    for (;;) {
+        if (s_curr.type == TOK_EOF) break;
+        if (s_curr.type == TOK_LBRACKET || s_curr.type == TOK_LPAREN) depth++;
+        else if (s_curr.type == TOK_RPAREN) { if (depth > 0) depth--; }
+        else if (s_curr.type == TOK_RBRACKET) {
+            depth--;
+            if (depth == 0) break;   // matched the opening '['
+        }
+        else if (s_curr.type == TOK_COMMA && depth == 1) { found = true; break; }
+        // advance the lexer manually (can't use advance(): it has side effects
+        // like the `with`-switch machinery; a raw scan is what a peek needs).
+        s_curr = Lexer_NextToken();
+    }
+    parser_restore(&cp);
+    return found;
+}
+
 static Type* parse_alias_or_type_param_type(Type* base_t) {
     Type* tp = type_param_lookup(s_curr.start, s_curr.length);
     if (tp) {
         free(base_t);
         advance();
+        // Higher-kinded APPLICATION: `M[T, U]` where M is a bound template head.
+        // The one and only spelling is the comma list, identical to every other
+        // generic use site in the language. (The old stacked `M[T][U]` form is
+        // gone -- it was the sole place generics chained, and it is ambiguous
+        // with array-of syntax.)
+        //
+        // DISAMBIGUATION: `M[X]` (a single bracket arg) is AMBIGUOUS with an
+        // array-of-type-param (`T[N]` is "array of T, size N", ubiquitous), so a
+        // lone bracket is NOT taken as application here -- it falls through to the
+        // shared postfix array loop, and unary HKT resolves there / in
+        // Type_Substitute exactly as before. A COMMA, however, can only be an
+        // application: arrays never use comma (`i32[3,4]` is not valid; arrays
+        // chain as `i32[3][4]`). So we commit to the application path only when a
+        // comma is present -- 2+ comma-separated args. That keeps `T[N]` an array
+        // and makes `M[T, U]` an unambiguous higher-kinded application.
+        if (s_curr.type == TOK_LBRACKET && bracket_group_has_comma()) {
+            advance();
+            Type** args = NULL; size_t n = 0, cap = 0;
+            for (;;) {
+                Type* a = NULL;
+                Type* vpin = NULL;
+                bool is_value_param = (s_curr.type == TOK_IDENTIFIER &&
+                                       param_kind_lookup(s_curr.start, s_curr.length, &vpin) == 1);
+                if (s_curr.type == TOK_INTEGER) {
+                    // A const-generic VALUE argument written as a literal
+                    // (`M[T, 4]`): pin u32 and parse it, mirroring the value-arg
+                    // spelling used at every other generic application site.
+                    Type* pin = Type_MakePrim(PRIM_U32);
+                    a = parse_generic_value_arg(pin);
+                } else if (is_value_param) {
+                    // The arg names an in-scope VALUE param (`M[T, K]` where K is
+                    // a `u32 K` param): parse it as a value arg pinned to that
+                    // param's own type, so it threads as a const-generic value.
+                    a = parse_generic_value_arg(vpin ? vpin : Type_MakePrim(PRIM_U32));
+                } else {
+                    a = parse_type();
+                }
+                if (!a) parse_error("Expected a type or value argument after '[' in a higher-kinded application");
+                if (n >= cap) { cap = cap ? cap * 2 : 4; args = (Type**)realloc(args, cap * sizeof(Type*)); }
+                args[n++] = a;
+                if (s_curr.type == TOK_COMMA) { advance(); continue; }
+                if (s_curr.type != TOK_RBRACKET)
+                    parse_error("Expected ']' or ',' after a higher-kinded application argument");
+                advance();
+                break;
+            }
+            tp->app_args = args;
+            tp->app_arg_count = n;
+            tp->app_pack_idx = -1;
+            tp->app_has_brackets = true;
+        }
         return tp;
     }
     
@@ -2821,10 +2906,9 @@ static ASTNode* parse_expr_prec(int min_prec) {
 // bare identifier would be, since neither can ever fail to match.
 static bool pattern_covers_all(ASTNode* pat) {
     if (pat->type == AST_IDENT) return true;
-    // [GENERALIZE-LEAF] An lvalue-access leaf (`*x`, `x[i]`, `x.f`) is a total
-    // target -- assigning the projection into an existing place can never
-    // reject, exactly like a fresh bind can't. So it "covers all" too.
-    if (pat->type == AST_DEREF || pat->type == AST_INDEX || pat->type == AST_FIELD) return true;
+    // A `*name` leaf binds a fresh pointer into the slot -- irrefutable, like a
+    // bare name. (Other lvalue-access shapes are no longer binding leaves.)
+    if (pat->type == AST_DEREF && pat->unary && pat->unary->type == AST_IDENT) return true;
     if (pat->type == AST_STRUCT_LITERAL && !pat->struct_lit.is_enum_variant) {
         for (size_t i = 0; i < pat->struct_lit.count; i++)
             if (!pattern_covers_all(pat->struct_lit.values[i])) return false;
@@ -2859,29 +2943,27 @@ static ASTNode* make_tag_eq(ASTNode* scrut, int idx) {
 
 static void compile_pattern(ASTNode* pat, ASTNode* scrut, Type* scrut_type, ASTNode** out_cond, ASTNode*** out_decls, size_t* decl_count, size_t* decl_cap) {
     if (pat->type == AST_IDENT) {
-        // [GENERALIZE-LEAF] If the name ALREADY exists in scope, this is a
-        // destructuring-ASSIGNMENT into it, not a re-declaration (which would be
-        // an "already declared" error). Only a fresh name declares. This makes
-        // `unpack { a, b } = t` swap into existing a,b, and lets a bare existing
-        // var appear as a leaf alongside `*x`/`x[i]`/`x.f`.
-        Symbol* existing = SymTable_Find(s_symtable, pat->ident.name, pat->ident.name_len);
-        if (existing) {
-            // A switch pre-declared binder is registered with a NULL placeholder
-            // type (predeclare_binders). This is a fresh binding whose type we now
-            // know, not a destructure-assign into a pre-existing variable: patch the
-            // symbol's type and emit a real decl-init (matching the fresh-name path
-            // below), so the arm body sees a properly typed local.
-            if (existing->type == NULL) {
-                existing->type = scrut_type;
-                ASTNode* decl = make_decl_stmt(scrut_type, pat->ident.name, pat->ident.name_len, existing, scrut);
-                DA_PUSH(*out_decls, *decl_count, *decl_cap, decl);
-                return;
-            }
-            ASTNode* asn = new_node(AST_ASSIGN);
-            pat->ident.sym = existing;
-            asn->binary.left = pat;
-            asn->binary.right = scrut;
-            DA_PUSH(*out_decls, *decl_count, *decl_cap, asn);
+        // A pattern leaf DECLARES a fresh name (binds the slot's value to it). It
+        // may shadow an outer variable -- that's a normal fresh declaration in the
+        // pattern's own scope, NOT an assign-into the outer one (no lvalue swap).
+        // A predeclared binder (predeclare_binders) lives in the CURRENT scope with
+        // a NULL placeholder type -- patch it and emit the decl-init. Any other name
+        // (including one that shadows an outer variable) is a fresh declaration:
+        // SymTable_Add handles it, rejecting only a genuine same-scope duplicate.
+        // Shadowing an enclosing binding is legitimate (a match arm's own scope),
+        // so we must NOT walk parents here -- only the current table's predeclared
+        // slot counts as "already this binder".
+        Symbol* pre = NULL;
+        for (size_t i = 0; i < s_symtable->count; i++) {
+            Symbol* e = s_symtable->symbols[i];
+            if (e->name_len == pat->ident.name_len &&
+                strncmp(e->name, pat->ident.name, pat->ident.name_len) == 0 &&
+                e->type == NULL) { pre = e; break; }
+        }
+        if (pre) {
+            pre->type = scrut_type;
+            ASTNode* decl = make_decl_stmt(scrut_type, pat->ident.name, pat->ident.name_len, pre, scrut);
+            DA_PUSH(*out_decls, *decl_count, *decl_cap, decl);
             return;
         }
         SymbolKind kind = s_symtable->is_function_scope ? SYM_LOCAL : SYM_GLOBAL;
@@ -2891,21 +2973,33 @@ static void compile_pattern(ASTNode* pat, ASTNode* scrut, Type* scrut_type, ASTN
         return;
     }
 
-    // [GENERALIZE-LEAF] A pattern leaf that is an LVALUE ACCESS (`*x`, `x[i]`,
-    // `x.f`) rather than a fresh binder: instead of declaring a new name, ASSIGN
-    // the projected scrutinee into that existing place. This is destructuring-
-    // ASSIGNMENT (vs the AST_IDENT case's destructuring-DECLARATION). The leaf
-    // expression is used verbatim as the assign target -- it's already a valid
-    // lvalue by the same rules any `*x = e` / `a[i] = e` / `a.f = e` statement
-    // uses, so no new lvalue concept is introduced. Emitted as an AST_ASSIGN
-    // pushed onto the same decl list; the backend already lowers it.
-    if (pat->type == AST_DEREF || pat->type == AST_INDEX || pat->type == AST_FIELD) {
-        ASTNode* asn = new_node(AST_ASSIGN);
-        asn->binary.left = pat;      // the lvalue access, verbatim
-        asn->binary.right = scrut;   // the projected scrutinee value
-        DA_PUSH(*out_decls, *decl_count, *decl_cap, asn);
+    // The ONE hardcoded pattern feature: a `*name` leaf binds `name` as a POINTER
+    // INTO the projected slot (`name = &slot`), so `*name` reads and writes through
+    // the live element -- no copy. `name` is fresh (may shadow an outer var). A
+    // current-scope predeclared binder (NULL type) is patched; otherwise declared.
+    if (pat->type == AST_DEREF && pat->unary && pat->unary->type == AST_IDENT) {
+        const char* nm = pat->unary->ident.name;
+        size_t nml = pat->unary->ident.name_len;
+        Type* ptr_t = make_pointer_type(scrut_type);            // name : Slot*
+        ASTNode* addr = new_node(AST_ADDR); addr->unary = scrut; // &slot
+        Symbol* pre = NULL;
+        for (size_t i = 0; i < s_symtable->count; i++) {
+            Symbol* e = s_symtable->symbols[i];
+            if (e->name_len == nml && strncmp(e->name, nm, nml) == 0 && e->type == NULL) { pre = e; break; }
+        }
+        if (pre) {
+            pre->type = ptr_t;
+            ASTNode* decl = make_decl_stmt(ptr_t, nm, nml, pre, addr);
+            DA_PUSH(*out_decls, *decl_count, *decl_cap, decl);
+        } else {
+            SymbolKind kind = s_symtable->is_function_scope ? SYM_LOCAL : SYM_GLOBAL;
+            Symbol* sym = SymTable_Add(s_symtable, nm, nml, ptr_t, kind);
+            ASTNode* decl = make_decl_stmt(ptr_t, nm, nml, sym, addr);
+            DA_PUSH(*out_decls, *decl_count, *decl_cap, decl);
+        }
         return;
     }
+
     
     // Enum-variant pattern: `.Variant(payload)` (is_enum_variant=true, field_names[0]
     // = variant name, values[0] = payload sub-pattern if count==1) OR the designated-
@@ -3078,7 +3172,19 @@ ASTNode* Lower_Match(ASTNode* node, Type* st) {
 
     static int s_switch_ctr = 0;
     char* mname = malloc(32); int mn = snprintf(mname, 32, "$s%d", s_switch_ctr++);
-    Symbol* msym = SymTable_Add(s_symtable, mname, mn, st, kind);
+
+    // REFERENCE.md's `unpack`/`match` write-through contract: "Write-through
+    // reaches the original only when the scrutinee is itself addressable
+    // storage ... a real lvalue." To honor that, an lvalue scrutinee must be
+    // bound by REFERENCE ($s0 = &scrut, a pointer), not by value -- otherwise
+    // every `*name` leaf (see compile_pattern's AST_DEREF case, which takes
+    // &scrut of whatever node SREF() hands it) ends up aliasing a throwaway
+    // copy instead of the original, silently breaking the documented
+    // semantics. Non-lvalue scrutinees (call results, arithmetic, etc.) have
+    // no original to alias, so they keep the by-value temp path unchanged.
+    bool scrut_is_lvalue = base_is_lvalue(scrut);
+    Type* msym_type = scrut_is_lvalue ? make_pointer_type(st) : st;
+    Symbol* msym = SymTable_Add(s_symtable, mname, mn, msym_type, kind);
 
     MatchChain mc = matchchain_begin();
     ASTNode* outer = mc.outer;
@@ -3087,9 +3193,16 @@ ASTNode* Lower_Match(ASTNode* node, Type* st) {
     // ConstEval must not scope them away either -- so `const K = f()` where f
     // unpacks folds, matching the old parse-time lowering this replaced.
     if (node->match_stmt.is_unpack) outer->block.transparent = true;
-    matchchain_push_stmt(&mc, make_decl_stmt(st, mname, mn, msym, scrut));
+    if (scrut_is_lvalue) {
+        ASTNode* addr_of_scrut = new_node(AST_ADDR); addr_of_scrut->unary = scrut;
+        matchchain_push_stmt(&mc, make_decl_stmt(msym_type, mname, mn, msym, addr_of_scrut));
+    } else {
+        matchchain_push_stmt(&mc, make_decl_stmt(st, mname, mn, msym, scrut));
+    }
     #define SREF() ({ ASTNode* r = new_node(AST_IDENT); r->ident.name = mname; \
-                      r->ident.name_len = mn; r->ident.sym = msym; r; })
+                      r->ident.name_len = mn; r->ident.sym = msym; \
+                      scrut_is_lvalue ? ({ ASTNode* d = new_node(AST_DEREF); d->unary = r; d; }) : r; })
+
 
     StructDef* enum_sd = (st->cls == TYPE_STRUCT) ? Struct_Find(st->struct_name) : NULL;
     bool is_enum_match = enum_sd && enum_sd->is_enum;
@@ -3458,10 +3571,32 @@ static ASTNode* parse_unpack(void) {
 // fresh identifiers in binding position declare; literals / existing lvalues don't.
 static void predeclare_binders(ASTNode* pat) {
     if (!pat) return;
+    // A `*name` leaf declares `name` (a pointer INTO the projected slot). Predeclare
+    // with a NULL placeholder type; compile_pattern patches it to `slot*` once the
+    // scrutinee type is known.
+    if (pat->type == AST_DEREF && pat->unary && pat->unary->type == AST_IDENT) {
+        bool here = false;
+        for (size_t i = 0; i < s_symtable->count; i++) {
+            Symbol* e = s_symtable->symbols[i];
+            if (e->name_len == pat->unary->ident.name_len &&
+                strncmp(e->name, pat->unary->ident.name, pat->unary->ident.name_len) == 0) { here = true; break; }
+        }
+        if (!here) {
+            SymbolKind k = s_symtable->is_function_scope ? SYM_LOCAL : SYM_GLOBAL;
+            SymTable_Add(s_symtable, pat->unary->ident.name, pat->unary->ident.name_len, NULL, k);
+        }
+        return;
+    }
     if (pat->type == AST_IDENT) {
-        // A bare name that isn't already in scope is a fresh binder. (An existing
-        // name is a destructure-assignment target, not a new declaration.)
-        if (!SymTable_Find(s_symtable, pat->ident.name, pat->ident.name_len)) {
+        // A bare name binds fresh; may shadow an outer var. Predeclare it in the
+        // CURRENT scope unless it's already this scope's binder.
+        bool here = false;
+        for (size_t i = 0; i < s_symtable->count; i++) {
+            Symbol* e = s_symtable->symbols[i];
+            if (e->name_len == pat->ident.name_len &&
+                strncmp(e->name, pat->ident.name, pat->ident.name_len) == 0) { here = true; break; }
+        }
+        if (!here) {
             SymbolKind k = s_symtable->is_function_scope ? SYM_LOCAL : SYM_GLOBAL;
             SymTable_Add(s_symtable, pat->ident.name, pat->ident.name_len, NULL, k);
         }
@@ -3723,13 +3858,28 @@ static ASTNode* parse_forin_statement(void) {
     static int s_cur_ctr = 0; int id = s_cur_ctr++;
 
     char* itname = malloc(32); int itlen = snprintf(itname, 32, "$ci_it%d", id);
-    Symbol* itsym = SymTable_Add(s_symtable, itname, itlen, itype, kind);
+    // Same principle as Lower_Match's scrutinee fix above: if ITERABLE is
+    // already addressable storage (a plain variable, field, etc.), binding
+    // $it by VALUE copies it, so begin()'s internal pointers (e.g. `&self.
+    // arr[0]`) end up addressing the COPY, not the original -- any pointer
+    // the cursor yields (and thus any write-through the loop body performs)
+    // silently misses the real iterable. Binding by reference when possible
+    // keeps `self` inside begin()/next() aliased to the real original.
+    bool iter_is_lvalue = base_is_lvalue(iter);
+    Type* itsym_type = iter_is_lvalue ? make_pointer_type(itype) : itype;
+    Symbol* itsym = SymTable_Add(s_symtable, itname, itlen, itsym_type, kind);
     char* cname = malloc(32); int clen = snprintf(cname, 32, "$ci_cur%d", id);
     Symbol* csym = SymTable_Add(s_symtable, cname, clen, cur_type, kind);
 
-    // $it = ITERABLE
-    ASTNode* it_decl = make_decl_stmt(itype, itname, itlen, itsym, iter);
-    // $cur = $it.begin()
+    // $it = ITERABLE  (or  $it = &ITERABLE  when ITERABLE is an lvalue)
+    ASTNode* it_decl;
+    if (iter_is_lvalue) {
+        ASTNode* addr_of_iter = new_node(AST_ADDR); addr_of_iter->unary = iter;
+        it_decl = make_decl_stmt(itsym_type, itname, itlen, itsym, addr_of_iter);
+    } else {
+        it_decl = make_decl_stmt(itype, itname, itlen, itsym, iter);
+    }
+    // $cur = $it.begin()   -- auto-deref handles $it being a pointer here
     ASTNode* itref = make_ident_node(itname, itlen, itsym);
     ASTNode* bfield = new_node(AST_FIELD);
     bfield->field.base = itref;

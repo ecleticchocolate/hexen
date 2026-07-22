@@ -636,6 +636,25 @@ Sugar for a struct/array match arm that's known to always match — no
 Rejects anything refutable (a literal-pinned field, an enum-variant
 pattern) — use `match` for those.
 
+**Leaf binding.** A pattern leaf is a fresh name that binds the slot's value (a
+copy). It may shadow an outer variable. There is no assign-into-an-existing-
+variable form — a leaf always declares.
+
+**`*name` — write-through binding.** A leaf written `*name` binds `name` as a
+*pointer into the slot* (`name = &slot`), so `*name` reads and writes through the
+live element with no copy. This is the one hardcoded pattern feature, and it is
+shared by `match` and `unpack` alike (unpack is match-desugar), so `match` gets
+write-through with no `match&` qualifier and no references — the pointer is the
+alias, visible in the pattern:
+```
+unpack {.x=*px, .y=*py} = p          // px = &p.x ; *px writes through to p.x
+for unpack {.x=*px} in list { *px = 100 }   // mutates each element in place
+match b { {.v=*pv} { *pv = 100 } }   // write-through in a match arm, no match&
+```
+Write-through reaches the original only when the scrutinee is itself addressable
+storage (a pointer/reference the iterator yields, a real lvalue). A by-value
+scrutinee is copied into a temporary first, so `*name` then aliases the temp.
+
 ---
 
 ## `with` — declaration grouping
