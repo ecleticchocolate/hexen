@@ -33,6 +33,28 @@ fn main() i32 {
 
 ---
 
+## Function Default Arguments
+
+Parameters can specify `constexpr` default expressions (`= expr`). Trailing omitted arguments at call sites are automatically filled with their default values.
+
+```hexen
+fn connect(u8* host = "localhost", u16 port = 8080) i32 { ... }
+
+impl Server {
+    fn listen(u16 port = 8080, u32 max_clients = 100) bool { ... }
+}
+
+connect()            // Rewritten to connect("localhost", 8080)
+connect("127.0.0.1") // Rewritten to connect("127.0.0.1", 8080)
+```
+
+- **Compile-Time Constant Initializers**: Default expressions must be `constexpr` (literals, const symbols, `sizeof(T)`, constant math).
+- **Nominal / Call-Site Sugar**: Default arguments are evaluated at call sites when calling named functions/methods directly.
+- **Raw Function Pointers**: `fn(...)` raw pointer variables do not carry defaults; calling through a function pointer requires passing all positional parameters explicitly.
+- **Trailing Order**: All parameters with default values must come after non-default parameters.
+
+---
+
 ## Lexical
 
 ```
