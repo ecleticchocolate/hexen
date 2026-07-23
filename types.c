@@ -1071,9 +1071,28 @@ Type* Type_Substitute_Through_Instance(Type* t, StructDef* sd) {
 char* Method_Mangle(const Type* t, const char* mname, size_t mlen, size_t* out_len) {
     const Type* st = t;
     if (st && st->cls == TYPE_POINTER && st->pointer_base) st = st->pointer_base;
-    if (!st || st->cls != TYPE_STRUCT || !st->struct_name) return NULL;
-    StructDef* sd = Struct_Find(st->struct_name);
-    const char* base_name = (sd && sd->generic_base) ? sd->generic_base->name : st->struct_name;
+    if (!st) return NULL;
+    const char* base_name = NULL;
+    if (st->cls == TYPE_STRUCT && st->struct_name) {
+        StructDef* sd = Struct_Find(st->struct_name);
+        base_name = (sd && sd->generic_base) ? sd->generic_base->name : st->struct_name;
+    } else if (st->cls == TYPE_PRIMITIVE) {
+        switch (st->primitive) {
+            case PRIM_U8: base_name = "u8"; break;
+            case PRIM_U16: base_name = "u16"; break;
+            case PRIM_U32: base_name = "u32"; break;
+            case PRIM_U64: base_name = "u64"; break;
+            case PRIM_I8: base_name = "i8"; break;
+            case PRIM_I16: base_name = "i16"; break;
+            case PRIM_I32: base_name = "i32"; break;
+            case PRIM_I64: base_name = "i64"; break;
+            case PRIM_BOOL: base_name = "bool"; break;
+            case PRIM_F32: base_name = "f32"; break;
+            case PRIM_F64: base_name = "f64"; break;
+            default: break;
+        }
+    }
+    if (!base_name) return NULL;
     size_t blen = strlen(base_name);
     size_t manglen = blen + 1 + mlen;
     char* mangled = (char*)malloc(manglen + 1);
@@ -1141,14 +1160,15 @@ void try_rewrite_method_call(ASTNode* node) {
     }
     Type* bt = Type_Infer(field_node->field.base);
     Type* st = bt;
-    if (st && st->cls == TYPE_POINTER && st->pointer_base &&
-        st->pointer_base->cls == TYPE_STRUCT)
+    if (st && st->cls == TYPE_POINTER && st->pointer_base)
         st = st->pointer_base;
-    if (!st || st->cls != TYPE_STRUCT) return;
-    StructDef* sd = Struct_Find(st->struct_name);
-    StructField* f = sd ? Struct_FindField(sd, field_node->field.field_name,
-                                            field_node->field.field_name_len) : NULL;
-    if (f) return; // real field — leave to normal AST_FIELD resolution
+    if (!st) return;
+    if (st->cls == TYPE_STRUCT) {
+        StructDef* sd = Struct_Find(st->struct_name);
+        StructField* f = sd ? Struct_FindField(sd, field_node->field.field_name,
+                                                field_node->field.field_name_len) : NULL;
+        if (f) return; // real field — leave to normal AST_FIELD resolution
+    }
 
     size_t manglen = 0;
     char* mangled = Method_Mangle(st, field_node->field.field_name, field_node->field.field_name_len, &manglen);
@@ -1156,6 +1176,7 @@ void try_rewrite_method_call(ASTNode* node) {
     Symbol* msym = SymTable_Find(Get_SymTable(), mangled, manglen);
 
     ASTNode* base_arg = field_node->field.base;
+    StructDef* sd = (st->cls == TYPE_STRUCT) ? Struct_Find(st->struct_name) : NULL;
     StructDef* target_sd = sd;
 
     if ((!msym || msym->kind != SYM_FUNCTION) && sd) {

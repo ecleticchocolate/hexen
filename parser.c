@@ -3981,9 +3981,10 @@ static ASTNode* parse_top_level(void) {
 // Produces a block of normal AST_FUNC_DECL nodes — no new AST node type needed.
 static ASTNode* parse_impl_block(bool is_pub) {
     advance(); // consume 'impl'
-    if (s_curr.type != TOK_IDENTIFIER) parse_error("Expected type name after 'impl'");
+    if (s_curr.type != TOK_IDENTIFIER && !token_is_type_start(s_curr.type)) parse_error("Expected type name after 'impl'");
     const char* impl_type = strndup(s_curr.start, s_curr.length);
     size_t impl_type_len  = s_curr.length;
+    bool is_prim_impl     = token_is_type_start(s_curr.type);
     advance(); // consume type name
 
     // `impl` is a type site, and an alias is interchangeable with what it names
@@ -4090,6 +4091,9 @@ static ASTNode* parse_impl_block(bool is_pub) {
     size_t prev_impl_tparam_count  = s_type_param_count;
     char* impl_type_nul = strndup(impl_type, impl_type_len);
     StructDef* impl_sd = Struct_Find(impl_type_nul);
+    if (!impl_sd && !is_prim_impl) {
+        impl_sd = Struct_Register(impl_type_nul, strlen(impl_type_nul));
+    }
     free(impl_type_nul);
     if (impl_sd && impl_sd->type_param_count > 0) {
         s_type_params      = impl_sd->type_params;
@@ -4221,8 +4225,21 @@ static ASTNode* parse_fn_decl(bool is_pub, bool is_extern,
         if (impl_type_name) {
             // Inject self as first param (name "self"), type TYPE*.
             Type* self_base = (Type*)calloc(1, sizeof(Type));
-            self_base->cls = TYPE_STRUCT;
-            self_base->struct_name = impl_type_name;
+            if (strcmp(impl_type_name, "u8") == 0) { self_base->cls = TYPE_PRIMITIVE; self_base->primitive = PRIM_U8; }
+            else if (strcmp(impl_type_name, "u16") == 0) { self_base->cls = TYPE_PRIMITIVE; self_base->primitive = PRIM_U16; }
+            else if (strcmp(impl_type_name, "u32") == 0) { self_base->cls = TYPE_PRIMITIVE; self_base->primitive = PRIM_U32; }
+            else if (strcmp(impl_type_name, "u64") == 0) { self_base->cls = TYPE_PRIMITIVE; self_base->primitive = PRIM_U64; }
+            else if (strcmp(impl_type_name, "i8") == 0) { self_base->cls = TYPE_PRIMITIVE; self_base->primitive = PRIM_I8; }
+            else if (strcmp(impl_type_name, "i16") == 0) { self_base->cls = TYPE_PRIMITIVE; self_base->primitive = PRIM_I16; }
+            else if (strcmp(impl_type_name, "i32") == 0) { self_base->cls = TYPE_PRIMITIVE; self_base->primitive = PRIM_I32; }
+            else if (strcmp(impl_type_name, "i64") == 0) { self_base->cls = TYPE_PRIMITIVE; self_base->primitive = PRIM_I64; }
+            else if (strcmp(impl_type_name, "bool") == 0) { self_base->cls = TYPE_PRIMITIVE; self_base->primitive = PRIM_BOOL; }
+            else if (strcmp(impl_type_name, "f32") == 0) { self_base->cls = TYPE_PRIMITIVE; self_base->primitive = PRIM_F32; }
+            else if (strcmp(impl_type_name, "f64") == 0) { self_base->cls = TYPE_PRIMITIVE; self_base->primitive = PRIM_F64; }
+            else {
+                self_base->cls = TYPE_STRUCT;
+                self_base->struct_name = impl_type_name;
+            }
 
             Type* self_type = (Type*)calloc(1, sizeof(Type));
             self_type->cls = TYPE_POINTER;
