@@ -866,6 +866,13 @@ void AST_Dump(struct ASTNode* node, int depth);
 void  Typecheck_Tree(ASTNode* root); // eager pass: annotate every node's result_type (home for v1(b) checks)
 void  resolve_brace_literal(ASTNode* node, Type* target); // bind a bare `{...}` literal to its context type
 
+// --- Match Engine ---
+struct ASTNode* Lower_Match(struct ASTNode* node, struct Type* st);
+struct ASTNode* make_tag_eq(struct ASTNode* scrut, int idx);
+bool pattern_covers_all(struct ASTNode* pat);
+void compile_pattern(struct ASTNode* pat, struct ASTNode* scrut, struct Type* scrut_type, struct ASTNode** out_cond, struct ASTNode*** out_decls, size_t* decl_count, size_t* decl_cap);
+void predeclare_binders(struct ASTNode* pat);
+
 // --- Parser ---
 
 void Parse_Init(const char* filename, const char* source);
