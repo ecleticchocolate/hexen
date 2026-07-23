@@ -1443,6 +1443,24 @@ static Type* parse_type_ex(bool allow_array) {
             advance();
             break;
         }
+        case TOK_TYPEOF: {
+            advance();
+            if (s_curr.type != TOK_LPAREN) parse_error("expected '(' after typeof");
+            advance();
+            ASTNode* expr = parse_expr_prec(0);
+            if (!expr) parse_error("expected expression inside typeof(...)");
+            if (s_curr.type != TOK_RPAREN) parse_error("expected ')' after typeof expression");
+            advance();
+            free(base_t);
+
+            Typecheck_Tree(expr);
+            Type* inferred = Type_Infer(expr);
+            if (!inferred) {
+                parse_error("cannot infer type of expression in typeof(...)");
+            }
+            base_t = inferred;
+            break;
+        }
         case TOK_FN:
             parse_function_type(base_t);
             break;
@@ -1563,6 +1581,7 @@ static bool token_is_type_start(TokenType t) {
         case TOK_STRUCT:
         case TOK_UNION:
         case TOK_ENUM:
+        case TOK_TYPEOF:
             return true;
         case TOK_IMPL:
             // `impl {...}` is a type only as a MATCH PATTERN. Everywhere else `impl`

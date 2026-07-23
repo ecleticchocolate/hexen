@@ -179,6 +179,7 @@ Token Lexer_NextToken(void) {
         if (check_keyword(&tok, "alignof", TOK_ALIGNOF)) return tok;
         if (check_keyword(&tok, "offsetof", TOK_OFFSETOF)) return tok;
         if (check_keyword(&tok, "nameof", TOK_NAMEOF)) return tok;
+        if (check_keyword(&tok, "typeof", TOK_TYPEOF)) return tok;
         if (check_keyword(&tok, "true", TOK_TRUE)) return tok;
         if (check_keyword(&tok, "false", TOK_FALSE)) return tok;
         if (check_keyword(&tok, "null", TOK_NULL)) return tok;
