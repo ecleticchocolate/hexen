@@ -91,27 +91,29 @@ static Symbol* find_predeclared_symbol(const char* name, size_t name_len) {
     return NULL;
 }
 
-void compile_pattern(ASTNode* pat, ASTNode* scrut, Type* scrut_type, ASTNode** out_cond, ASTNode*** out_decls, size_t* decl_count, size_t* decl_cap) {
-    if (pat->type == AST_IDENT) {
-        Symbol* pre = find_predeclared_symbol(pat->ident.name, pat->ident.name_len);
-        SymbolKind kind = s_symtable->is_function_scope ? SYM_LOCAL : SYM_GLOBAL;
-        Symbol* sym = pre ? pre : SymTable_Add(s_symtable, pat->ident.name, pat->ident.name_len, scrut_type, kind);
-        if (pre) pre->type = scrut_type;
-        ASTNode* decl = make_decl_stmt(scrut_type, pat->ident.name, pat->ident.name_len, sym, scrut);
-        DA_PUSH(*out_decls, *decl_count, *decl_cap, decl);
-        return;
-    }
+static void append_condition(ASTNode** cond, ASTNode* eq) {
+    if (!*cond) { *cond = eq; return; }
+    ASTNode* and_node = new_node(AST_LOGICAL_AND);
+    and_node->binary.left = *cond;
+    and_node->binary.right = eq;
+    *cond = and_node;
+}
 
-    if (pat->type == AST_DEREF && pat->unary && pat->unary->type == AST_IDENT) {
-        const char* nm = pat->unary->ident.name;
-        size_t nml = pat->unary->ident.name_len;
-        Type* ptr_t = make_pointer_type(scrut_type);
-        ASTNode* addr = new_node(AST_ADDR); addr->unary = scrut;
+void compile_pattern(ASTNode* pat, ASTNode* scrut, Type* scrut_type, ASTNode** out_cond, ASTNode*** out_decls, size_t* decl_count, size_t* decl_cap) {
+    if (pat->type == AST_IDENT || (pat->type == AST_DEREF && pat->unary && pat->unary->type == AST_IDENT)) {
+        bool is_deref = (pat->type == AST_DEREF);
+        ASTNode* id_node = is_deref ? pat->unary : pat;
+        const char* nm = id_node->ident.name;
+        size_t nml = id_node->ident.name_len;
+        Type* bind_type = is_deref ? make_pointer_type(scrut_type) : scrut_type;
+        ASTNode* rhs = scrut;
+        if (is_deref) { ASTNode* a = new_node(AST_ADDR); a->unary = scrut; rhs = a; }
+
         Symbol* pre = find_predeclared_symbol(nm, nml);
         SymbolKind kind = s_symtable->is_function_scope ? SYM_LOCAL : SYM_GLOBAL;
-        Symbol* sym = pre ? pre : SymTable_Add(s_symtable, nm, nml, ptr_t, kind);
-        if (pre) pre->type = ptr_t;
-        ASTNode* decl = make_decl_stmt(ptr_t, nm, nml, sym, addr);
+        Symbol* sym = pre ? pre : SymTable_Add(s_symtable, nm, nml, bind_type, kind);
+        if (pre) pre->type = bind_type;
+        ASTNode* decl = make_decl_stmt(bind_type, nm, nml, sym, rhs);
         DA_PUSH(*out_decls, *decl_count, *decl_cap, decl);
         return;
     }
@@ -127,16 +129,7 @@ void compile_pattern(ASTNode* pat, ASTNode* scrut, Type* scrut_type, ASTNode** o
         int vidx = Enum_VariantIndex(sd, pat->struct_lit.field_names[0], pat->struct_lit.field_name_lens[0]);
         if (vidx < 0) parse_error("match arm names a variant this enum does not have");
 
-        ASTNode* eq = make_tag_eq(scrut, vidx);
-
-        if (*out_cond == NULL) {
-            *out_cond = eq;
-        } else {
-            ASTNode* and_node = new_node(AST_LOGICAL_AND);
-            and_node->binary.left = *out_cond;
-            and_node->binary.right = eq;
-            *out_cond = and_node;
-        }
+        append_condition(out_cond, make_tag_eq(scrut, vidx));
 
         if (pat->struct_lit.count == 1) {
             Type* ptype = sd->fields[vidx].type;
@@ -191,15 +184,7 @@ void compile_pattern(ASTNode* pat, ASTNode* scrut, Type* scrut_type, ASTNode** o
     ASTNode* eq = new_node(AST_EQ);
     eq->binary.left = scrut;
     eq->binary.right = pat;
-    
-    if (*out_cond == NULL) {
-        *out_cond = eq;
-    } else {
-        ASTNode* and_node = new_node(AST_LOGICAL_AND);
-        and_node->binary.left = *out_cond;
-        and_node->binary.right = eq;
-        *out_cond = and_node;
-    }
+    append_condition(out_cond, eq);
 }
 
 typedef struct {
