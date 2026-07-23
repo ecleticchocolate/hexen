@@ -846,86 +846,6 @@ static Type* count_expr_as_type_arg(ASTNode* count_expr, const char** params, Ty
     return NULL;
 }
 
-// `M[T][N]`, M an unapplied template: leftmost bracket is outermost (same
-// fold as u32[2][3]), so T (M's type arg) wraps N (a real array dim) --
-// backwards from what M[T] needs. Consumes `arity` brackets from the
-// outside in as type args; whatever's left wraps the instantiated result
-// as ordinary array dims. NULL (no-op) unless the base is confirmed a
-// still-generic template -- T[N]/Mat[T,R,C]{T[R][C]} never reach that.
-static Type* array_substitute_maybe_hkt(Type* t, const char** params, Type** args, size_t n) {
-    size_t depth = 0;
-    Type* base = t;
-    for (; base->cls == TYPE_ARRAY; base = base->array.element) depth++;
-    if (depth == 0) return NULL;
-
-    ASTNode** count_exprs = (ASTNode**)malloc(depth * sizeof(ASTNode*));
-    uint64_t* count_vals = (uint64_t*)malloc(depth * sizeof(uint64_t));
-    const char** size_params = (const char**)malloc(depth * sizeof(const char*));
-    size_t i = 0;
-    for (Type* cur = t; cur->cls == TYPE_ARRAY; cur = cur->array.element) {
-        count_vals[i] = cur->array.count;
-        size_params[i] = cur->array.size_param;
-        count_exprs[i++] = cur->array.count_expr;
-    }
-    Type* base_sub = Type_Substitute(base, params, args, n);
-
-    if (!base_sub || base_sub->cls != TYPE_STRUCT) { free(count_exprs); free(count_vals); free(size_params); return NULL; }
-    StructDef* esd = Struct_Find(base_sub->struct_name);
-    if (!esd || !esd->is_generic || esd->type_param_count == 0) { free(count_exprs); free(count_vals); free(size_params); return NULL; }
-    if (esd->type_param_count > depth) {
-        // A bare, deliberately-unapplied template (struct_unapplied, from an
-        // HKT slot) with FEWER brackets than its arity is under-applied -- an
-        // error, not a silent fallthrough that leaves it unapplied and
-        // zero-sized. An ordinary generic struct named as an array element
-        // (not struct_unapplied) is genuinely not an HKT here; leave it alone.
-        if (base_sub->struct_unapplied) {
-            fprintf(stderr, "Error: generic struct '%s' expects %zu type arguments, "
-                            "but is applied to only %zu here\n",
-                            esd->name, esd->type_param_count, depth);
-            exit(1);
-        }
-        free(count_exprs); free(count_vals); free(size_params); return NULL;
-    }
-
-    size_t arity = esd->type_param_count;
-    Type** type_args = (Type**)malloc(arity * sizeof(Type*));
-    for (size_t k = 0; k < arity; k++) {
-        Type* ta = count_expr_as_type_arg(count_exprs[k], params, args, n,
-                                          esd->param_kinds ? esd->param_kinds[k] : NULL,
-                                          count_vals[k], size_params[k]);
-        if (!ta) {
-            // A confirmed template short on type-shaped brackets (e.g. M[T][N]
-            // with M arity-2 and N a real value) is an arity error, not a
-            // silent fallthrough to "unapplied" -- that used to read as
-            // sizeof 0 instead of failing.
-            fprintf(stderr, "Error: generic struct '%s' expects %zu type arguments "
-                            "(used as %s[...] here), got fewer -- the remaining "
-                            "bracket(s) are not type-shaped\n",
-                            esd->name, arity, esd->name);
-            exit(1);
-        }
-        type_args[k] = ta;
-    }
-    StructDef* inst = Struct_Instantiate(esd, type_args, arity);
-    free(type_args);
-
-    // Rebuild any remaining OUTER-of-the-consumed-arity levels as genuine
-    // arrays (the brackets nearer the front that weren't needed for arity --
-    // for `M[T][N]` with a 1-ary M, arity consumes count_exprs[0]=T, leaving
-    // count_exprs[1]=N to wrap the instantiated result as a real array dim).
-    Type* result = (Type*)calloc(1, sizeof(Type));
-    result->cls = TYPE_STRUCT;
-    result->struct_name = inst->name;
-    for (size_t k = depth; k > arity; k--) {
-        Type* outer = (Type*)calloc(1, sizeof(Type));
-        outer->cls = TYPE_ARRAY;
-        outer->array.element = result;
-        fold_array_count(count_exprs[k - 1], params, args, n, &outer->array.count, &outer->array.count_expr);
-        result = outer;
-    }
-    free(count_exprs); free(count_vals); free(size_params);
-    return result;
-}
 
 // --- type substitution ---
 Type* Type_Substitute(Type* t, const char** params, Type** args, size_t n) {
@@ -937,30 +857,6 @@ Type* Type_Substitute(Type* t, const char** params, Type** args, size_t n) {
                 // Higher-kinded APPLICATION `M[A, B]`: M binds to a template
                 // (carried as a still-generic / deliberately-unapplied struct),
                 // and app_args are the type/value arguments to apply to it. Now
-                // that M's binding is known, substitute the args under the same
-                // frame and instantiate the template. Comma is the ONLY spelling
-                // (the chained `M[T][U]` form is gone).
-                if (t->app_has_brackets && bound && bound->cls == TYPE_STRUCT && bound->struct_name) {
-                    StructDef* tmpl = Struct_Find(bound->struct_name);
-                    if (tmpl && tmpl->is_generic && tmpl->type_param_count > 0) {
-                        size_t arity = tmpl->type_param_count;
-                        if (t->app_arg_count != arity) {
-                            fprintf(stderr, "Error: higher-kinded application of '%s' "
-                                            "expects %zu argument(s), got %zu\n",
-                                            tmpl->name, arity, t->app_arg_count);
-                            exit(1);
-                        }
-                        Type** sub_args = (Type**)malloc(arity * sizeof(Type*));
-                        for (size_t k = 0; k < arity; k++)
-                            sub_args[k] = Type_Substitute(t->app_args[k], params, args, n);
-                        StructDef* inst = Struct_Instantiate(tmpl, sub_args, arity);
-                        free(sub_args);
-                        Type* r = (Type*)calloc(1, sizeof(Type));
-                        r->cls = TYPE_STRUCT;
-                        r->struct_name = inst->name;
-                        return r;
-                    }
-                }
                 return bound; // replace with concrete type
             }
         }
@@ -1006,10 +902,6 @@ Type* Type_Substitute(Type* t, const char** params, Type** args, size_t n) {
     *c = *t;
     if (t->cls == TYPE_POINTER) c->pointer_base = Type_Substitute(t->pointer_base, params, args, n);
     else if (t->cls == TYPE_ARRAY) {
-        // M[T][N] on an unapplied template: see array_substitute_maybe_hkt.
-        Type* hkt = array_substitute_maybe_hkt(t, params, args, n);
-        if (hkt) return hkt;
-
         c->array.element = Type_Substitute(t->array.element, params, args, n);
         if (t->array.count_expr)
             fold_array_count(t->array.count_expr, params, args, n, &c->array.count, &c->array.count_expr);
@@ -1025,7 +917,7 @@ Type* Type_Substitute(Type* t, const char** params, Type** args, size_t n) {
             StructDef* new_sd = Struct_Instantiate(sd->generic_base, new_args, sd->type_arg_count);
             c->struct_name = new_sd->name;
             free(new_args);
-        } else if (sd && sd->is_generic && sd->type_param_count > 0 && !t->struct_unapplied) {
+        } else if (sd && sd->is_generic && sd->type_param_count > 0) {
             // Template struct (e.g. Box): if any of its type_params are in scope,
             // instantiate it with the substituted args. This handles `Box*` self
             // params (self's implicit type is a bare `TYPE_STRUCT{struct_name=Box}`

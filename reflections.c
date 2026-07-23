@@ -212,75 +212,7 @@ bool reflect_unify(Type* concrete, Type* pattern, ReflectBindings* out) {
     // The tag states the KIND, which is the one fact brackets can never carry, so
     // it is checked against the concrete declaration. The head then binds to the
     // concrete's own template (left UNAPPLIED, so it stays usable as `M[u8]`
-    // later), and each bracket argument unifies pairwise against the concrete
-    // instantiation's type_args -- ordinary reflect_unify recursion, so nested
-    // tagged applications, wildcards and concrete args all work at any depth.
-    if (pattern && concrete && is_hole(pattern) && pattern->nominal_tag) {
-        if (concrete->cls != TYPE_STRUCT || !concrete->struct_name) return false;
-        StructDef* csd = Struct_Find(concrete->struct_name);
-        if (!csd) return false;
 
-        unsigned char actual = csd->is_enum ? 2 : csd->is_overlapping ? 3 : 1;
-        if (actual != pattern->nominal_tag) return false;   // kind assertion
-
-        StructDef* tmpl_sd = csd->generic_base ? csd->generic_base : csd;
-        size_t nargs = csd->generic_base ? csd->type_arg_count : 0;
-
-        // Bare `struct M` (no brackets written at all) means "any struct,
-        // don't care about type args" -- skip the arg-count check below
-        // entirely rather than letting it silently inherit the "exactly
-        // zero args" requirement that only makes sense for an EXPLICIT
-        // `M[]`. Without this, `struct M` could never match a generic
-        // instantiation with any args, since app_arg_count defaults to 0
-        // whether or not `[...]` was actually written.
-        //
-        // An explicit `[...]` (even empty, `M[]`) asserts a real type-arg
-        // list, which only a generic instantiation has. A plain,
-        // non-generic struct has no type-arg list to be empty OR
-        // non-empty -- `nargs` above collapses that "not applicable" case
-        // to 0 for convenience elsewhere, but that must not let `M[]`
-        // coincidentally match every non-generic struct regardless of its
-        // field count. Require a real instantiation before the arg-count
-        // check is even meaningful.
-        if (pattern->app_has_brackets && !csd->generic_base) return false;
-
-        Type* tmpl = (Type*)calloc(1, sizeof(Type));
-        tmpl->cls = TYPE_STRUCT;
-        tmpl->struct_name = tmpl_sd->name;
-        tmpl->struct_unapplied = (nargs > 0);
-        if (!bind(out, pattern->param_name, tmpl)) return false;
-
-        if (!pattern->app_has_brackets) return true;
-
-        // `struct M[H, Rest...]` -- the wildcard-head sibling of the named-head
-        // pack destructure (`Def[H, Rest...]`), now reaching this path too. Flatten
-        // csd's own type_args first (its declared pack slot, if any, holds a
-        // pre-bundled carrier -- unpack it back to individual args), unify the
-        // fixed prefix positionally exactly as the no-pack case below already does,
-        // then hand the tail to the same pack_tail_unify core the fn-param and
-        // struct-field pack tails already share. A fixed slot ahead of the pack may
-        // itself be a const-generic VALUE (`struct M[u32 N, Ts...]`) -- that just
-        // works here, unchanged, because it unifies through the ordinary
-        // reflect_unify(TYPE_CONST_VALUE, ...) recursion like any other fixed slot.
-        if (pattern->app_pack_idx >= 0) {
-            size_t flat_n;
-            Type** flat = flatten_type_args(tmpl_sd, csd->type_args, nargs, &flat_n);
-            size_t fixed = (size_t)pattern->app_pack_idx;
-            bool ok = flat_n >= fixed;
-            for (size_t i = 0; ok && i < fixed; i++)
-                ok = reflect_unify(flat[i], pattern->app_args[i], out);
-            if (ok)
-                ok = pack_tail_unify(flat_n, fixed, pattern->app_args[fixed],
-                                     flat_args_getter, (void*)flat, false, out);
-            if (flat != csd->type_args) free(flat);
-            return ok;
-        }
-
-        if (pattern->app_arg_count != nargs) return false;  // arity from concrete
-        for (size_t i = 0; i < nargs; i++)
-            if (!reflect_unify(csd->type_args[i], pattern->app_args[i], out)) return false;
-        return true;
-    }
 
     // Pattern hole: bind it to whatever the concrete side is here, and succeed.
     if (pattern && is_hole(pattern)) {

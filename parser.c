@@ -1282,171 +1282,26 @@ static Type* parse_alias_or_type_param_type(Type* base_t);
 //   KNOWN name   -- the tag is redundant, so it is a no-op. It is still CHECKED
 //                   against the declaration's actual kind, because a tag that
 //                   can lie is worse than no tag.
-//   UNKNOWN name -- only reachable inside a pattern, where it is a wildcard. The
-//                   tag is REQUIRED here: it is the sole statement of intent that
-//                   distinguishes `struct M[X]` (template applied to X) from the
-//                   untagged `M[X]` (array of M sized X). Brackets are ambiguous;
-//                   tags are not. The asserted kind rides along on the node so
-//                   reflect_unify can check it against the concrete type.
 static const char* nominal_tag_name(unsigned char tag) {
     return tag == 1 ? "struct" : tag == 2 ? "enum" : "union";
 }
 
 static Type* parse_tagged_nominal_type(Type* base_t, unsigned char tag) {
     StructDef* sd = struct_find_by_token_text(s_curr.start, s_curr.length);
-
-    if (!sd && s_in_match_pattern &&
-        !type_param_lookup(s_curr.start, s_curr.length) &&
-        !alias_lookup(s_curr.start, s_curr.length)) {
-        // Unknown name under a tag: a nominal-head wildcard.
-        const char* wname = match_wildcard_lookup(s_curr.start, s_curr.length);
-        if (!wname) wname = register_match_wildcard(s_curr.start, s_curr.length);
-        advance();
-        base_t->cls = TYPE_PARAM;
-        base_t->param_name = wname;
-        base_t->nominal_tag = tag;
-        base_t->app_pack_idx = -1;  // no pack unless a bracket list below says so
-        // Bracket arguments, if any, are the application's type arguments. They
-        // are ordinary pattern types, so each may itself be concrete, a wildcard,
-        // or another tagged application -- recursion falls out for free.
-        if (s_curr.type == TOK_LBRACKET) {
-            base_t->app_has_brackets = true;
-            Type** args = NULL; size_t n = 0, cap = 0;
-            int pack_idx = -1;   // index of a `Rest...` tail among the args, or -1
-            while (s_curr.type == TOK_LBRACKET) {
-                advance();
-                // `struct M[]` -- the empty base case a peeling recursion needs to
-                // terminate on, mirroring `Def[]` for a named head (n stays 0, no
-                // pack). Must be checked before the inner loop unconditionally
-                // tries to parse an argument.
-                if (s_curr.type == TOK_RBRACKET) { advance(); break; }
-                for (;;) {
-                // A bracket argument is a TYPE in the general case, but a template
-                // may declare a const-generic VALUE param (`Vec[T, u32 N]`), so a
-                // literal like `[30]` must be accepted here and pinned as a value.
-                // Which slots are value slots is only knowable from the head, which
-                // is a wildcard -- so accept both spellings and let reflect_unify
-                // decide against the concrete instantiation's own type_args.
-                Type* a = NULL;
-                if (s_curr.type == TOK_INTEGER) {
-                    Type* pin = Type_MakePrim(PRIM_U32);
-                    a = parse_generic_value_arg(pin);
-                } else {
-                    // Everything else is an ordinary type production, parsed by the
-                    // one shared entry point -- so postfix (`E*`, `E[N]`), function
-                    // types, anonymous aggregates and further tagged applications
-                    // all compose here for free. Hand-rolling the wildcard case
-                    // instead would silently drop the postfix loop.
-                    a = parse_type();
-                    // EXPLICIT VALUE SLOT: `<pin-type> <name>` -- the one
-                    // compromise. Under a WILDCARD head the parser cannot know a
-                    // slot is a const-generic value slot (the head M supplies no
-                    // declaration), so bare `M[E, N]` cannot use N as a value in
-                    // the arm body. Writing the value's type explicitly -- `M[E,
-                    // u32 N]` (pin) or `M[E, VT N]` (bind the value-type to VT) --
-                    // states the kind the head can't, mirroring the DECLARATION
-                    // spelling `Vec[T, u32 N]`. The trailing name is the value
-                    // binder; the parsed type `a` is its pin. Same type-then-value
-                    // grammar every binding site uses, reaching the one pattern
-                    // slot that could not otherwise express it.
-                    if (a && s_in_match_pattern && s_curr.type == TOK_IDENTIFIER) {
-                        Type* dummy;
-                        bool known = (param_kind_lookup(s_curr.start, s_curr.length, &dummy) >= 0);
-                        LexerState save; Lexer_Save(&save);
-                        Token idtok = s_curr;
-                        Token nxt = Lexer_NextToken();
-                        Lexer_Restore(&save);
-                        if (!known && (nxt.type == TOK_COMMA || nxt.type == TOK_RBRACKET)) {
-                            const char* wname = match_wildcard_lookup(idtok.start, idtok.length);
-                            if (!wname) wname = register_match_wildcard_kind(idtok.start, idtok.length, true);
-                            advance(); // consume the value-binder name
-                            Type* v = make_const_value_type(a);   // pin = the written type `a`
-                            v->cval.defer = make_ident_node(wname, strlen(wname), NULL);
-                            a = v;
-                        }
-                    }
-                }
-                if (!a) parse_error("Expected a type or value argument after '[' in a tagged nominal pattern");
-                if (n >= cap) { cap = cap ? cap * 2 : 4; args = (Type**)realloc(args, cap * sizeof(Type*)); }
-                args[n++] = a;
-                // `Rest...` -- a pack-tail wildcard, the bracket-position spelling
-                // of `struct { H; Rest... }`, now reaching the wildcard-head path
-                // too: `struct M[H, Rest...]`. The args before it bind positionally;
-                // every remaining concrete type-arg bundles into this tail.
-                if (s_in_match_pattern && s_curr.type == TOK_ELLIPSIS) {
-                    if (pack_idx != -1)
-                        parse_error("at most one `...` tail wildcard is allowed in a generic argument pattern");
-                    pack_idx = (int)(n - 1);
-                    advance();
-                    if (s_curr.type != TOK_RBRACKET)
-                        parse_error("a `...` tail wildcard must be the LAST generic argument in a pattern");
-                }
-                // `struct M[X, Y]` -- the ordinary comma-separated argument list,
-                // same as every other generic use site in the language. The stacked
-                // `struct M[X][Y]` spelling means exactly the same thing; both are
-                // accepted so the tagged form does not need a grammar of its own.
-                if (s_curr.type == TOK_COMMA) { advance(); continue; }
-                if (s_curr.type != TOK_RBRACKET)
-                    parse_error("Expected ']' or ',' after a tagged nominal type argument");
-                advance();
-                break;
-                }
-                break;   // ONE argument group only -- see below
-            }
-            // Exactly one `[...]` carries the arguments; any further brackets are
-            // ordinary POSTFIX and belong to the shared grammar, exactly as they do
-            // for a concrete head. `Box[E][N]` means array-of-Box[E], so
-            // `struct M[E][N]` must mean the same thing -- letting the tagged form
-            // eat a second bracket as a second argument would make it the only
-            // production in the language where `[` changes meaning by position.
-            // Multi-argument templates use the comma list: `struct M[E,F]`.
-            base_t->app_args = args;
-            base_t->app_arg_count = n;
-            base_t->app_pack_idx = pack_idx;
-        }
-        return base_t;
+    if (!sd) {
+        char msg[256];
+        snprintf(msg, sizeof msg, "Unknown %s type '%.*s'", nominal_tag_name(tag), (int)s_curr.length, s_curr.start);
+        parse_error(msg);
     }
-
-    if (sd) {
-        // Known name: the tag must agree with how the type was actually declared.
-        unsigned char actual = sd->is_enum ? 2 : sd->is_overlapping ? 3 : 1;
-        if (actual != tag) {
-            char msg[256];
-            snprintf(msg, sizeof msg,
-                     "'%s' is declared as a %s, not a %s -- the tag must match the declaration",
-                     sd->name, nominal_tag_name(actual), nominal_tag_name(tag));
-            parse_error(msg);
-        }
+    unsigned char actual = sd->is_enum ? 2 : sd->is_overlapping ? 3 : 1;
+    if (actual != tag) {
+        char msg[256];
+        snprintf(msg, sizeof msg,
+                 "'%s' is declared as a %s, not a %s -- the tag must match the declaration",
+                 sd->name, nominal_tag_name(actual), nominal_tag_name(tag));
+        parse_error(msg);
     }
-    // Redundant tag on a known name (or an alias / type param): plain no-op.
     return parse_alias_or_type_param_type(base_t);
-}
-
-// Peek: with s_curr sitting on `[`, does THIS bracket group contain a
-// top-level comma before its matching `]`? Used to disambiguate a higher-kinded
-// application (`M[T, U]`, comma present) from an array-of-type-param (`T[N]`, no
-// comma) without consuming input. Nested `[`/`]` and `(`/`)` are skipped so an
-// inner array size or function type does not produce a false positive.
-static bool bracket_group_has_comma(void) {
-    ParseCheckpoint cp; parser_save(&cp);
-    bool found = false;
-    int depth = 0;
-    // s_curr is the opening '['.
-    for (;;) {
-        if (s_curr.type == TOK_EOF) break;
-        if (s_curr.type == TOK_LBRACKET || s_curr.type == TOK_LPAREN) depth++;
-        else if (s_curr.type == TOK_RPAREN) { if (depth > 0) depth--; }
-        else if (s_curr.type == TOK_RBRACKET) {
-            depth--;
-            if (depth == 0) break;   // matched the opening '['
-        }
-        else if (s_curr.type == TOK_COMMA && depth == 1) { found = true; break; }
-        // advance the lexer manually (can't use advance(): it has side effects
-        // like the `with`-switch machinery; a raw scan is what a peek needs).
-        s_curr = Lexer_NextToken();
-    }
-    parser_restore(&cp);
-    return found;
 }
 
 static Type* parse_alias_or_type_param_type(Type* base_t) {
@@ -1454,57 +1309,6 @@ static Type* parse_alias_or_type_param_type(Type* base_t) {
     if (tp) {
         free(base_t);
         advance();
-        // Higher-kinded APPLICATION: `M[T, U]` where M is a bound template head.
-        // The one and only spelling is the comma list, identical to every other
-        // generic use site in the language. (The old stacked `M[T][U]` form is
-        // gone -- it was the sole place generics chained, and it is ambiguous
-        // with array-of syntax.)
-        //
-        // DISAMBIGUATION: `M[X]` (a single bracket arg) is AMBIGUOUS with an
-        // array-of-type-param (`T[N]` is "array of T, size N", ubiquitous), so a
-        // lone bracket is NOT taken as application here -- it falls through to the
-        // shared postfix array loop, and unary HKT resolves there / in
-        // Type_Substitute exactly as before. A COMMA, however, can only be an
-        // application: arrays never use comma (`i32[3,4]` is not valid; arrays
-        // chain as `i32[3][4]`). So we commit to the application path only when a
-        // comma is present -- 2+ comma-separated args. That keeps `T[N]` an array
-        // and makes `M[T, U]` an unambiguous higher-kinded application.
-        if (s_curr.type == TOK_LBRACKET && bracket_group_has_comma()) {
-            advance();
-            Type** args = NULL; size_t n = 0, cap = 0;
-            for (;;) {
-                Type* a = NULL;
-                Type* vpin = NULL;
-                bool is_value_param = (s_curr.type == TOK_IDENTIFIER &&
-                                       param_kind_lookup(s_curr.start, s_curr.length, &vpin) == 1);
-                if (s_curr.type == TOK_INTEGER) {
-                    // A const-generic VALUE argument written as a literal
-                    // (`M[T, 4]`): pin u32 and parse it, mirroring the value-arg
-                    // spelling used at every other generic application site.
-                    Type* pin = Type_MakePrim(PRIM_U32);
-                    a = parse_generic_value_arg(pin);
-                } else if (is_value_param) {
-                    // The arg names an in-scope VALUE param (`M[T, K]` where K is
-                    // a `u32 K` param): parse it as a value arg pinned to that
-                    // param's own type, so it threads as a const-generic value.
-                    a = parse_generic_value_arg(vpin ? vpin : Type_MakePrim(PRIM_U32));
-                } else {
-                    a = parse_type();
-                }
-                if (!a) parse_error("Expected a type or value argument after '[' in a higher-kinded application");
-                if (n >= cap) { cap = cap ? cap * 2 : 4; args = (Type**)realloc(args, cap * sizeof(Type*)); }
-                args[n++] = a;
-                if (s_curr.type == TOK_COMMA) { advance(); continue; }
-                if (s_curr.type != TOK_RBRACKET)
-                    parse_error("Expected ']' or ',' after a higher-kinded application argument");
-                advance();
-                break;
-            }
-            tp->app_args = args;
-            tp->app_arg_count = n;
-            tp->app_pack_idx = -1;
-            tp->app_has_brackets = true;
-        }
         return tp;
     }
     
@@ -1547,12 +1351,9 @@ static Type* parse_alias_or_type_param_type(Type* base_t) {
     advance();
     if (sd->is_generic) {
         if (s_curr.type != TOK_LBRACKET) {
-            // No `[...]` -- a bare, deliberately unapplied template (e.g. `M`
-            // bound to `Box` in `HKT[Box, i32]`), not an error here.
-            base_t->cls = TYPE_STRUCT;
-            base_t->struct_name = sd->name;
-            base_t->struct_unapplied = true;
-            return base_t;
+            char msg[256];
+            snprintf(msg, sizeof msg, "Generic struct '%s' requires type arguments (e.g. %s[...])", sd->name, sd->name);
+            parse_error(msg);
         }
         advance();
         Type** targs; size_t tcount;
@@ -4478,20 +4279,18 @@ static ASTNode* parse_struct_decl_ex(bool is_enum, bool is_overlapping, bool is_
             // alias, or anything else a field type can be.
             Type* super_pt = parse_type();
             if (!super_pt) parse_error("Expected type name after 'super'");
-            if (super_pt->cls != TYPE_STRUCT && super_pt->cls != TYPE_PARAM)
-                parse_error("'super' type must be a struct/enum/union, or this template's own type parameter");
             if (s_curr.type != TOK_IDENTIFIER) parse_error("Expected field name after 'super TypeName'");
             Token super_field_name = s_curr;
             advance();
 
             char* base_name = strndup(super_field_name.start, super_field_name.length);
+            StructDef* super_sd = (super_pt->struct_name) ? Struct_Find(super_pt->struct_name) : NULL;
 
-            if (super_pt->cls == TYPE_PARAM) {
-                // `super T base` where T is still an unresolved type parameter of the
-                // enclosing generic template -- there is no StructDef to promote fields
-                // FROM yet (T isn't bound to anything until instantiation). Record just
-                // the `base`-shaped field (type T), flagged is_super_param, and defer the
-                // actual promotion-splice to Struct_Instantiate, once T is concrete.
+            if (!super_sd) {
+                // Unresolved type (type parameter T, HKT app M[T], dependent type) --
+                // there is no StructDef to promote fields FROM yet. Record just the
+                // `base`-shaped field, flag is_super_param, and defer the promotion-splice
+                // to Struct_Instantiate once concrete.
                 StructField f = { .name = base_name, .type = super_pt };
                 Struct_AppendField(&sd->fields, &sd->field_count, &cap, f);
                 sd->fields[sd->field_count - 1].is_super_param = true;
@@ -4500,9 +4299,6 @@ static ASTNode* parse_struct_decl_ex(bool is_enum, bool is_overlapping, bool is_
                 if (s_curr.type == TOK_SEMI) advance(); // optional separator
                 continue;
             }
-
-            StructDef* super_sd = Struct_Find(super_pt->struct_name);
-            if (!super_sd) parse_error("Unknown type after 'super'");
 
             for (size_t si = 0; si < super_sd->field_count; si++) {
                 Struct_AppendField(&sd->fields, &sd->field_count, &cap, super_sd->fields[si]);

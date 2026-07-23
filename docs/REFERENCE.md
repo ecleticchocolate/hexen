@@ -1,7 +1,27 @@
-"# Hexen Language Reference
+""# Hexen Language Reference
 
 Terse, complete, no rationale. One construct per entry: signature, then a
 minimal example. For "why," see `specs.md`. For workflow, see `GUIDE.md`.
+
+## Statement layout — READ FIRST
+
+**One statement per line.** Do not put two statements on the same line unless
+you genuinely have to. Cramming multiple statements onto one line is **not**
+idiomatic Hexen and should not be treated as the house style — much of the
+existing test corpus crams for brevity, but that is test shorthand, not a
+model to imitate. Write normal, one-per-line code.
+
+**Never put a second statement on a line when either statement dereferences.**
+A leading `*` (or `&`) at a statement boundary is **ambiguous with a binary
+operator against the previous expression**: `*px = 100  *py = 55` parses `100
+*py` as a multiplication, not as two write-through assignments. This is not a
+compiler bug — it is inherent to the grammar. Put each deref/write-through
+statement on its own line:
+
+```
+*px = 100
+*py = 55
+```
 
 ```
 extern fn printf(u8* fmt, ...) i32
@@ -1109,4 +1129,4 @@ gcc -o out aot_shim.c out.o          # link with the C entry-point shim to get a
 ./torrent file.t -- arg1 arg2        # args after -- go to your program's argv
 ./torrent -emit-mod out.tmod file.t  # write pub interface file
 ```
-"
+""

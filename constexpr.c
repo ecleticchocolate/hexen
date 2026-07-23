@@ -6,7 +6,13 @@
 
 // --- Named-constant registry (top-level, single namespace) ---
 
-static ConstDef* s_consts = NULL;
+// Stable storage: each ConstDef is individually heap-allocated and never moves,
+// so a ConstDef* handed out by Const_Register/Const_Find stays valid for the
+// life of the program. (Previously this was a contiguous array that realloc'd
+// on growth, invalidating every ConstDef* already stored in sym->cdef / pending
+// uses — a use-after-free the parser hit while resolving a const referenced
+// after the table had grown. Storing pointers, not inline structs, fixes it.)
+static ConstDef** s_consts = NULL;
 static size_t s_const_count = 0;
 static size_t s_const_capacity = 0;
 
@@ -30,27 +36,31 @@ void Global_RegisterForEmit(Symbol* sym) {
 size_t  Global_EmitCount(void)      { return s_emit_count; }
 Symbol* Global_EmitAt(size_t i)     { return (i < s_emit_count) ? s_emit_globals[i] : NULL; }
 
-ConstDef* Const_GetAll(size_t* out_count) {
-    if (out_count) *out_count = s_const_count;
-    return s_consts;
-}
+// Number of registered consts, and indexed access. (The old Const_GetAll
+// returned a flat ConstDef* array; storage is now a pointer-array, so callers
+// use Const_Count + Const_At instead of indexing a contiguous block.)
+size_t Const_Count(void) { return s_const_count; }
+ConstDef* Const_At(size_t i) { return (i < s_const_count) ? s_consts[i] : NULL; }
 
 ConstDef* Const_Find(const char* name, size_t len) {
     for (size_t i = 0; i < s_const_count; i++) {
-        if (strlen(s_consts[i].name) == len &&
-            strncmp(s_consts[i].name, name, len) == 0) {
-            return &s_consts[i];
+        if (strlen(s_consts[i]->name) == len &&
+            strncmp(s_consts[i]->name, name, len) == 0) {
+            return s_consts[i];
         }
     }
     return NULL;
 }
 
 ConstDef* Const_Register(const char* name, size_t len, int64_t value, Type* type) {
+    // The pointer-array may realloc/move on growth, but the ConstDef objects it
+    // points to never do — so previously handed-out ConstDef* stay valid.
     if (s_const_count >= s_const_capacity) {
         s_const_capacity = s_const_capacity ? s_const_capacity * 2 : 8;
-        s_consts = (ConstDef*)realloc(s_consts, s_const_capacity * sizeof(ConstDef));
+        s_consts = (ConstDef**)realloc(s_consts, s_const_capacity * sizeof(ConstDef*));
     }
-    ConstDef* c = &s_consts[s_const_count++];
+    ConstDef* c = (ConstDef*)calloc(1, sizeof(ConstDef));
+    s_consts[s_const_count++] = c;
     c->name = strndup(name, len);
     c->value = value;
     c->type = type;
@@ -87,15 +97,15 @@ bool Const_ResolvePending(void) {
     while (progress) {
         progress = false;
         for (size_t i = 0; i < s_const_count; i++) {
-            ConstDef* c = &s_consts[i];
+            ConstDef* c = s_consts[i];
             if (!c->pending_expr) continue;
             int64_t v;
             if (ConstEval(c->pending_expr, &v)) { c->value = v; c->pending_expr = NULL; progress = true; }
         }
     }
     for (size_t i = 0; i < s_const_count; i++) {
-        if (s_consts[i].pending_expr) {
-            fprintf(stderr, "Error: const '%s' initializer is not a constant expression\n", s_consts[i].name);
+        if (s_consts[i]->pending_expr) {
+            fprintf(stderr, "Error: const '%s' initializer is not a constant expression\n", s_consts[i]->name);
             return false;
         }
     }

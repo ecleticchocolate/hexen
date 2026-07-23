@@ -129,41 +129,6 @@ typedef enum {
 
 typedef struct Type {
     TypeClass cls;
-    // TYPE_STRUCT only: true iff this node names a still-generic template left
-    // DELIBERATELY unapplied (a "template template" argument, e.g. `M` bound to
-    // bare `Box` in `HKT[Box, i32]` -- Box is never instantiated here, just
-    // carried as a value). Set only at that one call-site path (parser.c's
-    // parse_generic_arg_list). Type_Substitute's TYPE_STRUCT case checks this to
-    // avoid its `Box*` self-param auto-completion firing by NAME COINCIDENCE on a
-    // node that was never meant to be completed at all.
-    bool struct_unapplied;
-    // A NOMINAL TAG (`struct`/`enum`/`union`) written before a type name.
-    // Optional and purely a no-op when the name is already known -- but still
-    // CHECKED, so `struct E` on an enum is an error rather than silently fine.
-    // When the name is UNKNOWN (a match wildcard), the tag is what makes the
-    // name readable as a nominal head at all: untagged `M[X]` stays an array
-    // pattern, tagged `struct M[X]` is a template application. The tag is the
-    // only place the kind can be stated, so it is required there, never guessed.
-    //   0 = no tag, 1 = struct, 2 = enum, 3 = union
-    unsigned char nominal_tag;
-    // TYPE_PARAM head of a tagged application (`struct M[X][Y]`): the bracket
-    // arguments, kept as pattern types so reflect_unify binds them pairwise
-    // against the concrete instantiation's own type_args.
-    struct Type** app_args;
-    size_t        app_arg_count;
-    // Index of a `Rest...` pack-tail among app_args (`struct M[H, Rest...]`), or
-    // -1 for none. The args before it bind positionally; every remaining concrete
-    // type-arg bundles into the tail hole, exactly as `Def[H, Rest...]` does for a
-    // named head. Set at parse time, consumed by reflect_unify's tagged-head path.
-    int           app_pack_idx;
-    // True iff a `[...]` (even empty, `M[]`) followed the tagged wildcard head in
-    // source. Distinguishes `struct M` (bare -- "any struct, don't care about type
-    // args") from `struct M[]` (explicit -- "a struct with exactly zero type
-    // args"). Both parse to app_arg_count == 0 with app_args == NULL, so without
-    // this flag they are indistinguishable to reflect_unify. calloc'd false by
-    // default, so anywhere this Type node is built by any OTHER path it correctly
-    // reads as "no brackets were written."
-    bool          app_has_brackets;
     union {
         PrimitiveKind primitive;
         struct Type* pointer_base;
@@ -780,7 +745,8 @@ typedef struct {
 
 ConstDef* Const_Register(const char* name, size_t len, int64_t value, Type* type);
 ConstDef* Const_Find(const char* name, size_t len);
-ConstDef* Const_GetAll(size_t* out_count);
+size_t Const_Count(void);
+ConstDef* Const_At(size_t i);
 // Resolve any consts whose initializer was deferred (forward-referenced a later
 // fn). Returns false (and reports) if one still can't fold. Call after parsing.
 bool Const_ResolvePending(void);
