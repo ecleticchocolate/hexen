@@ -82,23 +82,21 @@ ASTNode* make_tag_eq(ASTNode* scrut, int idx) {
     return eq;
 }
 
+static Symbol* find_predeclared_symbol(const char* name, size_t name_len) {
+    for (size_t i = 0; i < s_symtable->count; i++) {
+        Symbol* e = s_symtable->symbols[i];
+        if (e->name_len == name_len && strncmp(e->name, name, name_len) == 0 && e->type == NULL)
+            return e;
+    }
+    return NULL;
+}
+
 void compile_pattern(ASTNode* pat, ASTNode* scrut, Type* scrut_type, ASTNode** out_cond, ASTNode*** out_decls, size_t* decl_count, size_t* decl_cap) {
     if (pat->type == AST_IDENT) {
-        Symbol* pre = NULL;
-        for (size_t i = 0; i < s_symtable->count; i++) {
-            Symbol* e = s_symtable->symbols[i];
-            if (e->name_len == pat->ident.name_len &&
-                strncmp(e->name, pat->ident.name, pat->ident.name_len) == 0 &&
-                e->type == NULL) { pre = e; break; }
-        }
-        if (pre) {
-            pre->type = scrut_type;
-            ASTNode* decl = make_decl_stmt(scrut_type, pat->ident.name, pat->ident.name_len, pre, scrut);
-            DA_PUSH(*out_decls, *decl_count, *decl_cap, decl);
-            return;
-        }
+        Symbol* pre = find_predeclared_symbol(pat->ident.name, pat->ident.name_len);
         SymbolKind kind = s_symtable->is_function_scope ? SYM_LOCAL : SYM_GLOBAL;
-        Symbol* sym = SymTable_Add(s_symtable, pat->ident.name, pat->ident.name_len, scrut_type, kind);
+        Symbol* sym = pre ? pre : SymTable_Add(s_symtable, pat->ident.name, pat->ident.name_len, scrut_type, kind);
+        if (pre) pre->type = scrut_type;
         ASTNode* decl = make_decl_stmt(scrut_type, pat->ident.name, pat->ident.name_len, sym, scrut);
         DA_PUSH(*out_decls, *decl_count, *decl_cap, decl);
         return;
@@ -109,21 +107,12 @@ void compile_pattern(ASTNode* pat, ASTNode* scrut, Type* scrut_type, ASTNode** o
         size_t nml = pat->unary->ident.name_len;
         Type* ptr_t = make_pointer_type(scrut_type);
         ASTNode* addr = new_node(AST_ADDR); addr->unary = scrut;
-        Symbol* pre = NULL;
-        for (size_t i = 0; i < s_symtable->count; i++) {
-            Symbol* e = s_symtable->symbols[i];
-            if (e->name_len == nml && strncmp(e->name, nm, nml) == 0 && e->type == NULL) { pre = e; break; }
-        }
-        if (pre) {
-            pre->type = ptr_t;
-            ASTNode* decl = make_decl_stmt(ptr_t, nm, nml, pre, addr);
-            DA_PUSH(*out_decls, *decl_count, *decl_cap, decl);
-        } else {
-            SymbolKind kind = s_symtable->is_function_scope ? SYM_LOCAL : SYM_GLOBAL;
-            Symbol* sym = SymTable_Add(s_symtable, nm, nml, ptr_t, kind);
-            ASTNode* decl = make_decl_stmt(ptr_t, nm, nml, sym, addr);
-            DA_PUSH(*out_decls, *decl_count, *decl_cap, decl);
-        }
+        Symbol* pre = find_predeclared_symbol(nm, nml);
+        SymbolKind kind = s_symtable->is_function_scope ? SYM_LOCAL : SYM_GLOBAL;
+        Symbol* sym = pre ? pre : SymTable_Add(s_symtable, nm, nml, ptr_t, kind);
+        if (pre) pre->type = ptr_t;
+        ASTNode* decl = make_decl_stmt(ptr_t, nm, nml, sym, addr);
+        DA_PUSH(*out_decls, *decl_count, *decl_cap, decl);
         return;
     }
 
@@ -487,32 +476,23 @@ ASTNode* parse_unpack(void) {
     return node;
 }
 
+static void predeclare_single_ident(const char* name, size_t name_len) {
+    for (size_t i = 0; i < s_symtable->count; i++) {
+        Symbol* e = s_symtable->symbols[i];
+        if (e->name_len == name_len && strncmp(e->name, name, name_len) == 0) return;
+    }
+    SymbolKind k = s_symtable->is_function_scope ? SYM_LOCAL : SYM_GLOBAL;
+    SymTable_Add(s_symtable, name, name_len, NULL, k);
+}
+
 void predeclare_binders(ASTNode* pat) {
     if (!pat) return;
     if (pat->type == AST_DEREF && pat->unary && pat->unary->type == AST_IDENT) {
-        bool here = false;
-        for (size_t i = 0; i < s_symtable->count; i++) {
-            Symbol* e = s_symtable->symbols[i];
-            if (e->name_len == pat->unary->ident.name_len &&
-                strncmp(e->name, pat->unary->ident.name, pat->unary->ident.name_len) == 0) { here = true; break; }
-        }
-        if (!here) {
-            SymbolKind k = s_symtable->is_function_scope ? SYM_LOCAL : SYM_GLOBAL;
-            SymTable_Add(s_symtable, pat->unary->ident.name, pat->unary->ident.name_len, NULL, k);
-        }
+        predeclare_single_ident(pat->unary->ident.name, pat->unary->ident.name_len);
         return;
     }
     if (pat->type == AST_IDENT) {
-        bool here = false;
-        for (size_t i = 0; i < s_symtable->count; i++) {
-            Symbol* e = s_symtable->symbols[i];
-            if (e->name_len == pat->ident.name_len &&
-                strncmp(e->name, pat->ident.name, pat->ident.name_len) == 0) { here = true; break; }
-        }
-        if (!here) {
-            SymbolKind k = s_symtable->is_function_scope ? SYM_LOCAL : SYM_GLOBAL;
-            SymTable_Add(s_symtable, pat->ident.name, pat->ident.name_len, NULL, k);
-        }
+        predeclare_single_ident(pat->ident.name, pat->ident.name_len);
         return;
     }
     if (pat->type == AST_STRUCT_LITERAL) {
