@@ -525,6 +525,29 @@ static void check_assignable(Type* dst, ASTNode* src, const char* where);
 // the context type (decl, return, param, field, element). Recurses for nested
 // literals (a field/element value that is itself a bare `{...}`). No-op if the
 // node is already resolved or isn't a bare literal.
+void expand_call_default_args(ASTNode* node, ASTNode** pdefaults, size_t pcount, int pack_idx, Type** ptypes) {
+    if (!pdefaults || node->call.arg_count >= pcount) return;
+    size_t check_until = (pack_idx >= 0) ? (size_t)pack_idx : pcount;
+    if (node->call.arg_count >= check_until) return;
+
+    for (size_t k = node->call.arg_count; k < check_until; k++) {
+        if (!pdefaults[k]) return;
+    }
+
+    size_t fill_count = check_until;
+    ASTNode** expanded_args = (ASTNode**)realloc(node->call.args, fill_count * sizeof(ASTNode*));
+    if (expanded_args) {
+        node->call.args = expanded_args;
+        for (size_t k = node->call.arg_count; k < fill_count; k++) {
+            node->call.args[k] = clone_ast(pdefaults[k], NULL, NULL, 0, false);
+            if (ptypes && ptypes[k]) {
+                resolve_brace_literal(node->call.args[k], ptypes[k]);
+            }
+        }
+        node->call.arg_count = fill_count;
+    }
+}
+
 void resolve_brace_literal(ASTNode* node, Type* target) {
     if (!node || !target) return;
 
@@ -2883,32 +2906,7 @@ void Typecheck_Tree(ASTNode* node) {
                     ASTNode** pdefaults = fdecl_node ? fdecl_node->func_decl.param_defaults : NULL;
                     int pack_idx = fdecl_node ? fdecl_node->func_decl.pack_param_index : -1;
 
-                    if (pdefaults && node->call.arg_count < pcount) {
-                        bool all_missing_have_defaults = true;
-                        size_t check_until = (pack_idx >= 0) ? (size_t)pack_idx : pcount;
-                        for (size_t k = node->call.arg_count; k < check_until; k++) {
-                            if (!pdefaults[k]) {
-                                all_missing_have_defaults = false;
-                                break;
-                            }
-                        }
-                        if (all_missing_have_defaults) {
-                            size_t fill_count = check_until;
-                            if (node->call.arg_count < fill_count) {
-                                ASTNode** expanded_args = (ASTNode**)realloc(node->call.args, fill_count * sizeof(ASTNode*));
-                                if (expanded_args) {
-                                    node->call.args = expanded_args;
-                                    for (size_t k = node->call.arg_count; k < fill_count; k++) {
-                                        node->call.args[k] = clone_ast(pdefaults[k], NULL, NULL, 0, false);
-                                        if (ptypes && ptypes[k]) {
-                                            resolve_brace_literal(node->call.args[k], ptypes[k]);
-                                        }
-                                    }
-                                    node->call.arg_count = fill_count;
-                                }
-                            }
-                        }
-                    }
+                    expand_call_default_args(node, pdefaults, pcount, pack_idx, ptypes);
 
                     if (is_vararg) {
                         if (node->call.arg_count < pcount) {
@@ -3498,6 +3496,36 @@ static Symbol* clone_symbol(Symbol* s, const char** params, Type** args, size_t 
     return c;
 }
 
+static ASTNode* eval_const_in_frame(ASTNode* expr, const char** params, Type** args, size_t np, const char* err_msg) {
+    CeGenericFrame saved = ce_generic_frame_install(params, args, np);
+    int64_t v = 0;
+    s_ce_isfloat = false;
+    s_ce_isfnsym = false;
+    bool ok = ConstEval(expr, &v);
+    bool was_float = s_ce_isfloat;
+    bool was_fnsym = s_ce_isfnsym;
+    ce_generic_frame_restore(saved);
+
+    ASTNode* lit = (ASTNode*)calloc(1, sizeof(ASTNode));
+    lit->type = AST_INT_LITERAL;
+    if (!ok) {
+        if (err_msg) fprintf(stderr, "%s\n", err_msg);
+        lit->lit_kind = LIT_INT;
+        lit->int_value = 0;
+    } else if (was_float) {
+        lit->lit_kind = LIT_FLOAT;
+        double d; memcpy(&d, &v, sizeof d);
+        lit->float_value = d;
+    } else if (was_fnsym) {
+        lit->lit_kind = LIT_FN_SYMBOL;
+        lit->int_value = (uint64_t)v;
+    } else {
+        lit->lit_kind = LIT_INT;
+        lit->int_value = (uint64_t)v;
+    }
+    return lit;
+}
+
 ASTNode* clone_ast(ASTNode* n, const char** params, Type** args, size_t np, bool clone_symbols) {
     if (!n) return NULL;
     ASTNode* c = (ASTNode*)calloc(1, sizeof(ASTNode));
@@ -3509,31 +3537,13 @@ ASTNode* clone_ast(ASTNode* n, const char** params, Type** args, size_t np, bool
             break;
         case AST_SIZEOF:
         case AST_ALIGNOF:
-            c->sizeof_expr.type = Type_Substitute(n->sizeof_expr.type, params, args, np);
-            break;
-        case AST_OFFSETOF: {
-            Type* st = Type_Substitute(n->field_ref_expr.type, params, args, np);
-            c->field_ref_expr.type = st;
-            c->field_ref_expr.index_expr = clone_ast(n->field_ref_expr.index_expr, params, args, np, clone_symbols);
-            break;
-        }
-        case AST_NAMEOF: {
-            Type* st = Type_Substitute(n->field_ref_expr.type, params, args, np);
-            c->field_ref_expr.type = st;
-            c->field_ref_expr.index_expr = clone_ast(n->field_ref_expr.index_expr, params, args, np, clone_symbols);
-            break;
-        }
         case AST_TYPE_EXPR:
-            // Same field, same substitution as AST_SIZEOF right above — a bare
-            // type-param reference used as an expression (T == i32) must become
-            // fully concrete at monomorphization time, exactly like every other
-            // node that mentions a generic param. Without this, T stayed an
-            // abstract TYPE_PARAM reference all the way to codegen, which has
-            // no case for it at all (unlike AST_SIZEOF, which always folds away
-            // via ConstEval before codegen, or has its own real codegen case
-            // for the few situations where it can't) — that unconcretized node
-            // reaching compile_node_ctx was the actual cause of a real crash.
             c->sizeof_expr.type = Type_Substitute(n->sizeof_expr.type, params, args, np);
+            break;
+        case AST_OFFSETOF:
+        case AST_NAMEOF:
+            c->field_ref_expr.type = Type_Substitute(n->field_ref_expr.type, params, args, np);
+            c->field_ref_expr.index_expr = clone_ast(n->field_ref_expr.index_expr, params, args, np, clone_symbols);
             break;
         case AST_IDENT: {
             // Check if this ident refers to a const generic parameter
@@ -3661,98 +3671,18 @@ ASTNode* clone_ast(ASTNode* n, const char** params, Type** args, size_t np, bool
             c->decl.var_type = Type_Substitute(n->decl.var_type, params, args, np);
             c->decl.init_expr = clone_ast(n->decl.init_expr, params, args, np, clone_symbols);
             c->decl.sym = clone_symbol(n->decl.sym, params, args, np, clone_symbols);
-            // A `const` deferred from parse time because its initializer
-            // mentioned a generic param (see parser.c parse_const_decl). Now
-            // that this clone belongs to one concrete instantiation, params/args
-            // hold real values, so fold it the same way Type_Substitute folds a
-            // deferred TYPE_CONST_VALUE (types.c): same frame convention, same
-            // ConstEval call, just applied to a statement's init_expr instead of
-            // a type's count_expr. Bake the result in as a literal so any later
-            // use of this name within the clone (e.g. as an array size) sees a
-            // concrete, per-instantiation value instead of a runtime expr.
             if (n->decl.is_generic_const) {
-                CeGenericFrame saved = ce_generic_frame_install(params, args, np);
-                int64_t v;
-                s_ce_isfloat = false;
-                s_ce_isfnsym = false;
-                bool ok = ConstEval(c->decl.init_expr, &v);
-                bool was_float = s_ce_isfloat;
-                bool was_fnsym = s_ce_isfnsym;
-                ce_generic_frame_restore(saved);
-                if (!ok) {
-                    fprintf(stderr, "Error: const '%.*s' initializer is not a constant "
-                            "expression for this instantiation\n",
-                            (int)n->decl.name_len, n->decl.name);
-                } else {
-                    ASTNode* lit = (ASTNode*)calloc(1, sizeof(ASTNode));
-                    lit->type = AST_INT_LITERAL;
-                    // Same reasoning as AST_CONST_EXPR just below: a fn-typed
-                    // generic const folds to a Symbol* (constexpr.c), not a
-                    // real integer -- tag it so the backend resolves the
-                    // function's real address instead of moving the raw
-                    // pointer bits. (Note: this path doesn't yet handle
-                    // was_float the way AST_CONST_EXPR does -- pre-existing
-                    // gap, out of scope for this fix.)
-                    if (was_fnsym) {
-                        lit->lit_kind = LIT_FN_SYMBOL;
-                        lit->int_value = (uint64_t)v;
-                    } else {
-                        lit->int_value = v;
-                    }
-                    lit->result_type = c->decl.var_type;
-                    c->decl.init_expr = lit;
-                }
+                char err_buf[256];
+                snprintf(err_buf, sizeof(err_buf), "Error: const '%.*s' initializer is not a constant expression for this instantiation", (int)n->decl.name_len, n->decl.name);
+                ASTNode* lit = eval_const_in_frame(c->decl.init_expr, params, args, np, err_buf);
+                lit->result_type = c->decl.var_type;
+                c->decl.init_expr = lit;
             }
             break;
         }
         case AST_CONST_EXPR: {
-            // const(EXPR) inside a generic body: the fold was deferred at parse time
-            // because EXPR mentions an in-scope generic param, and the template is
-            // parsed once, before any instantiation exists. Now that this clone
-            // belongs to ONE concrete instantiation, fold it -- same frame
-            // convention and same ConstEval call the deferred `is_generic_const`
-            // declaration path above uses, just yielding an expression instead of a
-            // statement's initializer.
-            //
-            // NOTE this replaces the AST_CONST_EXPR node with the folded literal, so
-            // nothing downstream ever sees this node kind -- const(...) leaves no
-            // trace in the tree and emits no code, exactly like a scalar const.
-            CeGenericFrame saved = ce_generic_frame_install(params, args, np);
-            int64_t v = 0;
-            s_ce_isfloat = false;
-            s_ce_isfnsym = false;
-            bool ok = ConstEval(n->const_expr.inner, &v);
-            bool was_float = s_ce_isfloat;
-            bool was_fnsym = s_ce_isfnsym;
-            ce_generic_frame_restore(saved);
-            if (!ok) {
-                fprintf(stderr, "Error: const(...) operand is not a constant "
-                                "expression for this instantiation\n");
-                c->type = AST_INT_LITERAL;
-                c->lit_kind = LIT_INT;
-                c->int_value = 0;
-            } else {
-                // Rewrite this node in place as the folded literal. Float-ness must
-                // be preserved: a comptime float travels as IEEE-754 bits in the
-                // int64 slot, so emit LIT_FLOAT (bitcast back) rather than an
-                // integer that happens to hold that bit pattern. Same reasoning
-                // for fn-symbol-ness: const(Op) on a fn-typed const generic
-                // param folds to a Symbol* (constexpr.c), not a real integer —
-                // emit LIT_FN_SYMBOL so the backend resolves it to the
-                // function's real address instead of moving the raw pointer.
-                c->type = AST_INT_LITERAL;
-                if (was_float) {
-                    c->lit_kind = LIT_FLOAT;
-                    double d; memcpy(&d, &v, sizeof d);
-                    c->float_value = d;
-                } else if (was_fnsym) {
-                    c->lit_kind = LIT_FN_SYMBOL;
-                    c->int_value = (uint64_t)v;
-                } else {
-                    c->lit_kind = LIT_INT;
-                    c->int_value = (uint64_t)v;
-                }
-            }
+            ASTNode* lit = eval_const_in_frame(n->const_expr.inner, params, args, np, "Error: const(...) operand is not a constant expression for this instantiation");
+            *c = *lit;
             break;
         }
         case AST_BLOCK: {

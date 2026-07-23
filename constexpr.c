@@ -913,25 +913,7 @@ static bool ce_eval_call(ASTNode* node, int64_t* out) {
             }
             if (fn->func_decl.type_param_count > 0) return false; // still generic after the above: not foldable
 
-            if (fn->func_decl.param_defaults && node->call.arg_count < fn->func_decl.param_count) {
-                bool all_missing_have_defaults = true;
-                for (size_t k = node->call.arg_count; k < fn->func_decl.param_count; k++) {
-                    if (!fn->func_decl.param_defaults[k]) {
-                        all_missing_have_defaults = false;
-                        break;
-                    }
-                }
-                if (all_missing_have_defaults) {
-                    ASTNode** expanded_args = (ASTNode**)realloc(node->call.args, fn->func_decl.param_count * sizeof(ASTNode*));
-                    if (expanded_args) {
-                        node->call.args = expanded_args;
-                        for (size_t k = node->call.arg_count; k < fn->func_decl.param_count; k++) {
-                            node->call.args[k] = clone_ast(fn->func_decl.param_defaults[k], NULL, NULL, 0, false);
-                        }
-                        node->call.arg_count = fn->func_decl.param_count;
-                    }
-                }
-            }
+            expand_call_default_args(node, fn->func_decl.param_defaults, fn->func_decl.param_count, fn->func_decl.pack_param_index, NULL);
 
             if (node->call.arg_count != fn->func_decl.param_count) return false;
 

@@ -865,6 +865,7 @@ void reflect_bindings_free(ReflectBindings* b);
 void AST_Dump(struct ASTNode* node, int depth);
 void  Typecheck_Tree(ASTNode* root); // eager pass: annotate every node's result_type (home for v1(b) checks)
 void  resolve_brace_literal(ASTNode* node, Type* target); // bind a bare `{...}` literal to its context type
+void  expand_call_default_args(ASTNode* node, ASTNode** pdefaults, size_t pcount, int pack_idx, Type** ptypes);
 
 // --- Match Engine ---
 struct ASTNode* Lower_Match(struct ASTNode* node, struct Type* st);
