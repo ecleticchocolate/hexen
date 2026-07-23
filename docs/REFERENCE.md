@@ -229,7 +229,9 @@ struct Derived {
   by value (`f(d.info)` passes an ordinary independent *value* copy).
 - Works in `struct` and `union` bodies. Embedded type may be a generic
   param (`super T base`), resolved at instantiation.
-- Copies fields only, never methods.
+- Method forwarding: calling a method on `Derived` (`d.method()`) automatically
+  forwards to `d.info.method()` if `Derived` does not define `method` itself.
+  Works across both concrete structs and generic parameter embeddings (`super T payload`).
 - `(Base*)&derived_val` reads through the shared prefix (see Casts) — the same
   bytes `d.info` names.
 

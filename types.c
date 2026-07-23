@@ -1183,17 +1183,57 @@ void try_rewrite_method_call(ASTNode* node) {
     char* mangled = Method_Mangle(st, field_node->field.field_name, field_node->field.field_name_len, &manglen);
     if (!mangled) return; // st isn't struct-shaped enough for Method_Mangle -- same bail as before
     Symbol* msym = SymTable_Find(Get_SymTable(), mangled, manglen);
+
+    ASTNode* base_arg = field_node->field.base;
+    StructDef* target_sd = sd;
+
+    if ((!msym || msym->kind != SYM_FUNCTION) && sd) {
+        // Method not found directly on `st`. Check if `sd` has a `super` field!
+        for (size_t i = 0; i < sd->field_count; i++) {
+            StructField* sf = &sd->fields[i];
+            if (sf->is_super_alias || sf->is_super_param) {
+                Type* super_t = sf->type;
+                if (super_t && super_t->cls == TYPE_POINTER) super_t = super_t->pointer_base;
+                if (super_t && super_t->cls == TYPE_STRUCT && super_t->struct_name) {
+                    size_t super_manglen = 0;
+                    char* super_mangled = Method_Mangle(super_t, field_node->field.field_name, field_node->field.field_name_len, &super_manglen);
+                    if (super_mangled) {
+                        Symbol* super_msym = SymTable_Find(Get_SymTable(), super_mangled, super_manglen);
+                        if (super_msym && super_msym->kind == SYM_FUNCTION) {
+                            free(mangled);
+                            mangled = super_mangled;
+                            manglen = super_manglen;
+                            msym = super_msym;
+
+                            ASTNode* super_field_access = (ASTNode*)calloc(1, sizeof(ASTNode));
+                            super_field_access->type = AST_FIELD;
+                            super_field_access->field.base = field_node->field.base;
+                            super_field_access->field.field_name = strdup(sf->name);
+                            super_field_access->field.field_name_len = strlen(sf->name);
+
+                            base_arg = super_field_access;
+                            bt = super_t;
+                            target_sd = Struct_Find(super_t->struct_name);
+                            break;
+                        }
+                        free(super_mangled);
+                    }
+                }
+            }
+        }
+    }
+
     if (!msym || msym->kind != SYM_FUNCTION) { free(mangled); return; }
 
     size_t old_argc = node->call.arg_count;
     ASTNode** new_args = (ASTNode**)malloc((old_argc + 1) * sizeof(ASTNode*));
     ASTNode* self_arg;
     if (bt && bt->cls == TYPE_POINTER) {
-        self_arg = field_node->field.base;
+        self_arg = base_arg;
     } else {
         self_arg = (ASTNode*)calloc(1, sizeof(ASTNode));
         self_arg->type = AST_ADDR;
-        self_arg->unary = field_node->field.base;
+        self_arg->unary = base_arg;
     }
     new_args[0] = self_arg;
     for (size_t i = 0; i < old_argc; i++) new_args[i + 1] = node->call.args[i];
