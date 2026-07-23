@@ -140,35 +140,6 @@ static Type* fn_param_getter(void* ctx, size_t i) {
     return ((Type*)ctx)->function.param_types[i];
 }
 
-static Type* flat_args_getter(void* ctx, size_t i) {
-    return ((Type**)ctx)[i];
-}
-
-// A struct's own `type_args` array is already collapsed at ITS declaration's
-// granularity: an ordinary (non-pack) param passes through as one slot, but
-// the ONE declared param at the struct's own pack_type_param_index holds a
-// pre-bundled anon carrier (Struct_MakeAnon) whose FIELDS are the true
-// individual type arguments that got bundled there. A wildcard-head pattern
-// peeling `H, Rest...` needs to walk that true flat sequence, not the
-// already-collapsed one -- otherwise `struct M[H, Rest...]` against
-// `Def[Ts...]` instantiated as `Def[i32, u8]` would bind H to the WHOLE
-// carrier struct{i32,u8} instead of i32 alone. Unpack the carrier's fields
-// back into a flat array so the fixed prefix and the pack tail below can be
-// positioned exactly like they are for an ordinary (non-bundled) struct.
-// Returns a malloc'd array the caller must free UNLESS it equals `type_args`
-// itself (the no-pack-in-declaration fast path, returned unowned).
-static Type** flatten_type_args(StructDef* tmpl_sd, Type** type_args, size_t nargs, size_t* out_count) {
-    int p = tmpl_sd->pack_type_param_index;
-    if (p < 0 || (size_t)p >= nargs) { *out_count = nargs; return type_args; }
-    StructDef* carrier = Struct_Find(type_args[p]->struct_name);
-    size_t carrier_n = carrier ? carrier->field_count : 0;
-    size_t total = (size_t)p + carrier_n;
-    Type** flat = (Type**)malloc((total ? total : 1) * sizeof(Type*));
-    for (size_t i = 0; i < (size_t)p; i++) flat[i] = type_args[i];
-    for (size_t i = 0; i < carrier_n; i++) flat[(size_t)p + i] = carrier->fields[i].type;
-    *out_count = total;
-    return flat;
-}
 
 // Build the DECLARED view of a struct's field list for type-pattern matching.
 // Struct_Layout stores a `super A base` field as its PROMOTED PREFIX (A's own
@@ -207,12 +178,6 @@ static bool field_slot_unify(StructField* concrete, StructField* pat, ReflectBin
 
 bool reflect_unify(Type* concrete, Type* pattern, ReflectBindings* out) {
     if (!concrete && !pattern) return true;
-
-    // ── Tagged nominal pattern: `struct M`, `struct M[X]`, `enum M[X]`, ... ──
-    // The tag states the KIND, which is the one fact brackets can never carry, so
-    // it is checked against the concrete declaration. The head then binds to the
-    // concrete's own template (left UNAPPLIED, so it stays usable as `M[u8]`
-
 
     // Pattern hole: bind it to whatever the concrete side is here, and succeed.
     if (pattern && is_hole(pattern)) {

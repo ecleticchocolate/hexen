@@ -4287,7 +4287,7 @@ static ASTNode* parse_struct_decl_ex(bool is_enum, bool is_overlapping, bool is_
             StructDef* super_sd = (super_pt->struct_name) ? Struct_Find(super_pt->struct_name) : NULL;
 
             if (!super_sd) {
-                // Unresolved type (type parameter T, HKT app M[T], dependent type) --
+                // Unresolved type (type parameter T, dependent type) --
                 // there is no StructDef to promote fields FROM yet. Record just the
                 // `base`-shaped field, flag is_super_param, and defer the promotion-splice
                 // to Struct_Instantiate once concrete.

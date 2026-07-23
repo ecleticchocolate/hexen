@@ -766,8 +766,7 @@ static void ce_generic_frame_restore(CeGenericFrame saved) {
 }
 
 // Fold one array-postfix count_expr under a substitution frame: ConstEval,
-// positive check, else defer. Shared by Type_Substitute's own TYPE_ARRAY
-// case and array_substitute_maybe_hkt's outer-dimension rebuild.
+// positive check, else defer. Shared by Type_Substitute's own TYPE_ARRAY case.
 static void fold_array_count(ASTNode* ce, const char** params, Type** args, size_t n,
                               uint64_t* count_out, ASTNode** count_expr_out) {
     if (!ce) { *count_expr_out = NULL; return; }
@@ -786,64 +785,6 @@ static void fold_array_count(ASTNode* ce, const char** params, Type** args, size
     } else {
         *count_expr_out = ce;
     }
-}
-
-// One array-postfix dimension as a Type* type argument, or NULL if it's an
-// ordinary (non-type) array-size expression.
-// One bracket of an HKT application, resolved against the applied template's OWN
-// declared kind for that slot (`pin` = sd->param_kinds[k]: NULL for a type param,
-// non-NULL for a value param).
-//
-// `pin` is what lets a VALUE argument resolve here at all. `M[i32][30]` where M is
-// bound to `Vec[T, u32 N]` has a second bracket that is not type-shaped, so without
-// a kind to fold it against it was rejected and the whole application failed --
-// meaning a bound HKT head could only ever be applied to TYPE arguments, never to a
-// const-generic value. `folded` carries the already-folded literal for the common
-// case where the parser resolved `[30]` to a concrete array count and dropped the
-// expr (count_expr == NULL), which is exactly what a plain literal bracket does.
-static Type* count_expr_as_type_arg(ASTNode* count_expr, const char** params, Type** args, size_t n,
-                                     Type* pin, uint64_t folded, const char* size_param) {
-    // A size WILDCARD (`M[E][N]`): the parser leaves count==0/no expr and stashes the
-    // name in array.size_param. Hand it back as an unbound TYPE_PARAM so reflect_unify
-    // binds it exactly like any other hole -- the value-slot pin is irrelevant here
-    // because nothing is being folded, only bound.
-    if (size_param) {
-        Type* h = (Type*)calloc(1, sizeof(Type));
-        h->cls = TYPE_PARAM;
-        h->param_name = size_param;
-        return h;
-    }
-    if (count_expr) {
-        if (count_expr->type == AST_TYPE_EXPR) {
-            return Type_Substitute(count_expr->sizeof_expr.type, params, args, n);
-        }
-        if (count_expr->type == AST_IDENT) {
-            for (size_t i = 0; i < n; i++) {
-                if (strcmp(count_expr->ident.name, params[i]) == 0) return args[i];
-            }
-        }
-    }
-    // VALUE slot: produce the pinned constant. Either fold the surviving expr (with
-    // the generic frame installed so an in-scope `N` resolves), or -- when the parser
-    // already folded it away -- use the count it left behind.
-    if (pin) {
-        int64_t v; bool ok = false;
-        if (count_expr) {
-            CeGenericFrame saved = ce_generic_frame_install(params, args, n);
-            ok = ConstEval(count_expr, &v);
-            ce_generic_frame_restore(saved);
-        } else if (folded > 0) {
-            v = (int64_t)folded; ok = true;
-        }
-        if (ok) {
-            Type* cv = (Type*)calloc(1, sizeof(Type));
-            cv->cls = TYPE_CONST_VALUE;
-            cv->cval.pin = pin;
-            cv->cval.scalar = v;
-            return cv;
-        }
-    }
-    return NULL;
 }
 
 

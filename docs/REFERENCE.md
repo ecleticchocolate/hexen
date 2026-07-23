@@ -33,28 +33,6 @@ fn main() i32 {
 
 ---
 
-## Function Default Arguments
-
-Parameters can specify `constexpr` default expressions (`= expr`). Trailing omitted arguments at call sites are automatically filled with their default values.
-
-```hexen
-fn connect(u8* host = "localhost", u16 port = 8080) i32 { ... }
-
-impl Server {
-    fn listen(u16 port = 8080, u32 max_clients = 100) bool { ... }
-}
-
-connect()            // Rewritten to connect("localhost", 8080)
-connect("127.0.0.1") // Rewritten to connect("127.0.0.1", 8080)
-```
-
-- **Compile-Time Constant Initializers**: Default expressions must be `constexpr` (literals, const symbols, `sizeof(T)`, constant math).
-- **Nominal / Call-Site Sugar**: Default arguments are evaluated at call sites when calling named functions/methods directly.
-- **Raw Function Pointers**: `fn(...)` raw pointer variables do not carry defaults; calling through a function pointer requires passing all positional parameters explicitly.
-- **Trailing Order**: All parameters with default values must come after non-default parameters.
-
----
-
 ## Lexical
 
 ```
@@ -86,8 +64,6 @@ always `true`. See Showcases for the idiomatic uses this enables.
 syntax as in C, just the same cast grammar every other type already uses —
 and reads naturally as "discard the result" since `void` holds nothing.
 
----
-
 ## Declarations
 
 ```
@@ -105,6 +81,28 @@ extern fn name(TYPE a) RETTYPE           // no body; links against libc/host
 extern fn printf(u8* fmt, ...) i32       // "..." = C varargs (extern only)
 pub fn name(...) ...                     // exported via -emit-mod
 ```
+
+### Function Default Arguments
+
+Parameters can specify default expressions (`= expr`). Trailing omitted arguments at call sites are automatically filled by cloning the default expression into the call site.
+
+```hexen
+fn default_port() u16 { return 8080 }
+
+fn connect(u8* host = "localhost", u16 port = default_port()) i32 { ... }
+
+impl Server {
+    fn listen(u16 port = 8080, u32 max_clients = 100) bool { ... }
+}
+
+connect()            // Rewritten to connect("localhost", default_port())
+connect("127.0.0.1") // Rewritten to connect("127.0.0.1", default_port())
+```
+
+- **Arbitrary Expression ASTs**: Default expressions are full expression AST nodes (function calls, literals, `sizeof(T)`, constant math, constructors). The AST is cloned into the call site.
+- **Nominal / Call-Site Sugar**: Default arguments are evaluated at call sites when calling named functions/methods directly.
+- **Raw Function Pointers**: `fn(...)` raw pointer variables do not carry defaults; calling through a function pointer requires passing all positional parameters explicitly.
+- **Trailing Order**: All parameters with default values must come after non-default parameters (except variadic pack parameters `T... args`).
 
 ---
 
@@ -579,79 +577,6 @@ values because every value carries its own type; nothing is lost. `Ts...`
 bundles types, and a type has no value — so `Nums[1, 2, 3]` (values into a
 bracket pack) is a category error, not a missing feature. Value-parameterize
 with a const-generic before the pack (`[u32 N, Ts...]`) instead.
-
-### Higher-kinded parameters (unapplied templates)
-
-A generic parameter can bind a **still-generic template**, unapplied — no
-`[args]` — and the body applies it later:
-```
-struct Box[T]    { T val }
-struct HKT[M, T] { M[T] data }     // M binds a bare template; M[T] applies it
-
-HKT[Box, i32] h                    // M = Box (unapplied), then Box[i32] inside
-h.data = { .val = 5 }
-```
-`M` here is higher-kinded: it stands for a type *constructor*, not a type. `M[T]`
-in the body is the deferred application, routed through instantiation (not read
-as an array size). Arity is checked — a template applied to the wrong number of
-arguments is rejected.
-
-**Matching the head.** `match` on a higher-kinded parameter distinguishes *which*
-template it is bound to — the head is a first-class thing to pattern on:
-```
-fn describe[M, T](HKT[M, T] h) i32 {
-    match M {
-        Box  { return 1 }      // M is genuinely the bare template Box
-        else { return 0 }
-    }
-}
-```
-**Const-generic value under a wildcard head.** A concrete head supplies each
-slot's kind from its declaration, so `Vec[E, N]` knows `N` is a value with no
-annotation. A **wildcard head** (`struct M[...]`) supplies no declaration — so to
-*use* a value slot as a value in the arm body, the pattern must state the value's
-type, with the same type-then-value grammar a declaration uses. Two spellings,
-the ordinary pin-vs-bind duality:
-```
-struct Vec[T, u32 N] { T[N] e }
-match S {
-    struct M[E, u32 N]  { /* PIN:  value-type u32 written; N usable as a value  */ }
-}
-struct Row[VT, T, VT N] { T[3] e }
-match S {
-    struct M[VT, E, VT N] { /* BIND: value-type -> VT; both VT (as type) and N   */ }
-}                          /*        (as value) usable in the body               */
-```
-The trailing name binds the value; the type before it is its pin — checked
-against the concrete (`M[E, u32 N]` will not match a `u64`-typed slot). This is
-the one place in `match` where a type annotation is *required* rather than
-inferred, and for the same reason a `struct` tag is required on a wildcard head:
-the head cannot supply the fact, so the pattern must. A bare `struct M[E, N]`
-still matches and binds `N`, but `N` cannot be read as a value without the
-annotation.
-
-### Nominal-kind tags in patterns
-
-A pattern can pin the **nominal kind** of a slot. Position decides what the
-keyword means: in a **type position** (`fn(struct Point)`, `struct Point p`) a
-leading `struct`/`enum`/`union` is a redundant C-style tag on an already-known
-type — accepted, carries no information. In a **match pattern** the *same*
-keyword is a meaningful **kind assertion**: `struct M[X]` matches only when the
-head is a struct, binds the head to `M` and its argument to `X`; `enum M[X]`
-matches only enums, and so on:
-```
-struct Box[T] { T v }
-enum   Opt[T] { T Some  None }
-match S {
-    enum   M[X] { }   // fires only if S's head is an ENUM  (Opt[..] yes, Box[..] no)
-    struct M[X] { }   // fires only if S's head is a STRUCT (Box[..] yes, Opt[..] no)
-    else        { }
-}
-```
-Tagged applications nest — the argument of one may be another tagged application,
-inner wildcards binding normally: `struct M[struct N[X]]` matches
-`Box[Wrap[u64]]` with `M=Box`, `N=Wrap`, `X=u64`. Where the kind is already
-known from context the tag is a no-op, so it never *hurts* to write it.
 
 ### Repeated wildcards and back-inference
 
