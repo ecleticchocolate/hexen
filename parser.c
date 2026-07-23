@@ -1447,6 +1447,8 @@ static Type* parse_type_ex(bool allow_array) {
             advance();
             if (s_curr.type != TOK_LPAREN) parse_error("expected '(' after typeof");
             advance();
+            bool prev_imp = s_in_match_pattern;
+            s_in_match_pattern = false;
             ASTNode* expr = parse_expr_prec(0);
             if (!expr) parse_error("expected expression inside typeof(...)");
             if (s_curr.type != TOK_RPAREN) parse_error("expected ')' after typeof expression");
@@ -1455,6 +1457,7 @@ static Type* parse_type_ex(bool allow_array) {
 
             Typecheck_Tree(expr);
             Type* inferred = Type_Infer(expr);
+            s_in_match_pattern = prev_imp;
             if (!inferred) {
                 parse_error("cannot infer type of expression in typeof(...)");
             }
