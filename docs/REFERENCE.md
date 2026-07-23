@@ -84,12 +84,15 @@ pub fn name(...) ...                     // exported via -emit-mod
 
 ### Function Default Arguments
 
-Parameters can specify default expressions (`= expr`). Trailing omitted arguments at call sites are automatically filled by cloning the default expression into the call site.
+Parameters can specify default expressions (`= expr`). Default expressions must be valid `constexpr` expressions evaluated at compile time (literals, struct/array literals, constant math, `sizeof`, or `constexpr` functions).
 
 ```hexen
 fn default_port() u16 { return 8080 }
 
 fn connect(u8* host = "localhost", u16 port = default_port()) i32 { ... }
+
+struct Point { i32 x  i32 y }
+fn process(Point p = {.x = 100, .y = 200}, i32[3] arr = {10, 20, 30}) i32 { ... }
 
 impl Server {
     fn listen(u16 port = 8080, u32 max_clients = 100) bool { ... }
@@ -99,8 +102,8 @@ connect()            // Rewritten to connect("localhost", default_port())
 connect("127.0.0.1") // Rewritten to connect("127.0.0.1", default_port())
 ```
 
-- **Arbitrary Expression ASTs**: Default expressions are full expression AST nodes (function calls, literals, `sizeof(T)`, constant math, constructors). The AST is cloned into the call site.
-- **Nominal / Call-Site Sugar**: Default arguments are evaluated at call sites when calling named functions/methods directly.
+- **Compile-Time Constant Initializers**: Default expressions must be strictly `constexpr` (evaluated at parse time via `ConstEval`).
+- **Struct and Array Defaults**: Aggregate brace literals (`{.x = 100}` or `{10, 20, 30}`) derive their layout top-down from the parameter type and fold at compile time.
 - **Raw Function Pointers**: `fn(...)` raw pointer variables do not carry defaults; calling through a function pointer requires passing all positional parameters explicitly.
 - **Trailing Order**: All parameters with default values must come after non-default parameters (except variadic pack parameters `T... args`).
 
@@ -130,12 +133,46 @@ return x                    // y is undeclared from here on
 
 ```
 type      ::= base postfix*
-base      ::= primitive | named | fn_type | anon_struct | "(" type ")"
+base      ::= primitive | named | fn_type | anon_struct | "(" type ")" | "typeof" "(" expr ")"
 postfix   ::= "*" | "[" constexpr "]" | "[" "]"
 named     ::= IDENT | IDENT "[" type_or_value ("," type_or_value)* "]"
 fn_type   ::= "fn" "(" (type ("," type)*)? ")" type?
 anon_struct ::= "struct" "{" (type IDENT)* "}"
 ```
+
+### Type Query — `typeof(expr)`
+
+Queries the static type signature of `expr` at compile time without evaluating `expr` (unevaluated operand context, identical to `sizeof(expr)`).
+
+```hexen
+i32 val = 42
+
+// 1. Variable & field declarations:
+typeof(val) x = 100
+struct Container { typeof(val) count }
+
+// 2. Function parameters & return types:
+fn add(typeof(10) a, typeof(20) b) typeof(a + b) { return a + b }
+
+// 3. Postfix composition & casts:
+typeof(val)* ptr = &x
+typeof(val)[4] arr = {1, 2, 3, 4}
+typeof(val) casted = (typeof(val)) 3.14
+
+// 4. Aliases & generic arguments:
+alias MyInt = typeof(val)
+Box[typeof(val), 5] b
+
+// 5. Type match & reflection:
+match typeof(val) {
+    i32 { return 100 }
+    else { return 200 }
+}
+```
+
+- **Unevaluated Context**: `expr` is inspected purely at compile time via static type inference (`Type_Infer`). Expressions inside `typeof(...)` are never executed or emitted into runtime machine code.
+- **Universal Orthogonality**: `typeof(expr)` is a type `base` in `parse_type_ex` and can be used anywhere a type is expected.
+- **Self-Reference Guard**: Referencing an un-inferred identifier currently being declared (`typeof(x) x`) is cleanly rejected as an undeclared/un-inferred symbol error.
 
 Postfixes bind left-to-right over what's built so far:
 
