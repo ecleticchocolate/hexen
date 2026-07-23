@@ -5081,6 +5081,10 @@ static ASTNode* parse_fn_decl(bool is_pub, bool is_extern,
                     advance();
                     default_expr = parse_expr_prec(0);
                     if (!default_expr) parse_error("expected default argument expression");
+                    int64_t dummy_val;
+                    if (s_type_param_count == 0 && !ConstEval(default_expr, &dummy_val)) {
+                        parse_error("function default argument must be a constant expression (constexpr)");
+                    }
                     has_defaults_started = true;
                 } else if (has_defaults_started && !is_pack_param) {
                     char err_msg[256];
