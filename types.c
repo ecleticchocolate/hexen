@@ -2921,6 +2921,29 @@ void Typecheck_Tree(ASTNode* node) {
                 }
 
                 if (can_check_params) {
+                    ASTNode* fdecl_node = (node->call.sym && node->call.sym->func_decl) ? node->call.sym->func_decl : NULL;
+                    ASTNode** pdefaults = fdecl_node ? fdecl_node->func_decl.param_defaults : NULL;
+
+                    if (pdefaults && node->call.arg_count < pcount) {
+                        bool all_missing_have_defaults = true;
+                        for (size_t k = node->call.arg_count; k < pcount; k++) {
+                            if (!pdefaults[k]) {
+                                all_missing_have_defaults = false;
+                                break;
+                            }
+                        }
+                        if (all_missing_have_defaults) {
+                            ASTNode** expanded_args = (ASTNode**)realloc(node->call.args, pcount * sizeof(ASTNode*));
+                            if (expanded_args) {
+                                node->call.args = expanded_args;
+                                for (size_t k = node->call.arg_count; k < pcount; k++) {
+                                    node->call.args[k] = clone_ast(pdefaults[k], NULL, NULL, 0, false);
+                                }
+                                node->call.arg_count = pcount;
+                            }
+                        }
+                    }
+
                     if (is_vararg) {
                         if (node->call.arg_count < pcount) {
                             Error_AtNode(node, "not enough arguments to vararg function", NULL);
@@ -3840,6 +3863,13 @@ ASTNode* clone_ast(ASTNode* n, const char** params, Type** args, size_t np, bool
         case AST_FUNC_DECL: {
             c->func_decl.return_type = Type_Substitute(n->func_decl.return_type, params, args, np);
             c->func_decl.param_syms = (Symbol**)calloc(n->func_decl.param_count, sizeof(Symbol*));
+            if (n->func_decl.param_defaults) {
+                c->func_decl.param_defaults = (ASTNode**)calloc(n->func_decl.param_count, sizeof(ASTNode*));
+                for (size_t i = 0; i < n->func_decl.param_count; i++) {
+                    if (n->func_decl.param_defaults[i])
+                        c->func_decl.param_defaults[i] = clone_ast(n->func_decl.param_defaults[i], params, args, np, clone_symbols);
+                }
+            }
             for (size_t i = 0; i < n->func_decl.param_count; i++)
                 c->func_decl.param_syms[i] = clone_symbol(n->func_decl.param_syms[i], params, args, np, clone_symbols);
             c->func_decl.body = clone_ast(n->func_decl.body, params, args, np, clone_symbols);

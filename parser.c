@@ -5018,6 +5018,7 @@ static ASTNode* parse_fn_decl(bool is_pub, bool is_extern,
         node->func_decl.pack_param_index = -1; // packs not supported on impl methods yet
         size_t param_cap = 6;
         node->func_decl.param_syms = (Symbol**)calloc(param_cap, sizeof(Symbol*));
+        node->func_decl.param_defaults = (ASTNode**)calloc(param_cap, sizeof(ASTNode*));
 
         // Temporarily set up a scope for the parameters
         SymbolTable* prev_table = s_symtable;
@@ -5039,6 +5040,7 @@ static ASTNode* parse_fn_decl(bool is_pub, bool is_extern,
         }
 
         bool is_vararg = false;
+        bool has_defaults_started = false;
         if (s_curr.type != TOK_RPAREN) {
             while (1) {
                 if (s_curr.type == TOK_ELLIPSIS) {
@@ -5049,6 +5051,8 @@ static ASTNode* parse_fn_decl(bool is_pub, bool is_extern,
                 if (node->func_decl.param_count >= param_cap) {
                     param_cap *= 2;
                     node->func_decl.param_syms = (Symbol**)realloc(node->func_decl.param_syms, param_cap * sizeof(Symbol*));
+                    node->func_decl.param_defaults = (ASTNode**)realloc(node->func_decl.param_defaults, param_cap * sizeof(ASTNode*));
+                    memset(node->func_decl.param_defaults + param_cap / 2, 0, (param_cap / 2) * sizeof(ASTNode*));
                 }
                 // Spec: parameters are `type name`, same order as declarations.
                 Type* param_type = parse_type();
@@ -5069,9 +5073,23 @@ static ASTNode* parse_fn_decl(bool is_pub, bool is_extern,
                 Token param_name = s_curr;
                 advance();
 
+                ASTNode* default_expr = NULL;
+                if (s_curr.type == TOK_EQ) {
+                    advance();
+                    default_expr = parse_expr_prec(0);
+                    if (!default_expr) parse_error("expected default argument expression");
+                    has_defaults_started = true;
+                } else if (has_defaults_started) {
+                    char err_msg[256];
+                    snprintf(err_msg, sizeof(err_msg), "non-default parameter '%.*s' follows default parameter",
+                             (int)param_name.length, param_name.start);
+                    parse_error(err_msg);
+                }
+
                 Symbol* psym = SymTable_Add(s_symtable, param_name.start, param_name.length, param_type, SYM_LOCAL);
                 psym->is_pack = is_pack_param;
                 node->func_decl.param_syms[node->func_decl.param_count] = psym;
+                node->func_decl.param_defaults[node->func_decl.param_count] = default_expr;
                 if (is_pack_param) node->func_decl.pack_param_index = (int)node->func_decl.param_count;
                 node->func_decl.param_count++;
                 

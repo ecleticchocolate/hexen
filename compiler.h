@@ -567,6 +567,7 @@ typedef struct ASTNode {
             size_t name_len;
             struct Symbol* params;
             struct Symbol** param_syms; // resolved param symbols (offset + type), in order
+            struct ASTNode** param_defaults; // default argument expressions (or NULL) per param slot
             size_t param_count;
             struct Type* return_type;
             struct ASTNode* body;
