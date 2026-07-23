@@ -39,9 +39,9 @@ struct ManagedService {
 }
 
 // -------------------------------------------------------------
-// 4. Value Pack function with defaults
+// 4. Value Pack function with defaults (T... rest)
 // -------------------------------------------------------------
-fn value_pack_default(i32 prefix = 100, i32... rest) i32 {
+fn value_pack_default[T](i32 prefix = 100, T... rest) i32 {
     return prefix
 }
 
@@ -67,8 +67,8 @@ fn main() i32 {
     i32 m2 = ms.run(5000)
 
     // 4. Value Pack default:
-    // value_pack_default() -> prefix = 100
-    i32 vp1 = value_pack_default()
+    // value_pack_default[i32]() -> prefix = 100
+    i32 vp1 = value_pack_default[i32]()
 
     // Sum calculation:
     // g1 = 4, g2 = 8, cg1 = 50, cg2 = 999

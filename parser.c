@@ -5065,6 +5065,9 @@ static ASTNode* parse_fn_decl(bool is_pub, bool is_extern,
                 if (s_curr.type == TOK_ELLIPSIS) {
                     is_pack_param = true;
                     advance();
+                    if (param_type->cls != TYPE_PARAM) {
+                        parse_error("a variadic pack parameter 'T... name' must be a generic type parameter (e.g. T... args)");
+                    }
                     if (node->func_decl.pack_param_index != -1)
                         parse_error("at most one `T...` pack parameter is allowed per function");
                 }
