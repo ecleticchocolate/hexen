@@ -609,6 +609,12 @@ void resolve_brace_literal(ASTNode* node, Type* target) {
     }
 
     if (node->type == AST_ARRAY_LITERAL && node->array_lit.elem_type == NULL) {
+        if (target->cls == TYPE_ARRAY && target->array.count == 0 && target->array.count_expr) {
+            int64_t v;
+            if (ConstEval(target->array.count_expr, &v)) {
+                target->array.count = (uint64_t)v;
+            }
+        }
         // Zero-initialization of scalar targets: `(i32){}` or `(ptr){}` becomes `0`.
         // This is crucial for generic bodies that use `(T){}` to zero-initialize any T.
         if ((target->cls == TYPE_PRIMITIVE || target->cls == TYPE_POINTER) && node->array_lit.count == 0) {
@@ -714,6 +720,7 @@ void resolve_brace_literal(ASTNode* node, Type* target) {
                 check_assignable(elem, ev, "array element");
             }
         }
+        node->result_type = target;
         if (target->array.count_expr) {
             Type* concrete = (Type*)malloc(sizeof(Type));
             *concrete = *target;
@@ -1695,7 +1702,15 @@ Type* Type_Infer(ASTNode* node) {
         }
 
         case AST_ARRAY_LITERAL:
-            t = node->result_type; // set at parse time (full array type w/ resolved size)
+            if (node->result_type) {
+                t = node->result_type;
+            } else if (node->array_lit.elem_type) {
+                t = (Type*)calloc(1, sizeof(Type));
+                t->cls = TYPE_ARRAY;
+                t->array.element = node->array_lit.elem_type;
+                t->array.count = node->array_lit.count;
+                node->result_type = t;
+            }
             break;
 
         case AST_SIZEOF:
@@ -2885,6 +2900,9 @@ void Typecheck_Tree(ASTNode* node) {
                                     node->call.args = expanded_args;
                                     for (size_t k = node->call.arg_count; k < fill_count; k++) {
                                         node->call.args[k] = clone_ast(pdefaults[k], NULL, NULL, 0, false);
+                                        if (ptypes && ptypes[k]) {
+                                            resolve_brace_literal(node->call.args[k], ptypes[k]);
+                                        }
                                     }
                                     node->call.arg_count = fill_count;
                                 }

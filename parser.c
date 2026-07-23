@@ -892,7 +892,7 @@ static Type* make_array_type(Type* elem, uint64_t count, ASTNode* count_expr, co
     Type* t = (Type*)calloc(1, sizeof(Type));
     t->cls = TYPE_ARRAY;
     t->array.element = elem;
-    t->array.count = count;
+    t->array.count = count ? count : ((count_expr && count_expr->type == AST_INT_LITERAL) ? count_expr->int_value : 0);
     t->array.count_expr = count_expr;
     t->array.size_param = size_param;
     return t;
@@ -5080,7 +5080,9 @@ static ASTNode* parse_fn_decl(bool is_pub, bool is_extern,
                 if (s_curr.type == TOK_EQ) {
                     advance();
                     default_expr = parse_expr_prec(0);
-                    if (!default_expr) parse_error("expected default argument expression");
+                    if (default_expr && param_type && (default_expr->type == AST_STRUCT_LITERAL || default_expr->type == AST_ARRAY_LITERAL)) {
+                        resolve_brace_literal(default_expr, param_type);
+                    }
                     int64_t dummy_val;
                     if (s_type_param_count == 0 && !ConstEval(default_expr, &dummy_val)) {
                         parse_error("function default argument must be a constant expression (constexpr)");
