@@ -2881,6 +2881,7 @@ void Typecheck_Tree(ASTNode* node) {
                 size_t pcount = 0;
                 bool is_vararg = false;
                 bool can_check_params = false;
+                Symbol* inst_sym = NULL;
 
                 if (has_sym && (!is_generic || generic_resolved)) {
                     can_check_params = true;
@@ -2888,7 +2889,7 @@ void Typecheck_Tree(ASTNode* node) {
                     is_vararg = node->call.sym->type->function.is_vararg;
 
                     if (generic_resolved) {
-                        Generic_Instantiate(node->call.sym, node->call.type_args, node->call.type_arg_count);
+                        inst_sym = Generic_Instantiate(node->call.sym, node->call.type_args, node->call.type_arg_count);
                         ASTNode* gdecl = node->call.sym->generic_decl;
                         ptypes = (Type**)malloc(pcount * sizeof(Type*));
                         for (size_t i = 0; i < pcount; i++) {
@@ -2921,25 +2922,31 @@ void Typecheck_Tree(ASTNode* node) {
                 }
 
                 if (can_check_params) {
-                    ASTNode* fdecl_node = (node->call.sym && node->call.sym->func_decl) ? node->call.sym->func_decl : NULL;
+                    Symbol* call_sym = inst_sym ? inst_sym : node->call.sym;
+                    ASTNode* fdecl_node = (call_sym && call_sym->func_decl) ? call_sym->func_decl : NULL;
                     ASTNode** pdefaults = fdecl_node ? fdecl_node->func_decl.param_defaults : NULL;
+                    int pack_idx = fdecl_node ? fdecl_node->func_decl.pack_param_index : -1;
 
                     if (pdefaults && node->call.arg_count < pcount) {
                         bool all_missing_have_defaults = true;
-                        for (size_t k = node->call.arg_count; k < pcount; k++) {
+                        size_t check_until = (pack_idx >= 0) ? (size_t)pack_idx : pcount;
+                        for (size_t k = node->call.arg_count; k < check_until; k++) {
                             if (!pdefaults[k]) {
                                 all_missing_have_defaults = false;
                                 break;
                             }
                         }
                         if (all_missing_have_defaults) {
-                            ASTNode** expanded_args = (ASTNode**)realloc(node->call.args, pcount * sizeof(ASTNode*));
-                            if (expanded_args) {
-                                node->call.args = expanded_args;
-                                for (size_t k = node->call.arg_count; k < pcount; k++) {
-                                    node->call.args[k] = clone_ast(pdefaults[k], NULL, NULL, 0, false);
+                            size_t fill_count = check_until;
+                            if (node->call.arg_count < fill_count) {
+                                ASTNode** expanded_args = (ASTNode**)realloc(node->call.args, fill_count * sizeof(ASTNode*));
+                                if (expanded_args) {
+                                    node->call.args = expanded_args;
+                                    for (size_t k = node->call.arg_count; k < fill_count; k++) {
+                                        node->call.args[k] = clone_ast(pdefaults[k], NULL, NULL, 0, false);
+                                    }
+                                    node->call.arg_count = fill_count;
                                 }
-                                node->call.arg_count = pcount;
                             }
                         }
                     }
@@ -2947,6 +2954,10 @@ void Typecheck_Tree(ASTNode* node) {
                     if (is_vararg) {
                         if (node->call.arg_count < pcount) {
                             Error_AtNode(node, "not enough arguments to vararg function", NULL);
+                        }
+                    } else if (pack_idx >= 0) {
+                        if (node->call.arg_count < (size_t)pack_idx) {
+                            Error_AtNode(node, "not enough arguments for function with pack parameter", NULL);
                         }
                     } else {
                         if (node->call.arg_count != pcount) {

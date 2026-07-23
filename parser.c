@@ -5079,7 +5079,7 @@ static ASTNode* parse_fn_decl(bool is_pub, bool is_extern,
                     default_expr = parse_expr_prec(0);
                     if (!default_expr) parse_error("expected default argument expression");
                     has_defaults_started = true;
-                } else if (has_defaults_started) {
+                } else if (has_defaults_started && !is_pack_param) {
                     char err_msg[256];
                     snprintf(err_msg, sizeof(err_msg), "non-default parameter '%.*s' follows default parameter",
                              (int)param_name.length, param_name.start);
