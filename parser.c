@@ -4091,9 +4091,6 @@ static ASTNode* parse_impl_block(bool is_pub) {
     size_t prev_impl_tparam_count  = s_type_param_count;
     char* impl_type_nul = strndup(impl_type, impl_type_len);
     StructDef* impl_sd = Struct_Find(impl_type_nul);
-    if (!impl_sd && !is_prim_impl) {
-        impl_sd = Struct_Register(impl_type_nul, strlen(impl_type_nul));
-    }
     free(impl_type_nul);
     if (impl_sd && impl_sd->type_param_count > 0) {
         s_type_params      = impl_sd->type_params;
