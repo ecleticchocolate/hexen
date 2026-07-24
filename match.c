@@ -460,6 +460,7 @@ ASTNode* parse_match_type(ASTNode* scrut) {
     bool has_wildcard = false;
 
     while (s_curr.type != TOK_RBRACE && s_curr.type != TOK_EOF) {
+        if (s_curr.type == TOK_CASE) advance();
         bool is_else = (s_curr.type == TOK_ELSE);
 
         Type* pattern = NULL;
@@ -620,6 +621,7 @@ ASTNode* parse_match(void) {
     SymbolTable** scopes = NULL; size_t ns = 0, scap = 0;
 
     while (s_curr.type != TOK_RBRACE && s_curr.type != TOK_EOF) {
+        if (s_curr.type == TOK_CASE) advance();
         ASTNode* pat = NULL;
         if (s_curr.type == TOK_ELSE) {
             advance();

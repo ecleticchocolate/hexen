@@ -1485,7 +1485,7 @@ static Type* parse_type_ex(bool allow_array) {
             base_t = make_pointer_type(base_t);
         } else if (s_curr.type == TOK_CARET) {
             advance();
-            StructDef* sd = Struct_Find("SmartPtr");
+            StructDef* sd = Struct_Find("Shared");
             if (sd) {
                 Type** targs = (Type**)malloc(sizeof(Type*));
                 targs[0] = base_t;
@@ -1495,7 +1495,7 @@ static Type* parse_type_ex(bool allow_array) {
                 res->struct_name = inst->name;
                 base_t = res;
             } else {
-                parse_error("T^ type sugar requires 'SmartPtr' to be defined");
+                parse_error("T^ type sugar requires 'Shared' to be defined");
             }
         } else if (s_curr.type == TOK_SINGLE_QUOTE) {
             advance();

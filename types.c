@@ -1391,14 +1391,13 @@ static bool rewrite_operand_to_method_call(ASTNode* node, ASTNode* recv, ASTNode
             matches = check_assignable_ne(param_t, arg, "__assign argument");
         }
         if (!matches) {
-            if (!node->binary.is_init && param_t && param_t->cls == TYPE_POINTER && 
-                Type_Equals(param_t->pointer_base, rt)) {
+            if (!node->binary.is_init && param_t && param_t->cls == TYPE_POINTER) {
                 char msg[256];
                 char pt_buf[128], arg_buf[128];
                 Type_ToString(param_t, pt_buf, sizeof(pt_buf));
                 Type* arg_t = Type_Infer(arg);
                 Type_ToString(arg_t ? arg_t : (Type*)NULL, arg_buf, sizeof(arg_buf));
-                snprintf(msg, sizeof(msg), "__assign expects '%s', got '%s'", pt_buf, arg_buf);
+                snprintf(msg, sizeof(msg), "__assign expects pointer '%s', got '%s' — use & for assignment", pt_buf, arg_buf);
                 Error_AtNode(node, msg, NULL);
             }
             return false;
