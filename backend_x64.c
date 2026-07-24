@@ -282,7 +282,7 @@ static void compile_lvalue(JITBuffer* buf, ASTNode* node, LoopContext* loop) {
         // Address of base.field = base_address + field->offset.
         // base_address: if base is a struct value -> its lvalue address;
         //               if base is a pointer-to-struct -> the pointer value (auto-deref).
-        Type_Infer(node); // ensure field.field/sdef are resolved (needed for cloned generic ASTs)
+        node->result_type = NULL; Type_Infer(node); // ensure field.field/sdef are resolved (needed for cloned generic ASTs)
         Type* bt = Type_Infer(node->field.base);
         if (bt && bt->cls == TYPE_POINTER) {
             compile_node_ctx(buf, node->field.base, loop); // pointer value in rax
@@ -301,7 +301,7 @@ static void compile_lvalue(JITBuffer* buf, ASTNode* node, LoopContext* loop) {
             emit_byte(buf, 0x48); emit_byte(buf, 0x05); emit_u32(buf, (uint32_t)off);
         }
     } else if (node->type == AST_INDEX) {
-        // Address of a[i] = base_address + i * elem_size.
+        if (node->index.base) node->index.base->result_type = NULL;
         Type* bt = Type_Infer(node->index.base);
         Type* elem;
         // Base address into rax: array value -> lvalue address; pointer -> its value.

@@ -2143,8 +2143,10 @@ void infer_generic(ASTNode* node, Type* target) {
         // __index call site already gets. A non-generic Fixed.__index bails
         // at the very next line (`!generic_decl`), so tucking this after
         // those checks would silently skip the non-generic case entirely.
-        wrap_index_result_deref(node);
-        if (node->call.type_arg_count > 0) return; // already explicit
+        if (node->call.type_arg_count > 0) {
+            wrap_index_result_deref(node);
+            return; // already explicit
+        }
         if (!node->call.sym || !node->call.sym->generic_decl) return; // not generic
         if (!node->call.sym->type || node->call.sym->type->cls != TYPE_FUNCTION) return;
 
@@ -2260,6 +2262,7 @@ void infer_generic(ASTNode* node, Type* target) {
         } else {
             free(inferred_args);
         }
+        wrap_index_result_deref(node);
         return;
     }
 
@@ -2889,8 +2892,8 @@ void Typecheck_Tree(ASTNode* node) {
                     is_vararg = node->call.sym->type->function.is_vararg;
 
                     if (generic_resolved) {
-                        inst_sym = Generic_Instantiate(node->call.sym, node->call.type_args, node->call.type_arg_count);
                         ASTNode* gdecl = node->call.sym->generic_decl;
+                        inst_sym = Generic_Instantiate(node->call.sym, node->call.type_args, node->call.type_arg_count);
                         ptypes = (Type**)malloc(pcount * sizeof(Type*));
                         for (size_t i = 0; i < pcount; i++) {
                             ptypes[i] = Type_Substitute(
