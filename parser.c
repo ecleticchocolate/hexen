@@ -1713,6 +1713,8 @@ static bool curr_names_enum(void) {
 // parser — same three parallel malloc'd arrays, same grow-on-overflow
 // doubling, same s_in_struct_literal_field save/restore around the value
 // parse — differing only in what happened to sdef before/after the loop.
+static ASTNode* parse_brace_literal(void); // fwd decl: used by `new T{...}` above its own definition
+
 static ASTNode* parse_struct_literal_body(void) {
     ASTNode* node = new_node(AST_STRUCT_LITERAL);
     node->struct_lit.sdef = NULL;
@@ -1996,8 +1998,12 @@ static ASTNode* parse_new_expr(void) {
             // case did this same recursion, just too late for a comptime fold,
             // which runs at parse time, before typecheck).
             if (t->cls != TYPE_STRUCT) parse_error("'new T{...}' initializer requires T to be a struct");
-            advance(); // consume '{'
-            ASTNode* lit = parse_struct_literal_body();
+            // Dispatch on shape (struct-shaped `.field = ...` vs positional) the
+            // SAME way every other brace-literal site does, instead of always
+            // calling the designated-only sub-parser directly — that shortcut is
+            // what silently dropped positional support here. parse_brace_literal
+            // consumes the '{' itself, so don't advance() past it first.
+            ASTNode* lit = parse_brace_literal();
             resolve_brace_literal(lit, t);
             node->new_expr.init = lit;
         }
