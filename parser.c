@@ -1718,6 +1718,7 @@ static ASTNode* parse_brace_literal(void); // fwd decl: used by `new T{...}` abo
 static ASTNode* parse_struct_literal_body(void) {
     ASTNode* node = new_node(AST_STRUCT_LITERAL);
     node->struct_lit.sdef = NULL;
+    node->struct_lit.pack_index = -1;
     size_t cap = 8;
     node->struct_lit.field_names = malloc(cap * sizeof(char*));
     node->struct_lit.field_name_lens = malloc(cap * sizeof(size_t));
@@ -1742,6 +1743,10 @@ static ASTNode* parse_struct_literal_body(void) {
         s_in_struct_literal_field = true;
         node->struct_lit.values[node->struct_lit.count] = parse_expr_prec(2); // above assignment, below comma
         s_in_struct_literal_field = prev_slf;
+        if (s_curr.type == TOK_ELLIPSIS) {
+            advance();
+            node->struct_lit.pack_index = (int)node->struct_lit.count;
+        }
         node->struct_lit.count++;
         if (s_curr.type == TOK_COMMA) advance();
     }
@@ -2346,6 +2351,7 @@ static ASTNode* parse_brace_literal(void) {
     } else {
         ASTNode* node = new_node(AST_ARRAY_LITERAL);
         node->array_lit.elem_type = NULL;
+        node->array_lit.pack_index = -1;
         size_t cap = 8;
         node->array_lit.values = (ASTNode**)malloc(cap * sizeof(ASTNode*));
         node->array_lit.count = 0;
@@ -2354,7 +2360,12 @@ static ASTNode* parse_brace_literal(void) {
                 cap *= 2;
                 node->array_lit.values = realloc(node->array_lit.values, cap * sizeof(ASTNode*));
             }
-            node->array_lit.values[node->array_lit.count++] = parse_expr_prec(2);
+            node->array_lit.values[node->array_lit.count] = parse_expr_prec(2);
+            if (s_curr.type == TOK_ELLIPSIS) {
+                advance();
+                node->array_lit.pack_index = (int)node->array_lit.count;
+            }
+            node->array_lit.count++;
             if (s_curr.type == TOK_COMMA) advance();
         }
         if (s_curr.type != TOK_RBRACE) parse_error("Expected '}' to end array literal");

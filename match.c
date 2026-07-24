@@ -144,8 +144,88 @@ void compile_pattern(ASTNode* pat, ASTNode* scrut, Type* scrut_type, ASTNode** o
     }
 
     if (pat->type == AST_STRUCT_LITERAL) {
+        int pack_idx = pat->struct_lit.pack_index;
         for (size_t i = 0; i < pat->struct_lit.count; i++) {
             ASTNode* elem_pat = pat->struct_lit.values[i];
+            if (pack_idx >= 0 && (int)i == pack_idx) {
+                bool is_deref = (elem_pat->type == AST_DEREF);
+                ASTNode* id_node = is_deref ? elem_pat->unary : elem_pat;
+                if (id_node && id_node->type == AST_IDENT) {
+                    const char* nm = id_node->ident.name;
+                    size_t nml = id_node->ident.name_len;
+                    StructDef* sd = (scrut_type && scrut_type->cls == TYPE_STRUCT) ? Struct_Find(scrut_type->struct_name) : NULL;
+                    if (sd && pack_idx <= (int)sd->field_count) {
+                        size_t tail_n = sd->field_count - pack_idx;
+                        Type** ftypes = (Type**)malloc((tail_n ? tail_n : 1) * sizeof(Type*));
+                        for (size_t k = 0; k < tail_n; k++) ftypes[k] = sd->fields[pack_idx + k].type;
+                        StructDef* rest_sd = Struct_MakeAnon(ftypes, tail_n, sd->is_overlapping);
+                        free(ftypes);
+                        Type* rest_type = (Type*)calloc(1, sizeof(Type));
+                        rest_type->cls = TYPE_STRUCT;
+                        rest_type->struct_name = rest_sd->name;
+
+                        ASTNode* rhs = NULL;
+                        Type* bind_type = NULL;
+                        if (is_deref) {
+                            bind_type = (Type*)calloc(1, sizeof(Type));
+                            bind_type->cls = TYPE_POINTER;
+                            bind_type->pointer_base = rest_type;
+
+                            ASTNode* field_addr = NULL;
+                            if (pack_idx < (int)sd->field_count) {
+                                ASTNode* field_node = new_node(AST_FIELD);
+                                field_node->field.base = scrut;
+                                field_node->field.field_name = sd->fields[pack_idx].name;
+                                field_node->field.field_name_len = strlen(sd->fields[pack_idx].name);
+                                field_addr = new_node(AST_ADDR);
+                                field_addr->unary = field_node;
+                            } else {
+                                ASTNode* addr_node = new_node(AST_ADDR);
+                                addr_node->unary = scrut;
+                                field_addr = addr_node;
+                            }
+                            ASTNode* cast_node = new_node(AST_CAST);
+                            cast_node->cast.expr = field_addr;
+                            cast_node->cast.target_type = bind_type;
+                            rhs = cast_node;
+                        } else {
+                            bind_type = rest_type;
+                            Type* ptr_rest = (Type*)calloc(1, sizeof(Type));
+                            ptr_rest->cls = TYPE_POINTER;
+                            ptr_rest->pointer_base = rest_type;
+
+                            ASTNode* field_addr = NULL;
+                            if (pack_idx < (int)sd->field_count) {
+                                ASTNode* field_node = new_node(AST_FIELD);
+                                field_node->field.base = scrut;
+                                field_node->field.field_name = sd->fields[pack_idx].name;
+                                field_node->field.field_name_len = strlen(sd->fields[pack_idx].name);
+                                field_addr = new_node(AST_ADDR);
+                                field_addr->unary = field_node;
+                            } else {
+                                ASTNode* addr_node = new_node(AST_ADDR);
+                                addr_node->unary = scrut;
+                                field_addr = addr_node;
+                            }
+                            ASTNode* cast_node = new_node(AST_CAST);
+                            cast_node->cast.expr = field_addr;
+                            cast_node->cast.target_type = ptr_rest;
+                            ASTNode* deref_node = new_node(AST_DEREF);
+                            deref_node->unary = cast_node;
+                            rhs = deref_node;
+                        }
+
+                        Symbol* pre = find_predeclared_symbol(nm, nml);
+                        SymbolKind kind = s_symtable->is_function_scope ? SYM_LOCAL : SYM_GLOBAL;
+                        Symbol* sym = pre ? pre : SymTable_Add(s_symtable, nm, nml, bind_type, kind);
+                        if (pre) pre->type = bind_type;
+                        ASTNode* decl = make_decl_stmt(bind_type, nm, nml, sym, rhs);
+                        DA_PUSH(*out_decls, *decl_count, *decl_cap, decl);
+                        continue;
+                    }
+                }
+            }
+
             ASTNode* elem_scrut = new_node(AST_FIELD);
             elem_scrut->field.base = scrut;
             elem_scrut->field.field_name = pat->struct_lit.field_names[i];
@@ -257,7 +337,27 @@ ASTNode* Lower_Match(ASTNode* node, Type* st) {
         SymbolTable* arm_scope = node->match_stmt.arm_scopes[a];
         bool is_wildcard = (pat == NULL);
 
-        if (!is_wildcard && Type_IsAggregate(st)) resolve_brace_literal(pat, st);
+        if (!is_wildcard && Type_IsAggregate(st)) {
+            Type* check_t = (st->cls == TYPE_POINTER && st->pointer_base) ? st->pointer_base : st;
+            if (check_t->cls == TYPE_STRUCT) {
+                StructDef* sd = Struct_Find(check_t->struct_name);
+                if (sd && pat->type == AST_ARRAY_LITERAL) {
+                    int min_req = (pat->array_lit.pack_index >= 0) ? pat->array_lit.pack_index : (int)pat->array_lit.count;
+                    if ((int)sd->field_count < min_req) {
+                        ASTNode* cond = new_node(AST_INT_LITERAL);
+                        cond->lit_kind = LIT_BOOL;
+                        cond->int_value = 0;
+                        ASTNode* ifn = new_node(AST_IF);
+                        ifn->if_stmt.condition = cond;
+                        ifn->if_stmt.true_block = body;
+                        ifn->if_stmt.false_block = NULL;
+                        matchchain_add_arm(&mc, ifn, body, false);
+                        continue;
+                    }
+                }
+            }
+            resolve_brace_literal(pat, st);
+        }
 
         bool is_variant_pattern = !is_wildcard && is_enum_match && pat->type == AST_STRUCT_LITERAL &&
             (pat->struct_lit.is_enum_variant ||

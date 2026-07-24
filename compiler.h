@@ -635,6 +635,7 @@ typedef struct ASTNode {
             // (`{.field=..}`: field_names=designated fields). Ignored once sdef
             // is filled in (a resolved enum literal sets sdef + is_enum_variant).
             bool is_enum_variant;
+            int pack_index; // -1 if no pack tail (...), >= 0 for pack tail element index
         } struct_lit;
         struct {
             struct ASTNode* base;  // the array (or pointer) being indexed
@@ -644,6 +645,7 @@ typedef struct ASTNode {
             struct Type* elem_type;     // element type
             struct ASTNode** values;
             size_t count;
+            int pack_index; // -1 if no pack tail (...), >= 0 for pack tail element index
         } array_lit;
         struct {
             struct Type* alloc_type;    // the T in `new T` (element type for arrays)

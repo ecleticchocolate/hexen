@@ -602,6 +602,9 @@ void resolve_brace_literal(ASTNode* node, Type* target) {
         // Validate each named field exists; recurse so nested `{...}` field values
         // resolve against the field's declared type.
         for (size_t i = 0; i < node->struct_lit.count; i++) {
+            if (node->struct_lit.pack_index >= 0 && (int)i == node->struct_lit.pack_index && i >= sd->field_count) {
+                continue;
+            }
             StructField* f = Struct_FindField(sd, node->struct_lit.field_names[i],
                                               node->struct_lit.field_name_lens[i]);
             if (!f) {
@@ -666,7 +669,7 @@ void resolve_brace_literal(ASTNode* node, Type* target) {
                          "use `.Variant{..}` or %s.Variant{..}", sd->name, sd->name);
                 Error_AtNode(node, msg, NULL);
             }
-            if (node->array_lit.count > sd->field_count) {
+            if (node->array_lit.pack_index < 0 && node->array_lit.count > sd->field_count) {
                 char msg[256];
                 snprintf(msg, sizeof(msg),
                          "positional literal for struct %s has %zu values, expected %zu fields",
@@ -678,22 +681,29 @@ void resolve_brace_literal(ASTNode* node, Type* target) {
             size_t n = sd->field_count;
             size_t provided = node->array_lit.count;
             ASTNode** orig_vals = node->array_lit.values;
-            ASTNode** vals = (ASTNode**)malloc(n * sizeof(ASTNode*));
+            ASTNode** vals = (ASTNode**)malloc(provided * sizeof(ASTNode*));
             for (size_t i = 0; i < provided; i++) vals[i] = orig_vals[i];
             // Un-provided fields are handled by codegen: pre-zero covers no-default fields,
             // and has_default fields are stamped from default_val_buf. Don't synthesize
             // explicit zeros — they would overwrite defaults. Only emit entries for
             // the values that were actually provided (positional order).
+            int orig_pack_index = node->array_lit.pack_index;
             node->type = AST_STRUCT_LITERAL;
             node->struct_lit.sdef = NULL;              // set by the struct resolver below
             node->struct_lit.is_enum_variant = false;
+            node->struct_lit.pack_index = orig_pack_index;
             node->struct_lit.count = provided;
             node->struct_lit.values = vals;
-            node->struct_lit.field_names = (const char**)malloc((n ? n : 1) * sizeof(char*));
-            node->struct_lit.field_name_lens = (size_t*)malloc((n ? n : 1) * sizeof(size_t));
-            for (size_t i = 0; i < n; i++) {
-                node->struct_lit.field_names[i] = sd->fields[i].name;
-                node->struct_lit.field_name_lens[i] = strlen(sd->fields[i].name);
+            node->struct_lit.field_names = (const char**)malloc((provided ? provided : 1) * sizeof(char*));
+            node->struct_lit.field_name_lens = (size_t*)malloc((provided ? provided : 1) * sizeof(size_t));
+            for (size_t i = 0; i < provided; i++) {
+                if (i < sd->field_count) {
+                    node->struct_lit.field_names[i] = sd->fields[i].name;
+                    node->struct_lit.field_name_lens[i] = strlen(sd->fields[i].name);
+                } else {
+                    node->struct_lit.field_names[i] = "";
+                    node->struct_lit.field_name_lens[i] = 0;
+                }
             }
             // Now an AST_STRUCT_LITERAL with sdef==NULL: re-run the resolver so the
             // struct branch above fills sdef and recurses into each positional value.
