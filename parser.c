@@ -856,6 +856,7 @@ ASTNode* make_decl_stmt(Type* var_type, const char* name, size_t name_len,
     ASTNode* assign = new_node(AST_ASSIGN);
     assign->binary.left = make_ident_node(name, name_len, sym);
     assign->binary.right = init_expr;
+    assign->binary.is_init = true;
 
     ASTNode* blk = new_node(AST_BLOCK);
     blk->block.capacity = 2;
@@ -1478,10 +1479,38 @@ static Type* parse_type_ex(bool allow_array) {
         // While parsing `new`'s type, a postfix that starts a new line is the next
         // statement (`new u32` <nl> `*x = 42`), not part of this type.
         if (s_new_type_no_nl_postfix && s_curr_newline_before &&
-            (s_curr.type == TOK_STAR || s_curr.type == TOK_LBRACKET)) break;
+            (s_curr.type == TOK_STAR || s_curr.type == TOK_LBRACKET || s_curr.type == TOK_CARET || s_curr.type == TOK_SINGLE_QUOTE)) break;
         if (s_curr.type == TOK_STAR) {
             advance();
             base_t = make_pointer_type(base_t);
+        } else if (s_curr.type == TOK_CARET) {
+            advance();
+            StructDef* sd = Struct_Find("SmartPtr");
+            if (sd) {
+                Type** targs = (Type**)malloc(sizeof(Type*));
+                targs[0] = base_t;
+                StructDef* inst = Struct_Instantiate(sd, targs, 1);
+                Type* res = (Type*)calloc(1, sizeof(Type));
+                res->cls = TYPE_STRUCT;
+                res->struct_name = inst->name;
+                base_t = res;
+            } else {
+                parse_error("T^ type sugar requires 'SmartPtr' to be defined");
+            }
+        } else if (s_curr.type == TOK_SINGLE_QUOTE) {
+            advance();
+            StructDef* sd = Struct_Find("Unique");
+            if (sd) {
+                Type** targs = (Type**)malloc(sizeof(Type*));
+                targs[0] = base_t;
+                StructDef* inst = Struct_Instantiate(sd, targs, 1);
+                Type* res = (Type*)calloc(1, sizeof(Type));
+                res->cls = TYPE_STRUCT;
+                res->struct_name = inst->name;
+                base_t = res;
+            } else {
+                parse_error("T' type sugar requires 'Unique' to be defined");
+            }
         } else if (allow_array && s_curr.type == TOK_LBRACKET) {
             // Gather the contiguous run of dimensions, then fold right-to-left.
             uint64_t dims[8];

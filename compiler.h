@@ -20,7 +20,7 @@ typedef enum {
     
     // Operators
     TOK_PLUS, TOK_MINUS, TOK_STAR, TOK_SLASH, TOK_MOD,
-    TOK_AMP, TOK_PIPE, TOK_CARET, TOK_SHL, TOK_SHR,
+    TOK_AMP, TOK_PIPE, TOK_CARET, TOK_SINGLE_QUOTE, TOK_SHL, TOK_SHR,
     TOK_EQEQ, TOK_NEQ, TOK_LT, TOK_GT, TOK_LTE, TOK_GTE,
     TOK_ANDAND, TOK_OROR, TOK_BANG, TOK_TILDE,
     TOK_EQ, // =
@@ -481,6 +481,7 @@ typedef struct ASTNode {
                                // right's binop) -- codegen must spill its address
                                // instead of walking it twice. See compile_lvalue's
                                // memo in backend_x64.c.
+            bool is_init;     // AST_ASSIGN only: true when this assign comes from a TYPE x = expr initialization
         } binary;
         struct {
             struct Type* var_type;

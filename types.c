@@ -1318,6 +1318,10 @@ static bool rewrite_operand_to_method_call(ASTNode* node, ASTNode* recv, ASTNode
     // left the other two free to rewrite (and corrupt) an ordinary assignment
     // whenever THEY happened to visit the node first.
     if (node->type == AST_ASSIGN) {
+        if (node->binary.is_init) {
+            Type* arg_t = Type_Infer(arg);
+            if (arg_t && Type_Equals(rt, arg_t)) return false; // Same-type initialization (T x = val) MUST NOT dispatch to __assign!
+        }
         if (!msym->type || msym->type->cls != TYPE_FUNCTION ||
             msym->type->function.param_count < 2) {
             return false;
@@ -1386,7 +1390,19 @@ static bool rewrite_operand_to_method_call(ASTNode* node, ASTNode* recv, ASTNode
         } else {
             matches = check_assignable_ne(param_t, arg, "__assign argument");
         }
-        if (!matches) return false;
+        if (!matches) {
+            if (!node->binary.is_init && param_t && param_t->cls == TYPE_POINTER && 
+                Type_Equals(param_t->pointer_base, rt)) {
+                char msg[256];
+                char pt_buf[128], arg_buf[128];
+                Type_ToString(param_t, pt_buf, sizeof(pt_buf));
+                Type* arg_t = Type_Infer(arg);
+                Type_ToString(arg_t ? arg_t : (Type*)NULL, arg_buf, sizeof(arg_buf));
+                snprintf(msg, sizeof(msg), "__assign expects '%s', got '%s'", pt_buf, arg_buf);
+                Error_AtNode(node, msg, NULL);
+            }
+            return false;
+        }
     }
 
     ASTNode* target = (ASTNode*)calloc(1, sizeof(ASTNode));
@@ -1679,7 +1695,20 @@ Type* Type_Infer(ASTNode* node) {
 
         case AST_DEREF: {
             Type* base = Type_Infer(node->unary);
-            t = (base && base->cls == TYPE_POINTER) ? base->pointer_base : NULL;
+            if (base && base->cls == TYPE_POINTER) {
+                t = base->pointer_base;
+            } else if (base && base->cls == TYPE_STRUCT) {
+                Symbol* msym = Method_Resolve(base, "__deref", 7);
+                if (msym && msym->type && msym->type->cls == TYPE_FUNCTION && msym->type->function.return_type) {
+                    Type* ret = msym->type->function.return_type;
+                    ret = Type_Substitute_Through_Instance(ret, Struct_Find(base->struct_name));
+                    t = (ret->cls == TYPE_POINTER) ? ret->pointer_base : ret;
+                } else {
+                    t = NULL;
+                }
+            } else {
+                t = NULL;
+            }
             break;
         }
 
@@ -1711,6 +1740,39 @@ Type* Type_Infer(ASTNode* node) {
                 Error_AtNode(node, msg, NULL);
             }
             StructField* f = Struct_FindField(sd, node->field.field_name, node->field.field_name_len);
+            if (!f && bt && bt->cls == TYPE_STRUCT && Method_Resolve(bt, "__deref", 7)) {
+                Symbol* msym = Method_Resolve(bt, "__deref", 7);
+                if (msym && msym->type && msym->type->cls == TYPE_FUNCTION && msym->type->function.return_type) {
+                    Type* ret = msym->type->function.return_type;
+                    ret = Type_Substitute_Through_Instance(ret, Struct_Find(bt->struct_name));
+                    Type* deref_t = (ret->cls == TYPE_POINTER) ? ret->pointer_base : ret;
+                    if (deref_t && deref_t->cls == TYPE_STRUCT) {
+                        StructDef* dsd = Struct_Find(deref_t->struct_name);
+                        if (dsd) {
+                            f = Struct_FindField(dsd, node->field.field_name, node->field.field_name_len);
+                            if (f) {
+                                ASTNode* df = (ASTNode*)calloc(1, sizeof(ASTNode));
+                                df->type = AST_FIELD;
+                                df->field.base = node->field.base;
+                                df->field.field_name = "__deref";
+                                df->field.field_name_len = 7;
+                                df->line = node->line;
+                                df->column = node->column;
+                                
+                                ASTNode* dcall = (ASTNode*)calloc(1, sizeof(ASTNode));
+                                dcall->type = AST_CALL;
+                                dcall->call.target_expr = df;
+                                dcall->line = node->line;
+                                dcall->column = node->column;
+                                
+                                 Typecheck_Tree(dcall);
+                                node->field.base = dcall;
+                                sd = dsd;
+                            }
+                        }
+                    }
+                }
+            }
             if (!f) {
                 char msg[192];
                 snprintf(msg, sizeof(msg), "%s '%s' has no field '%.*s'", sd->is_overlapping ? "union" : "struct", sd->name,
@@ -2613,10 +2675,67 @@ void Typecheck_Tree(ASTNode* node) {
     if (!node) return;
 
     switch (node->type) {
-        case AST_BLOCK:
-            for (size_t i = 0; i < node->block.count; i++)
-                Typecheck_Tree(node->block.statements[i]);
+        case AST_BLOCK: {
+            for (size_t i = 0; i < node->block.count; i++) {
+                ASTNode* stmt = node->block.statements[i];
+                Typecheck_Tree(stmt);
+                
+                if (!node->block.transparent) {
+                    ASTNode* decl = NULL;
+                    if (stmt) {
+                        if (stmt->type == AST_DECLARATION) {
+                            decl = stmt;
+                        } else if (stmt->type == AST_BLOCK && stmt->block.transparent && 
+                                   stmt->block.count > 0 && stmt->block.statements[0]->type == AST_DECLARATION) {
+                            decl = stmt->block.statements[0];
+                        }
+                    }
+                    
+                    if (decl) {
+                        Type* vt = decl->decl.var_type;
+                        if (vt && vt->cls == TYPE_STRUCT && Method_Resolve(vt, "__delete", 8)) {
+                            ASTNode* ident = (ASTNode*)calloc(1, sizeof(ASTNode));
+                            ident->type = AST_IDENT;
+                            ident->ident.name = decl->decl.name;
+                            ident->ident.name_len = decl->decl.name_len;
+                            ident->ident.sym = decl->decl.sym;
+                            ident->line = decl->line;
+                            ident->column = decl->column;
+                            
+                            ASTNode* field = (ASTNode*)calloc(1, sizeof(ASTNode));
+                            field->type = AST_FIELD;
+                            field->field.base = ident;
+                            field->field.field_name = "__delete";
+                            field->field.field_name_len = 8;
+                            field->line = decl->line;
+                            field->column = decl->column;
+                            
+                            ASTNode* call = (ASTNode*)calloc(1, sizeof(ASTNode));
+                            call->type = AST_CALL;
+                            call->call.target_expr = field;
+                            call->line = decl->line;
+                            call->column = decl->column;
+                            Typecheck_Tree(call);
+                            
+                            ASTNode* defer_node = (ASTNode*)calloc(1, sizeof(ASTNode));
+                            defer_node->type = AST_DEFER;
+                            defer_node->unary = call;
+                            defer_node->line = decl->line;
+                            defer_node->column = decl->column;
+                            
+                            node->block.count++;
+                            node->block.statements = realloc(node->block.statements, node->block.count * sizeof(ASTNode*));
+                            for (size_t j = node->block.count - 1; j > i + 1; j--) {
+                                node->block.statements[j] = node->block.statements[j - 1];
+                            }
+                            node->block.statements[i + 1] = defer_node;
+                            i++;
+                        }
+                    }
+                }
+            }
             return;
+        }
 
         case AST_FUNC_DECL: {
             if (node->func_decl.type_param_count > 0) return;
@@ -3022,6 +3141,36 @@ void Typecheck_Tree(ASTNode* node) {
         case AST_DEREF: {
             Typecheck_Tree(node->unary);
             Type* base = Type_Infer(node->unary);
+            if (base && base->cls == TYPE_STRUCT && Method_Resolve(base, "__deref", 7)) {
+                ASTNode* field = (ASTNode*)calloc(1, sizeof(ASTNode));
+                field->type = AST_FIELD;
+                field->field.base = node->unary;
+                field->field.field_name = "__deref";
+                field->field.field_name_len = 7;
+                field->line = node->line;
+                field->column = node->column;
+                
+                ASTNode* call = (ASTNode*)calloc(1, sizeof(ASTNode));
+                call->type = AST_CALL;
+                call->call.target_expr = field;
+                call->line = node->line;
+                call->column = node->column;
+                
+                Typecheck_Tree(call);
+                Type* ret_t = Type_Infer(call);
+                if (ret_t && ret_t->cls == TYPE_POINTER) {
+                    ASTNode* deref = (ASTNode*)calloc(1, sizeof(ASTNode));
+                    deref->type = AST_DEREF;
+                    deref->unary = call;
+                    deref->line = node->line;
+                    deref->column = node->column;
+                    *node = *deref;
+                } else {
+                    *node = *call;
+                }
+                Type_Infer(node);
+                return;
+            }
             // *expr requires expr to be a pointer. Type_Infer's own AST_DEREF case
             // already detects this (returns NULL when base isn't TYPE_POINTER) but
             // treats it as "type unknown" rather than an error — every downstream
