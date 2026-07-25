@@ -1436,10 +1436,28 @@ static bool rewrite_operand_to_method_call(ASTNode* node, ASTNode* recv, ASTNode
                     }
                     if (all_fields_exist && arg->struct_lit.count > 0) return false;
                 } else if (arg->type == AST_ARRAY_LITERAL && !arg->array_lit.elem_type &&
-                           arg->array_lit.count <= rt_sd_for_check->field_count) {
+                           arg->array_lit.count <= rt_sd_for_check->field_count &&
+                           param_t->cls != TYPE_ARRAY) {
                     return false;
                 }
             }
+        }
+        // resolve_brace_literal writes the literal's element count back into
+        // target->array.count when the target's size is inferred (`T[N]` with
+        // N not yet pinned, count==0/count_expr==NULL — see its own comment).
+        // param_t here is __assign's DECLARED parameter type, read straight off
+        // msym's cached signature and shared by every call site that resolves
+        // against this same __assign. Left un-cloned, the first `w = {1,2,3,4}`
+        // would permanently bake count=4 into that shared Type*, so a later
+        // `w = {9,9}` on the same (or any other) variable would wrongly be
+        // checked against a pinned-4 array instead of getting its own N.
+        // Clone just the array-type shell (element pointer is shared/read-only,
+        // fine to alias) so the mutation lands on a throwaway copy local to
+        // this one assignment.
+        if (param_t->cls == TYPE_ARRAY && param_t->array.count == 0 && !param_t->array.count_expr) {
+            Type* param_t_copy = (Type*)malloc(sizeof(Type));
+            *param_t_copy = *param_t;
+            param_t = param_t_copy;
         }
         resolve_brace_literal(arg, param_t);
         bool matches = false;
