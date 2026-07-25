@@ -511,12 +511,12 @@ static Type* parse_generic_value_arg(Type* pin) {
         // through as unresolved, and nothing downstream (clone_ast cloning
         // this struct's methods, none of which are themselves generic) ever
         // revisits it -- so it silently reads back as a scalar 0.
-        if (expr->type == AST_IDENT && expr->ident.sym && expr->ident.sym->generic_decl &&
-            expr->ident.type_arg_count > 0) {
+        bool maybe_outer_param = expr_mentions_generic_param(expr) && s_type_param_count > 0;
+        if (!maybe_outer_param && expr->type == AST_IDENT && expr->ident.sym &&
+            expr->ident.sym->generic_decl && expr->ident.type_arg_count > 0) {
             expr->ident.sym = Generic_Instantiate(expr->ident.sym, expr->ident.type_args,
                                                   expr->ident.type_arg_count);
         }
-        bool maybe_outer_param = expr_mentions_generic_param(expr) && s_type_param_count > 0;
         if (maybe_outer_param) {
             // Depends on an outer, not-yet-concrete generic param (e.g. this
             // struct is itself being defined/used inside another generic's
@@ -2586,6 +2586,43 @@ static ASTNode* parse_postfix(void) {
             fnode->field.field = NULL;
             fnode->field.sdef = NULL;
             node = fnode;
+
+            // A static method used as a VALUE (`Type.method`, rather than
+            // `Type.method(...)`) is the same function symbol as a static
+            // method call. Lower it to an identifier now so constexpr and
+            // const-generic function-value handling see the real mangled
+            // function, not an AST_FIELD whose base is a type expression.
+            // Calls remain AST_FIELDs and use try_rewrite_method_call(), which
+            // also performs the normal call-specific validation.
+            if (s_curr.type != TOK_LPAREN &&
+                fnode->field.base && fnode->field.base->type == AST_TYPE_EXPR &&
+                fnode->field.base->sizeof_expr.type &&
+                fnode->field.base->sizeof_expr.type->cls == TYPE_STRUCT) {
+                Type* base_type = fnode->field.base->sizeof_expr.type;
+                Symbol* static_sym = Method_Resolve(base_type,
+                                                    fnode->field.field_name,
+                                                    fnode->field.field_name_len);
+                if (static_sym && static_sym->is_static) {
+                    ASTNode* id = new_node(AST_IDENT);
+                    id->ident.name = static_sym->name;
+                    id->ident.name_len = static_sym->name_len;
+                    id->ident.sym = static_sym;
+
+                    // A generic static method in `impl Box[T]` inherits the
+                    // concrete instantiation's type arguments. Carry them as
+                    // explicit args exactly as `box_method[T]` would.
+                    StructDef* sd = Struct_Find(base_type->struct_name);
+                    if (sd && sd->generic_base && sd->type_arg_count > 0 &&
+                        static_sym->generic_decl) {
+                        size_t n = sd->type_arg_count;
+                        id->ident.type_args = malloc(n * sizeof(Type*));
+                        for (size_t i = 0; i < n; i++)
+                            id->ident.type_args[i] = sd->type_args[i];
+                        id->ident.type_arg_count = n;
+                    }
+                    node = id;
+                }
+            }
 
             // `.method[TypeArgs](...)`: explicit generic type arguments on a
             // METHOD call (as opposed to a bare `identity[i32](...)` call,

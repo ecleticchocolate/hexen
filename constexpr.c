@@ -1209,8 +1209,25 @@ static bool ce_eval_ident(ASTNode* node, int64_t* out) {
             // a plain (non-generic) function folded fine.
             if (node->ident.sym && node->ident.sym->kind == SYM_FUNCTION &&
                 node->ident.sym->generic_decl && node->ident.type_arg_count > 0) {
-                Symbol* isym = Generic_Instantiate(node->ident.sym, node->ident.type_args,
-                                                    node->ident.type_arg_count);
+                // Same substitution the AST_CALL fold path already does a few
+                // hundred lines up: a generic fn value referenced with explicit
+                // type args (`vec_step[T]` stored as a const-generic value on
+                // Cursor[E,S,F]) must have those args substituted through the
+                // currently-installed generic frame before instantiating, or a
+                // deferred re-fold at outer monomorphization time still sees T
+                // abstract while self.state is already concrete.
+                Type** targs = node->ident.type_args;
+                size_t targc = node->ident.type_arg_count;
+                Type** sub_targs = NULL;
+                if (targc > 0 && s_ce_generic_n > 0) {
+                    sub_targs = malloc(targc * sizeof(Type*));
+                    for (size_t i = 0; i < targc; i++)
+                        sub_targs[i] = Type_Substitute(targs[i], s_ce_generic_params,
+                                                       s_ce_generic_args, s_ce_generic_n);
+                    targs = sub_targs;
+                }
+                Symbol* isym = Generic_Instantiate(node->ident.sym, targs, targc);
+                if (sub_targs) free(sub_targs);
                 *out = (int64_t)(intptr_t)isym;
                 s_ce_isfloat = false; s_ce_isagg = false; s_ce_isfnsym = true;
                 return true;

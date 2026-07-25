@@ -849,7 +849,13 @@ Type* Type_Substitute(Type* t, const char** params, Type** args, size_t n) {
         // frame active so its params resolve, then produce a concrete value pinned
         // to the same type. Mirrors the array.count_expr deferral below.
         CeGenericFrame saved = ce_generic_frame_install(params, args, n);
-        Type* pin = t->cval.pin;
+        // The pin may itself reference sibling params in the same generic
+        // (e.g. fn(S*) Option[E*] for a const-generic fn slot F on
+        // Cursor[E,S,F]) -- substitute it through this frame before folding
+        // or storing, same discipline as every other type slot in
+        // Type_Substitute. Without this, clone_ast's LIT_FN_SYMBOL cast for F
+        // keeps the abstract S/E param types and F(&self.state) fails assignability.
+        Type* pin = Type_Substitute(t->cval.pin, params, args, n);
         bool aggregate = Type_IsAggregate(pin);
         Type* r = (Type*)calloc(1, sizeof(Type));
         r->cls = TYPE_CONST_VALUE;
