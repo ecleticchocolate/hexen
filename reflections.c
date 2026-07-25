@@ -179,6 +179,15 @@ static bool field_slot_unify(StructField* concrete, StructField* pat, ReflectBin
 bool reflect_unify(Type* concrete, Type* pattern, ReflectBindings* out) {
     if (!concrete && !pattern) return true;
 
+    // A bare top-level function reference carries TYPE_FN_LITERAL (see its
+    // construction in types.c AST_IDENT case) so generic instantiation can
+    // track WHICH function was passed. Every other consumer unwraps this via
+    // Type_FnLitShape to see the plain TYPE_FUNCTION shape underneath -- match
+    // on type must do the same, or `match F { fn(A) B {...} }` silently fails
+    // to match a scrutinee that came from a bare function name.
+    concrete = Type_FnLitShape(concrete);
+    pattern  = Type_FnLitShape(pattern);
+
     // Pattern hole: bind it to whatever the concrete side is here, and succeed.
     if (pattern && is_hole(pattern)) {
         return bind(out, pattern->param_name, concrete);

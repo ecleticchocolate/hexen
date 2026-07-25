@@ -303,7 +303,7 @@ ASTNode* Lower_Match(ASTNode* node, Type* st) {
     SymbolTable* prev_table = s_symtable;
     s_symtable = SymTable_Create(prev_table);
     s_symtable->is_function_scope = prev_table->is_function_scope;
-    SymbolKind kind = s_symtable->is_function_scope ? SYM_LOCAL : SYM_GLOBAL;
+    SymbolKind kind = SYM_LOCAL;
 
     static int s_switch_ctr = 0;
     char* mname = malloc(32); int mn = snprintf(mname, 32, "$s%d", s_switch_ctr++);
