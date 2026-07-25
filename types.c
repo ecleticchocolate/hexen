@@ -2773,7 +2773,17 @@ void Typecheck_Tree(ASTNode* node) {
                     
                     if (decl) {
                         Type* vt = decl->decl.var_type;
-                        if (vt && vt->cls == TYPE_STRUCT && Method_Resolve(vt, "__delete", 8)) {
+                        // Don't destruct a local that this block returns by name.
+                        bool is_return_value = false;
+                        if (node->block.count > 0) {
+                            ASTNode* last = node->block.statements[node->block.count - 1];
+                            if (last && last->type == AST_RETURN && last->unary &&
+                                last->unary->type == AST_IDENT &&
+                                last->unary->ident.sym == decl->decl.sym) {
+                                is_return_value = true;
+                            }
+                        }
+                        if (vt && vt->cls == TYPE_STRUCT && !is_return_value && Method_Resolve(vt, "__delete", 8)) {
                             ASTNode* ident = (ASTNode*)calloc(1, sizeof(ASTNode));
                             ident->type = AST_IDENT;
                             ident->ident.name = decl->decl.name;
