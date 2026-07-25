@@ -20,6 +20,14 @@ Type* Type_FnLitShape(Type* t) {
 }
 #define fn_lit_shape Type_FnLitShape
 
+Type* Type_FromStruct(StructDef* sd) {
+    if (!sd) return NULL;
+    Type* t = (Type*)calloc(1, sizeof(Type));
+    t->cls = TYPE_STRUCT;
+    t->struct_name = sd->name;
+    return t;
+}
+
 // --- Primitive classification ---
 
 // The one shared width table for every REAL (non-void) primitive. Exported
@@ -1314,6 +1322,13 @@ void try_rewrite_method_call(ASTNode* node) {
     node->call.target_name = mangled;
     node->call.target_name_len = manglen;
     node->call.sym = msym;
+    if (node->call.target_name_len == 15 &&
+        strncmp(node->call.target_name, "Vector___delete", 15) == 0) {
+        char bt_name[256];
+        Type_ToString(bt, bt_name, sizeof(bt_name));
+        fprintf(stderr, "DEBUG delete receiver=%s method=%.*s\\n", bt_name,
+                (int)msym->name_len, msym->name);
+    }
     if (sd && sd->generic_base && sd->type_arg_count > 0 && node->call.type_arg_count == 0) {
         // The struct fixes only a PREFIX of the method's type params (its own T,...);
         // the method may declare additional ones of its own (fn map[U](...)). Stash
@@ -1538,6 +1553,14 @@ bool try_rewrite_operator_method(ASTNode* node) {
 // try_rewrite_operator_method (see that function's own comment).
 bool try_rewrite_index_method(ASTNode* node) {
     if (node->type != AST_INDEX) return false;
+    Type* rt = Type_Infer(node->index.base);
+    if (rt && (rt->cls == TYPE_ARRAY || rt->cls == TYPE_POINTER)) {
+        // Raw array/pointer indexing already has built-in semantics; do not
+        // rewrite it to a __index method call. This avoids treating a pointer
+        // to a struct like Vector[u8]* as a method receiver and collapsing
+        // pointer indexing to the struct's own __index semantics.
+        return false;
+    }
     return rewrite_operand_to_method_call(node, node->index.base, node->index.index, "__index");
 }
 
@@ -1820,6 +1843,13 @@ Type* Type_Infer(ASTNode* node) {
                 Error_AtNode(node, "field access on pointer-to-pointer; use (*pp).field", NULL);
             }
             if (!sd) {
+                char bbuf[256] = {0};
+                Type* bt2 = Type_Infer(node->field.base);
+                Type_ToString(bt2, bbuf, sizeof(bbuf));
+                fprintf(stderr, "DEBUG AST_FIELD base=%s field=%.*s base_node=%d\n",
+                        bbuf,
+                        (int)node->field.field_name_len, node->field.field_name,
+                        node->field.base ? node->field.base->type : -1);
                 char msg[160];
                 snprintf(msg, sizeof(msg), "field access '.%.*s' on a non-struct value",
                          (int)node->field.field_name_len, node->field.field_name);
@@ -1851,7 +1881,7 @@ Type* Type_Infer(ASTNode* node) {
                                 dcall->line = node->line;
                                 dcall->column = node->column;
                                 
-                                 Typecheck_Tree(dcall);
+                                Typecheck_Tree(dcall);
                                 node->field.base = dcall;
                                 sd = dsd;
                             }
@@ -1859,7 +1889,24 @@ Type* Type_Infer(ASTNode* node) {
                     }
                 }
             }
+            if (node->field.field_name_len == 4 &&
+                strncmp(node->field.field_name, "data", 4) == 0) {
+                char field_buf[256] = {0};
+                Type_ToString(f ? f->type : NULL, field_buf, sizeof(field_buf));
+                char base_buf[256] = {0};
+                Type_ToString(bt, base_buf, sizeof(base_buf));
+                fprintf(stderr, "DEBUG AST_FIELD data field type=%s base=%s\n",
+                        field_buf, base_buf);
+            }
             if (!f) {
+                char bname[256] = {0};
+                char btname[256] = {0};
+                Type_ToString(bt, btname, sizeof(btname));
+                Type_ToString(node->field.sdef ? Type_FromStruct(node->field.sdef) : NULL, bname, sizeof(bname));
+                fprintf(stderr, "DEBUG AST_FIELD failed base-type=%s field=%.*s base_node=%d\n",
+                        btname,
+                        (int)node->field.field_name_len, node->field.field_name,
+                        node->field.base ? node->field.base->type : -1);
                 char msg[192];
                 snprintf(msg, sizeof(msg), "%s '%s' has no field '%.*s'", sd->is_overlapping ? "union" : "struct", sd->name,
                          (int)node->field.field_name_len, node->field.field_name);
@@ -1889,8 +1936,9 @@ Type* Type_Infer(ASTNode* node) {
 
         case AST_INDEX: {
             Type* base = Type_Infer(node->index.base);
-            if (base && base->cls == TYPE_ARRAY) t = base->array.element;
-            else if (base && base->cls == TYPE_POINTER) {
+            if (base && base->cls == TYPE_ARRAY) {
+                t = base->array.element;
+            } else if (base && base->cls == TYPE_POINTER) {
                 // "array indexing auto-derefs through a pointer" (specs.md §8):
                 // p[i] means (*p)[i]. When the pointee is itself an array type
                 // (e.g. p: u32[8]*), the element we want is the pointee
@@ -1898,8 +1946,23 @@ Type* Type_Infer(ASTNode* node) {
                 // p[i] would wrongly infer as u32[8] instead of u32.
                 Type* pointee = base->pointer_base;
                 t = (pointee && pointee->cls == TYPE_ARRAY) ? pointee->array.element : pointee;
+                if (node->index.base && node->index.base->type == AST_FIELD) {
+                    char baset[256] = {0};
+                    Type_ToString(base, baset, sizeof(baset));
+                    char elt[256] = {0};
+                    Type_ToString(t, elt, sizeof(elt));
+                    fprintf(stderr, "DEBUG INDEX base node=AST_FIELD base-type=%s result-type=%s\n", baset, elt);
+                }
             }
-            else { Error_AtNode(node, "indexing a non-array, non-pointer", NULL); }
+            else {
+                if (node->index.base) {
+                    char baset[256] = {0};
+                    Type_ToString(base, baset, sizeof(baset));
+                    fprintf(stderr, "DEBUG INDEX non-array-pointer base type=%s base node=%d\n",
+                            baset, node->index.base->type);
+                }
+                Error_AtNode(node, "indexing a non-array, non-pointer", NULL);
+            }
             break;
         }
 
@@ -3036,6 +3099,12 @@ void Typecheck_Tree(ASTNode* node) {
             }
             // Assignability: the initializer must be allowed into the declared type.
             if (node->decl.init_expr) {
+                if (node->decl.name_len == 1 && node->decl.name && node->decl.name[0] == 'e') {
+                    char want[256], got[256];
+                    Type_ToString(node->decl.var_type, want, sizeof(want));
+                    Type_ToString(Type_Infer(node->decl.init_expr), got, sizeof(got));
+                    fprintf(stderr, "DEBUG e declaration want=%s got=%s\\n", want, got);
+                }
                 char buf[256];
                 snprintf(buf, sizeof(buf), "declaration of %.*s",
                      node->decl.name ? (int)node->decl.name_len : 7,
@@ -4268,6 +4337,12 @@ Symbol* Generic_Instantiate(Symbol* generic, Type** targs, size_t targ_count) {
         }
     }
     // New instantiation: clone+substitute the generic decl now; compile later.
+    if (generic->name && strncmp(generic->name, "Vector___delete", 15) == 0) {
+        char arg_name[256] = {0}, sig_name[512] = {0};
+        if (targ_count > 0) Type_ToString(targs[0], arg_name, sizeof(arg_name));
+        Type_ToString(generic->type, sig_name, sizeof(sig_name));
+        fprintf(stderr, "DEBUG instantiate delete arg=%s sig=%s\\n", arg_name, sig_name);
+    }
     ASTNode* gdecl = generic->generic_decl;
     const char** params = gdecl->func_decl.type_params;
     size_t np = gdecl->func_decl.type_param_count;
@@ -4294,6 +4369,12 @@ Symbol* Generic_Instantiate(Symbol* generic, Type** targs, size_t targ_count) {
         }
     }
     ASTNode* inst = clone_ast(gdecl, params, argcopy, np, true);
+    if (generic->name && strncmp(generic->name, "Vector___delete", 15) == 0 &&
+        inst && inst->func_decl.param_count > 0 && inst->func_decl.param_syms[0]) {
+        char self_name[512];
+        Type_ToString(inst->func_decl.param_syms[0]->type, self_name, sizeof(self_name));
+        fprintf(stderr, "DEBUG cloned delete self=%s\\n", self_name);
+    }
     Resolve_Reflect_Matches(inst); // resolve every `match T` in this instantiation
                                     // once, here, so no downstream consumer
                                     // (Typecheck_Tree, ConstEval, or a future
