@@ -17,12 +17,13 @@ static ASTNode* parse_top_level(void);
 static ASTNode* parse_impl_block(bool is_pub);
 // impl_type_name/impl_type_len/impl_sd are non-NULL/non-zero only when parsing
 // a method inside an `impl TYPE { ... }` block: the parsed fn is then mangled
-// to `TYPE_method`, gets an injected `TYPE* self` first parameter, and its
-// generic scope is seeded from the struct's own type params before its own
-// (optional) `[...]` extension is parsed. impl_type_name must outlive the
-// call (it's stored on the AST and on self's Type) -- callers pass the
-// original, non-freed token text.
-static ASTNode* parse_fn_decl(bool is_pub, bool is_extern,
+// to `TYPE_method`, gets an injected `TYPE* self` first parameter (unless
+// is_static), and its generic scope is seeded from the struct's own type
+// params before its own (optional) `[...]` extension is parsed. is_static is
+// ignored when impl_type_name is NULL (top-level fn is never impl-static).
+// impl_type_name must outlive the call (it's stored on the AST and on self's
+// Type) -- callers pass the original, non-freed token text.
+static ASTNode* parse_fn_decl(bool is_pub, bool is_extern, bool is_static,
                               const char* impl_type_name, size_t impl_type_len,
                               StructDef* impl_sd);
 ASTNode* parse_expr_prec(int min_prec);
@@ -4019,7 +4020,7 @@ static ASTNode* parse_top_level(void) {
         if (s_curr.type != TOK_FN) parse_error("Expected 'fn' after 'extern'");
     }
 
-    { ASTNode* r = parse_fn_decl(is_pub, is_extern, NULL, 0, NULL); if (r) return r; }
+    { ASTNode* r = parse_fn_decl(is_pub, is_extern, false, NULL, 0, NULL); if (r) return r; }
 }
 
 // impl TypeName { fn method(...) RT { ... } ... }
@@ -4153,10 +4154,16 @@ static ASTNode* parse_impl_block(bool is_pub) {
     block->block.count = 0;
 
     while (s_curr.type != TOK_RBRACE && s_curr.type != TOK_EOF) {
-        if (s_curr.type != TOK_FN) parse_error("Expected 'fn' inside impl block");
+        // `static fn name(...)`: no self injection, called as Type.name(...).
+        // Only `static` on a `fn` is recognized here -- static DATA declarations
+        // inside impl are a separate, not-yet-supported extension.
+        bool method_is_static = false;
+        if (s_curr.type == TOK_STATIC) { method_is_static = true; advance(); }
+        if (s_curr.type != TOK_FN) parse_error("Expected 'fn' (optionally 'static fn') inside impl block");
         // parse_fn_decl handles the whole method: name mangling, self
-        // injection, generic-param merge with the struct's own, body.
-        ASTNode* node = parse_fn_decl(is_pub, false, impl_type, impl_type_len, impl_sd);
+        // injection (skipped for static), generic-param merge with the
+        // struct's own, body.
+        ASTNode* node = parse_fn_decl(is_pub, false, method_is_static, impl_type, impl_type_len, impl_sd);
 
         // parse_fn_decl restores s_type_params to whatever was active on
         // entry -- which for a method with no [U] extension already is the
@@ -4184,7 +4191,7 @@ static ASTNode* parse_impl_block(bool is_pub) {
 //
 // Takes the modifiers as parameters because they are consumed BEFORE the dispatch
 // (`pub extern fn ...`), so they cannot be re-read from s_curr here.
-static ASTNode* parse_fn_decl(bool is_pub, bool is_extern,
+static ASTNode* parse_fn_decl(bool is_pub, bool is_extern, bool is_static,
                               const char* impl_type_name, size_t impl_type_len,
                               StructDef* impl_sd) {
     if (s_curr.type == TOK_FN) {
@@ -4254,6 +4261,7 @@ static ASTNode* parse_fn_decl(bool is_pub, bool is_extern,
         ASTNode* node = new_node(AST_FUNC_DECL);
         node->func_decl.name = impl_type_name ? mname : name.start;
         node->func_decl.name_len = impl_type_name ? mname_len : name.length;
+        node->func_decl.is_static = impl_type_name ? is_static : false;
         node->func_decl.param_count = 0;
         node->func_decl.pack_param_index = -1; // packs not supported on impl methods yet
         size_t param_cap = 6;
@@ -4265,7 +4273,7 @@ static ASTNode* parse_fn_decl(bool is_pub, bool is_extern,
         s_symtable = SymTable_Create(prev_table);
         s_symtable->is_function_scope = true;
 
-        if (impl_type_name) {
+        if (impl_type_name && !is_static) {
             // Inject self as first param (name "self"), type TYPE*.
             Type* self_base = (Type*)calloc(1, sizeof(Type));
             if (strcmp(impl_type_name, "u8") == 0) { self_base->cls = TYPE_PRIMITIVE; self_base->primitive = PRIM_U8; }
@@ -4407,6 +4415,7 @@ static ASTNode* parse_fn_decl(bool is_pub, bool is_extern,
         node->func_decl.sym = func_sym;
         if (is_extern) func_sym->is_extern = true;
         if (is_pub) func_sym->is_pub = true;
+        func_sym->is_static = node->func_decl.is_static;
         func_sym->has_init = true;
         func_sym->func_decl = node; // for constexpr interpretation of the body
         node->func_decl.type_params = tparams;

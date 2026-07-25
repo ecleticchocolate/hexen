@@ -1157,6 +1157,56 @@ bool try_rewrite_call_operator(ASTNode* node, Type* tgt) {
 void try_rewrite_method_call(ASTNode* node) {
     if (!node->call.target_expr || node->call.target_expr->type != AST_FIELD) return;
     ASTNode* field_node = node->call.target_expr;
+
+    // `Type.method(...)`: the base is a bare TYPE used in expression
+    // position -- parser.c parses any registered struct/enum name there as
+    // AST_TYPE_EXPR (node->sizeof_expr.type), same node produced for `T ==
+    // i32`, NOT as AST_IDENT (types and values are different registries; a
+    // struct name has no Symbol at all). Ordinary Type_Infer hard-errors on
+    // AST_TYPE_EXPR ("a type cannot be used as a value here") -- exactly
+    // like every other legitimate AST_TYPE_EXPR consumer, this must be
+    // checked BEFORE calling Type_Infer below, not after. Anything else
+    // (a real value, a real field access, an instance call) falls through
+    // to the existing path untouched.
+    if (field_node->field.base->type == AST_TYPE_EXPR &&
+        field_node->field.base->sizeof_expr.type &&
+        field_node->field.base->sizeof_expr.type->cls == TYPE_STRUCT) {
+        StructDef* tsd = Struct_Find(field_node->field.base->sizeof_expr.type->struct_name);
+        if (tsd) {
+            size_t manglen = 0;
+            Type synth = {0};
+            synth.cls = TYPE_STRUCT;
+            synth.struct_name = tsd->name;
+            char* mangled = Method_Mangle(&synth, field_node->field.field_name,
+                                          field_node->field.field_name_len, &manglen);
+            if (mangled) {
+                Symbol* msym = SymTable_Find(Get_SymTable(), mangled, manglen);
+                if (msym && msym->kind == SYM_FUNCTION && msym->is_static) {
+                    // No self to inject -- this is a plain direct call under the
+                    // mangled name, args untouched.
+                    node->call.target_expr = NULL;
+                    node->call.target_name = mangled;
+                    node->call.target_name_len = manglen;
+                    node->call.sym = msym;
+                    return;
+                }
+                if (msym && msym->kind == SYM_FUNCTION && !msym->is_static) {
+                    char msg[256];
+                    snprintf(msg, sizeof(msg),
+                             "'%.*s' is an instance method of %s, call it as instance.%.*s(...)",
+                             (int)field_node->field.field_name_len, field_node->field.field_name,
+                             tsd->name,
+                             (int)field_node->field.field_name_len, field_node->field.field_name);
+                    Error_AtNode(node, msg, NULL);
+                }
+                free(mangled);
+            }
+            // No such method on this type at all -- fall through to whatever
+            // ordinary error the rest of the compiler gives an unresolved
+            // AST_IDENT with no Symbol (same as today, unchanged).
+        }
+    }
+
     // The receiver may itself be an unresolved generic method call (chained calls
     // on a generic return, e.g. `bb.get().get()`). The inner call needs its own
     // method-call rewrite (to set .sym = Box_get and populate self_type_args) AND
@@ -1226,6 +1276,19 @@ void try_rewrite_method_call(ASTNode* node) {
     }
 
     if (!msym || msym->kind != SYM_FUNCTION) { free(mangled); return; }
+
+    if (msym->is_static) {
+        // `instance.static_method()` -- static methods take no self, so
+        // there is nothing to inject and no receiver to route through the
+        // instance-call desugaring below. Reject explicitly rather than
+        // silently dropping `base_arg` and calling it anyway.
+        char msg[256];
+        snprintf(msg, sizeof(msg),
+                 "static method '%.*s' must be called as Type.%.*s(...), not through an instance",
+                 (int)field_node->field.field_name_len, field_node->field.field_name,
+                 (int)field_node->field.field_name_len, field_node->field.field_name);
+        Error_AtNode(node, msg, NULL);
+    }
 
     size_t old_argc = node->call.arg_count;
     ASTNode** new_args = (ASTNode**)malloc((old_argc + 1) * sizeof(ASTNode*));

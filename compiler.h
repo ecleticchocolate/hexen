@@ -32,7 +32,7 @@ typedef enum {
     TOK_LPAREN, TOK_RPAREN, TOK_SEMI, TOK_LBRACE, TOK_RBRACE,
     TOK_DOT, TOK_LBRACKET, TOK_RBRACKET, TOK_STRUCT, TOK_CONST, TOK_SIZEOF,
     TOK_ALIGNOF, TOK_OFFSETOF, TOK_NAMEOF, TOK_TYPEOF,
-    TOK_ENUM, TOK_UNION, TOK_MATCH, TOK_CASE, TOK_UNPACK, TOK_EXTERN, TOK_ELLIPSIS, TOK_PUB, TOK_WITH, TOK_IMPL, TOK_ALIAS,
+    TOK_ENUM, TOK_UNION, TOK_MATCH, TOK_CASE, TOK_UNPACK, TOK_EXTERN, TOK_ELLIPSIS, TOK_PUB, TOK_WITH, TOK_IMPL, TOK_ALIAS, TOK_STATIC,
     
     // Keywords / Types
     TOK_U8, TOK_U16, TOK_U32, TOK_U64,
@@ -573,6 +573,10 @@ typedef struct ASTNode {
             struct Type* return_type;
             struct ASTNode* body;
             struct Symbol* sym;
+            // Declared `static fn` inside an `impl` block: no `self` is injected
+            // (see parser.c's parse_fn_decl), and it is called as `Type.method(...)`,
+            // never `instance.method(...)`. False for every non-impl function.
+            bool is_static;
             // Generics (stage 1: functions only). A generic function is NOT compiled
             // at definition — its AST is kept and each [T] instantiation is cloned,
             // type-substituted, and compiled on demand.
@@ -686,6 +690,10 @@ typedef struct Symbol {
     // scalar global_init path. Size is Type_SizeOf(sym->type).
     uint8_t* global_bytes;
     bool is_pub;
+    // Mirrors func_decl.is_static for SYM_FUNCTION symbols mangled from an
+    // `impl` block (Foo_method) -- checked at each call site to route to
+    // Type.method(...) resolution and to reject instance.method(...) for it.
+    bool is_static;
     // For a generic function symbol (SYM_FUNCTION with type params): a pointer to
     // its AST_FUNC_DECL node, kept so the backend can clone+substitute+compile each
     // instantiation. NULL for ordinary functions.
