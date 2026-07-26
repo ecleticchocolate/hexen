@@ -53,6 +53,19 @@ pub impl Array[T, N] {
         }
     }
 
+    // Lets a flat brace literal (`Array[T, N] a = {1, 2, 3}`) assign directly,
+    // the same way Vector's __assign does for its own flat literal -- Array's
+    // N is already fixed by the struct's own const-generic param, so unlike
+    // Vector's __assign[u32 N] this needs no separate generic parameter of
+    // its own. Routes through store_elem() so an owning T still deep-copies
+    // per element instead of aliasing the literal's storage.
+    fn __assign(T[N] arr) void {
+        for u32 i = 0 to N {
+            T old = self.e[i]
+            self.store_elem(i, arr[i])
+        }
+    }
+
     // Zero-initialized array. `Array[T, N] a` alone does the same thing; this
     // exists so the type can be constructed in expression position.
     static fn create() Array[T, N] {
@@ -84,17 +97,31 @@ pub impl Array[T, N] {
     }
 
     // Sets an element by index safely. Returns true if successful.
+    //
+    // The displaced element is copied into `old` first -- an ordinary local,
+    // destroyed by scope exit like any other -- before store_elem overwrites
+    // the slot. Without this, an owning T already live in that slot is
+    // silently replaced with no destructor call: not aliased, just leaked,
+    // since the slot itself is the only reference and store_elem overwrites
+    // it directly. Same idiom as Vector.set()'s `T old = self.move_out(index)`,
+    // adapted for inline storage: there's no buffer slot to blank afterward,
+    // just the old value to hand to RAII.
     fn set(u32 index, T item) bool {
         if index >= N {
             return false
         }
+        T old = self.e[index]
         self.store_elem(index, item)
         return true
     }
 
-    // Overwrites every element with a copy of `item`.
+    // Overwrites every element with a copy of `item`. Same old-value-to-RAII
+    // idiom as set() -- each slot's previous element (which may already be
+    // live on a re-fill) is captured into a scope-exit-destroyed local before
+    // being replaced, not dropped in place.
     fn fill(T item) void {
         for u32 i = 0 to N {
+            T old = self.e[i]
             self.store_elem(i, item)
         }
     }
