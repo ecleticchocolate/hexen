@@ -15,3 +15,12 @@ pub enum Option[T] {
 // depends on (get()/pop() return Option[T]), so no new dependency edge is
 // created by putting it here.
 pub alias Owning = impl { fn __delete() }
+
+// The opt-in hash hook. A type that defines __hash() controls its own hashing
+// everywhere -- HashMap consults this before any structural fallback, so a type
+// that must hash only part of itself (or hash something its fields cannot
+// express) says so once rather than per container.
+//
+// Defining it is never required: a key with no __hash() is hashed structurally,
+// field by field. This is the escape hatch, not the mechanism.
+pub alias Hashable = impl { fn __hash() u32 }

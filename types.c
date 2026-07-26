@@ -636,6 +636,34 @@ void resolve_brace_literal(ASTNode* node, Type* target) {
             ASTNode* fv = node->struct_lit.values[i];
             if (is_untyped_literal(fv)) {
                 check_assignable(f->type, fv, "struct field");
+            } else {
+                // A TYPED field value was NOT CHECKED AT ALL: `H{.a = b}` accepted
+                // an unrelated struct -- even one of a different SIZE -- and simply
+                // reinterpreted its bytes. Silent wrongness, and also the reason a
+                // source type's __cast never got a chance to convert.
+                //
+                // Check it like every other assignability site. check_assignable
+                // also inserts a __cast conversion when the source declares one,
+                // so `H{.a = w}` converts rather than failing.
+                //
+                // Skipped for a DESTRUCTURE pattern: this same resolver walk runs
+                // over `match`/`unpack` patterns (`{.x = a, .y = b}`), where a field
+                // "value" is a bare binder that has no symbol and no type yet --
+                // checking one would error "void vs value" on a legitimate pattern.
+                // A binder is exactly an AST_IDENT with no resolved symbol.
+                // A pattern binder has no type yet and must not be checked: a bare
+                // `a` (AST_IDENT with no symbol), a write-through `*px` (AST_DEREF
+                // over one), or a nested destructure `{...}`. Type_Infer hard-errors
+                // on those, so they are excluded by SHAPE rather than by asking.
+                ASTNode* probe = fv;
+                if (probe->type == AST_DEREF && probe->unary) probe = probe->unary;
+                bool is_pattern_slot =
+                    (probe->type == AST_IDENT && !probe->ident.sym) ||
+                    probe->type == AST_STRUCT_LITERAL ||
+                    probe->type == AST_ARRAY_LITERAL;
+                if (!is_pattern_slot) {
+                    check_assignable(f->type, fv, "struct field");
+                }
             }
         }
         node->result_type = target;
@@ -1608,7 +1636,7 @@ bool try_rewrite_index_method(ASTNode* node) {
 // garbage/wrong union fields if `node` has already become AST_DEREF by the
 // time they run. So this is a SEPARATE step, applied once after the call is
 // fully resolved, not folded into try_rewrite_index_method itself.
-static void wrap_index_result_deref(ASTNode* node) {
+void wrap_index_result_deref(ASTNode* node) {
     if (node->type != AST_CALL || node->call.index_deref_wrapped) return;
     // try_rewrite_method_call (already run by the caller before this) resolves
     // target_expr's AST_FIELD to a mangled direct-call symbol and clears
@@ -2570,6 +2598,26 @@ static bool anon_structs_field_type_compatible(const Type* dst, const Type* src)
     if (!dsd->is_anonymous || !ssd->is_anonymous) return false;
     if (dsd->is_overlapping != ssd->is_overlapping) return false;
     if (dsd->field_count != ssd->field_count) return false;
+    // Positional-only relaxation. A field written with no name gets a
+    // synthesized `_N` placeholder, so "is this side positional" is exactly
+    // "are its field names _0, _1, ...".
+    //
+    // The relaxation exists for pack-synthesized bundles (`V... fns`, which are
+    // always positional) flowing into a named-field target -- REFERENCE.md's
+    // hand-built existential showcase depends on it. It must NOT extend to two
+    // sides that both NAME their fields differently: `struct{f32 x  f32 y}` and
+    // `struct{f32 lat  f32 lon}` are different types, and assignment already
+    // rejects that pair. Letting a CALL perform the same conversion was a hole
+    // -- screen coordinates silently read as latitude/longitude, no diagnostic.
+    bool dst_positional = true;
+    bool src_positional = true;
+    for (size_t i = 0; i < dsd->field_count; i++) {
+        char pn[24];
+        snprintf(pn, sizeof(pn), "_%zu", i);
+        if (dsd->fields[i].name && strcmp(dsd->fields[i].name, pn) != 0) dst_positional = false;
+        if (ssd->fields[i].name && strcmp(ssd->fields[i].name, pn) != 0) src_positional = false;
+    }
+    if (!dst_positional && !src_positional) return false;
     for (size_t i = 0; i < dsd->field_count; i++) {
         Type* dft = dsd->fields[i].type;
         Type* sft = (dft->cls != TYPE_FN_LITERAL) ? fn_lit_shape(ssd->fields[i].type) : ssd->fields[i].type;
@@ -2652,6 +2700,7 @@ static bool check_assignable_ne(Type* dst, ASTNode* src, const char* where) {
         anon_structs_field_type_compatible(dst, cmp_st)) return true;
 
     if (Type_Equals(dst, cmp_st)) return true;
+
     // User requested to relax the strict assignability check.
     // Allow implicit primitive coercions (like C).
     return dst->cls == TYPE_PRIMITIVE && cmp_st->cls == TYPE_PRIMITIVE;
@@ -2665,6 +2714,37 @@ static bool check_assignable_ne(Type* dst, ASTNode* src, const char* where) {
 // pure message selection on a known-failing case).
 static void check_assignable(Type* dst, ASTNode* src, const char* where) {
     if (check_assignable_ne(dst, src, where)) return;
+
+    // Doesn't fit -- but if the SOURCE type declares a __cast, convert instead of
+    // erroring. Primitives already coerce implicitly (check_assignable_ne's last
+    // line); this extends the same "try a conversion, then bail" rule to any type
+    // that opted in by writing __cast.
+    //
+    // It lives HERE, in the one shared checker, rather than at the call-argument
+    // site: assignability is also decided for a declaration, a return, a struct
+    // field, an array element and an assignment, and a conversion that worked for
+    // arguments alone would be an arbitrary special case.
+    //
+    // A real AST_CAST is inserted, not merely a relaxed check -- permitting the
+    // mismatch alone let the destination reinterpret the source's raw bytes (a
+    // Wrap{junk,real} read as Small{v} yielded `junk`), which is silent wrongness
+    // rather than a conversion. `src` is rewritten IN PLACE so every caller sees
+    // the converted node without knowing this happened.
+    if (src && dst) {
+        Type* st0 = Type_Infer(src);
+        if (st0 && st0->cls == TYPE_STRUCT && Method_Resolve(st0, "__cast", 6)) {
+            ASTNode* inner = (ASTNode*)malloc(sizeof(ASTNode));
+            *inner = *src;
+            src->type = AST_CAST;
+            src->cast.target_type = dst;
+            src->cast.expr = inner;
+            if (try_rewrite_cast_operator(src)) {
+                Typecheck_Tree(src);
+                return;
+            }
+            *src = *inner;   // no usable __cast for this target -- restore and error
+        }
+    }
 
     if (src && src->type == AST_TYPE_EXPR) {
         char msg[160];
@@ -3522,7 +3602,44 @@ void Typecheck_Tree(ASTNode* node) {
             }
             return;
 
+        case AST_STATIC_ASSERT: {
+            // Checked HERE, not at parse time: a `match T` arm is selected during
+            // typecheck, and an assert in an arm that was never taken must not
+            // fire. By this point the surrounding arm is known to be live.
+            int64_t v = 0;
+            if (!ConstEval(node->static_assert_expr.cond, &v)) {
+                Error_AtNode(node, "static_assert condition is not a compile-time constant", NULL);
+            }
+            if (v == 0) {
+                char buf[320];
+                if (node->static_assert_expr.msg)
+                    snprintf(buf, sizeof(buf), "static assertion failed: %.*s",
+                             (int)node->static_assert_expr.msg_len, node->static_assert_expr.msg);
+                else
+                    snprintf(buf, sizeof(buf), "static assertion failed");
+                Error_AtNode(node, buf, NULL);
+            }
+            // Satisfied: becomes an empty block, so codegen emits nothing.
+            node->type = AST_BLOCK;
+            node->block.statements = NULL;
+            node->block.count = 0;
+            node->block.capacity = 0;
+            return;
+        }
+
         case AST_INDEX:
+            // Rewrite `v[i]` to `v.__index(i)` BEFORE recursing, the same way
+            // AST_CALL rewrites a method call before typechecking its target.
+            // Recursing first typechecks the operands of a node that is about to
+            // stop being an AST_INDEX at all, and the rewritten call then never
+            // gets the AST_CALL treatment -- so a `__index` body that calls a
+            // sibling method (`self.helper()`) resolved as a bare field access
+            // and failed with "has no field 'helper'". __eq and friends were
+            // unaffected because their rewrite already ran ahead of the recursion.
+            if (try_rewrite_index_method(node)) {
+                Typecheck_Tree(node);
+                return;
+            }
             Typecheck_Tree(node->index.base);
             Typecheck_Tree(node->index.index);
             Type_Infer(node);
@@ -4053,6 +4170,16 @@ ASTNode* clone_ast(ASTNode* n, const char** params, Type** args, size_t np, bool
             break;
         case AST_LOGICAL_NOT: case AST_BIT_NOT: case AST_DEREF: case AST_ADDR: case AST_RETURN:
             c->unary = clone_ast(n->unary, params, args, np, clone_symbols);
+            break;
+        case AST_STATIC_ASSERT:
+            // The condition must be substituted like any other expression, or a
+            // generic's assert sees the un-instantiated `T`: `static_assert(
+            // sizeof(T) == 8)` inside `fn g[T]()` reported "condition is not a
+            // compile-time constant" even though the same expression folds fine
+            // once T is written out. Missing this case meant the clone shared
+            // the TEMPLATE's condition node.
+            c->static_assert_expr.cond =
+                clone_ast(n->static_assert_expr.cond, params, args, np, clone_symbols);
             break;
         case AST_CAST:
             c->cast.target_type = Type_Substitute(n->cast.target_type, params, args, np);

@@ -195,8 +195,23 @@ Anonymous struct type (not a declaration — usable anywhere a type is):
 ```
 struct { i32 x  i32 y } p
 ```
-Identity is structural (keyed on field types): two anonymous structs with
-the same field types are the same type. Named structs stay nominal.
+Identity is keyed on field types **and field names**: `struct { f32 x  f32 y }`
+and `struct { f32 lat  f32 lon }` are different types, the same way two named
+structs with identical fields are. Named structs stay nominal too.
+
+A field written with **no name** is positional — it gets a synthesized `_0`,
+`_1`, ... and carries no naming to disagree about:
+
+```
+struct { i32; i32 } t      // positional (a tuple); fields are _0, _1
+struct { i32 a  i32 b } r  // named
+```
+
+A **positional** value converts freely into a named-field target of the same
+field types (that is what makes a `T... args` pack — always positional — usable
+as an `alias`-declared vtable struct; see the hand-built existential in
+Showcases). Two values that both name their fields do **not** convert, in any
+position: assignment, parameter passing, and generic arguments all reject it.
 
 ---
 

@@ -248,6 +248,33 @@ bool reflect_unify(Type* concrete, Type* pattern, ReflectBindings* out) {
             mangled[manglen] = '\0';
             Symbol* msym = SymTable_Find(Get_SymTable(), mangled, manglen);
             free(mangled);
+
+            // Not declared directly on this struct -- look through a `super`
+            // embedding, the same way a CALL does.
+            //
+            // `super` forwarding is a call-site REWRITE (`o.len()` becomes
+            // `View_len(&o.v)`), so no `Owned_len` symbol is ever created. A
+            // lookup by mangled name therefore answers "no method" for a type
+            // whose method calls plainly work -- `o.len()` compiled and ran while
+            // `match S { impl { fn len() u32 } }` took the else arm. Walking the
+            // embedding here is what makes the query agree with the call.
+            if ((!msym || msym->kind != SYM_FUNCTION) && sd) {
+                for (size_t f = 0; f < sd->field_count; f++) {
+                    StructField* sf = &sd->fields[f];
+                    if (!sf->is_super_alias && !sf->is_super_param) continue;
+                    Type* sup = sf->type;
+                    if (sup && sup->cls == TYPE_POINTER) sup = sup->pointer_base;
+                    if (!sup || sup->cls != TYPE_STRUCT || !sup->struct_name) continue;
+                    size_t smanglen = 0;
+                    char* sm = Method_Mangle(sup, pattern->impl_pat.method_names[m],
+                                             mlen, &smanglen);
+                    if (!sm) continue;
+                    Symbol* ssym = SymTable_Find(Get_SymTable(), sm, smanglen);
+                    free(sm);
+                    if (ssym && ssym->kind == SYM_FUNCTION) { msym = ssym; break; }
+                }
+            }
+
             if (!msym || msym->kind != SYM_FUNCTION || !msym->type ||
                 msym->type->cls != TYPE_FUNCTION)
                 return false;

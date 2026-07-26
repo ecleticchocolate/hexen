@@ -45,10 +45,13 @@
 // else, and copy-binding an owning T's payload double-frees for the same
 // reason a raw field-copy anywhere else in this file does.
 
+// Field defaults ARE the empty state -- storage is not zeroed, so a bare
+// `Vector[T] v` (or a `T blank` used to vacate a slot) would otherwise hold a
+// garbage data pointer that __delete() would then try to free.
 pub struct Vector[T] {
-    T* data
-    u32 capacity
-    u32 size
+    T* data = null
+    u32 capacity = 0
+    u32 size = 0
 }
 
 pub impl Vector[T] {

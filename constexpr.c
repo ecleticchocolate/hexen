@@ -1439,6 +1439,14 @@ static bool ConstEval_inner(ASTNode* node, int64_t* out) {
     // comment.)
     if (try_rewrite_operator_method(node) || try_rewrite_index_method(node) ||
         try_rewrite_unary_operator_method(node) || try_rewrite_cast_operator(node)) {
+        // Same follow-up the runtime path runs (Type_Infer / infer_generic): an
+        // __index returning T* must become `*(v.__index(i))`. Without it the
+        // comptime interpreter folded the ADDRESS -- `const R = v[0]` on a
+        // 5-element vector baked in 84 instead of 5, silently, while v.len()
+        // and v.get(0) folded correctly. Shared helper, not a second copy of
+        // the rule, so the two phases cannot disagree about when to deref.
+        try_rewrite_method_call(node);
+        wrap_index_result_deref(node);
         return ConstEval(node, out);
     }
 

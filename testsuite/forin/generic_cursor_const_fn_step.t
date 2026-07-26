@@ -39,7 +39,10 @@ impl Vec[T] {
 
 fn main() i32 {
     i32[3] arr = {10, 20, 30}
-    Vec[i32] v = {.data = arr, .len = 3}
+    // &arr[0], not `arr`: an array is NOT a pointer in this language and
+    // there is no decay. This line used to read `.data = arr` and compiled
+    // only because a typed struct-literal field was never type-checked.
+    Vec[i32] v = {.data = &arr[0], .len = 3}
     i32 sum = 0
     for i32 x in v { sum = sum + x }
     return sum

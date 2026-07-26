@@ -32,7 +32,7 @@ typedef enum {
     TOK_LPAREN, TOK_RPAREN, TOK_SEMI, TOK_LBRACE, TOK_RBRACE,
     TOK_DOT, TOK_LBRACKET, TOK_RBRACKET, TOK_STRUCT, TOK_CONST, TOK_SIZEOF,
     TOK_ALIGNOF, TOK_OFFSETOF, TOK_NAMEOF, TOK_TYPEOF,
-    TOK_ENUM, TOK_UNION, TOK_MATCH, TOK_CASE, TOK_UNPACK, TOK_EXTERN, TOK_ELLIPSIS, TOK_PUB, TOK_WITH, TOK_IMPL, TOK_ALIAS, TOK_STATIC,
+    TOK_ENUM, TOK_UNION, TOK_MATCH, TOK_CASE, TOK_UNPACK, TOK_EXTERN, TOK_ELLIPSIS, TOK_PUB, TOK_WITH, TOK_IMPL, TOK_ALIAS, TOK_STATIC, TOK_STATIC_ASSERT,
     
     // Keywords / Types
     TOK_U8, TOK_U16, TOK_U32, TOK_U64,
@@ -362,6 +362,7 @@ typedef enum {
     AST_CONTINUE,
     AST_RETURN,
     AST_DEFER,
+    AST_STATIC_ASSERT,  // static_assert(cond, "msg") -- checked at typecheck
     AST_FOR,
     AST_FUNC_DECL,
     AST_CALL,
@@ -658,6 +659,11 @@ typedef struct ASTNode {
             struct ASTNode* count;      // optional [expr] runtime count, else NULL (single)
         } new_expr;
         struct {
+            struct ASTNode* cond;   // must live in the SAME struct as msg: the
+            const char* msg;        // node payloads are a union, so storing the
+            size_t msg_len;         // condition in ->unary would be overwritten
+        } static_assert_expr;
+        struct {
             struct ASTNode* ptr;        // the pointer expression to free
             // `delete[] p` -- p came from `new[n] T`. Needed because `new T` and
             // `new[n] T` produce the SAME static type (T*), so the delete site
@@ -802,7 +808,11 @@ bool ConstEval_Bytes(ASTNode* node, uint8_t* out_buf, uint64_t size); // aggrega
 int64_t ConstEval_AggPersist(struct ASTNode* node, Type* t); // aggregate const -> persistent arena offset
 bool ConstEval_ReadBytes(uint32_t off, uint8_t* out_buf, uint64_t size); // copy persisted arena bytes out
 bool ConstEval_AggHasEscapingPtr(Type* t, uint8_t* bytes, uint64_t size); // const stores a live comptime pointer?
-void try_rewrite_method_call(struct ASTNode* node); // rewrite expr.method(args) -> Base_method(&expr, args)
+void try_rewrite_method_call(struct ASTNode* node);
+// `v[i]` -> `*(v.__index(i))` when __index returns T*. Shared by Type_Infer,
+// infer_generic AND ConstEval: the comptime interpreter needs the identical
+// deref, or `const R = v[0]` folds the ADDRESS instead of the element.
+void wrap_index_result_deref(struct ASTNode* node);
 // (type, method-name) -> symbol name / Symbol. The single mangling used by method
 // CALLS, `impl {...}` MATCHING, and `fnof`, so all three agree. Resolves through
 // generic_base, which is why it is not nameof+concat.

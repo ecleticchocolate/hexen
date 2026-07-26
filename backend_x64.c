@@ -1394,6 +1394,8 @@ static void compile_node_ctx(JITBuffer* buf, ASTNode* node, LoopContext* loop) {
             emit_byte(buf,0x48);emit_byte(buf,0x89);emit_byte(buf,0x08); // mov [rax], rcx
             emit_byte(buf,0x48);emit_byte(buf,0x83);emit_byte(buf,0xc0);emit_byte(buf,0x08); // add rax, 8
         }
+        // EXPERIMENT: heap zero-init disabled to measure what depends on it.
+        if (0) {
         // Zero the allocation (new always zero-inits). Save ptr in r12 (callee-saved),
         // memset via rep stosb, then restore the pointer to rax.
         emit_byte(buf,0x41);emit_byte(buf,0x54);                 // push r12
@@ -1408,6 +1410,7 @@ static void compile_node_ctx(JITBuffer* buf, ASTNode* node, LoopContext* loop) {
         emit_byte(buf,0xf3);emit_byte(buf,0xaa);                     // rep stosb
         emit_byte(buf,0x4c);emit_byte(buf,0x89);emit_byte(buf,0xe0); // mov rax, r12 (ptr back)
         emit_byte(buf,0x41);emit_byte(buf,0x5c);                     // pop r12
+        }
 
         // new T{...}: fill the just-allocated object from the initializer literal.
         if (node->new_expr.init) {
@@ -2090,15 +2093,40 @@ static void compile_node_ctx(JITBuffer* buf, ASTNode* node, LoopContext* loop) {
             sym->kind == SYM_GLOBAL) {
             return;
         }
-        if (vt && (vt->cls == TYPE_STRUCT || vt->cls == TYPE_ARRAY)) {
-            uint64_t sz = Type_SizeOf(vt);
-            emit_var_addr(buf, sym);                                  // rax = &var
-            emit_byte(buf, 0x49); emit_byte(buf, 0x89); emit_byte(buf, 0xc0); // mov r8, rax (save base)
-            for (uint64_t b = 0; b < sz; b += 8) {
-                // mov qword [r8 + b], 0
-                emit_byte(buf, 0x49); emit_byte(buf, 0xc7); emit_byte(buf, 0x80);
-                emit_u32(buf, (uint32_t)b);
-                emit_u32(buf, 0);
+        // A bare aggregate declaration writes its FIELD DEFAULTS and nothing
+        // else. Storage is otherwise left as-is: `new`/locals are not zeroed, so
+        // a type that needs a valid empty state declares it (`u32 capacity = 0`)
+        // rather than relying on the allocator.
+        //
+        // Deliberately NOT a blanket zero-fill. Zeroing every declaration is an
+        // overhead no systems language pays, and it scales with SIZE, not with
+        // usefulness -- `Array[i32, 1000000000] a` would memset 4 GB before the
+        // program did any work. Only fields carrying an explicit default cost
+        // anything; a struct with no defaults, or a bare array, emits nothing.
+        // An ARRAY has no field defaults of its own -- nothing to write, and it
+        // must not fall through to the scalar path below (which would emit a
+        // bogus 8-byte store over the array's first element).
+        if (vt && vt->cls == TYPE_ARRAY) {
+            return;
+        }
+        if (vt && vt->cls == TYPE_STRUCT && sym->kind == SYM_LOCAL) {
+            StructDef* dsd = Struct_Find(vt->struct_name);
+            bool any_default = false;
+            if (dsd) {
+                for (size_t i = 0; i < dsd->field_count; i++)
+                    if (dsd->fields[i].has_default) { any_default = true; break; }
+            }
+            if (any_default) {
+                emit_var_addr(buf, sym);      // rax = &var
+                emit_byte(buf, 0x50);          // push base (the sink reads [rsp])
+                X64LayoutCtx lc = { .buf = buf, .loop = loop };
+                for (size_t i = 0; i < dsd->field_count; i++) {
+                    StructField* f = &dsd->fields[i];
+                    if (!f->has_default) continue;
+                    x64_sink_put_default(&lc, f->offset, Type_SizeOf(f->type),
+                                         f->default_val_buf);
+                }
+                emit_byte(buf, 0x58);          // pop base
             }
             return;
         }
@@ -2149,9 +2177,6 @@ static void compile_node_ctx(JITBuffer* buf, ASTNode* node, LoopContext* loop) {
             Symbol* target_sym = sym;
             if (node->ident.type_arg_count > 0 && sym->generic_decl) {
                 target_sym = Generic_Instantiate(sym, node->ident.type_args, node->ident.type_arg_count);
-            }
-            if (!target_sym->is_extern) {
-                printf("Function %.*s resolved: offset=%d, JIT=%p, addr=%p\n", (int)target_sym->name_len, target_sym->name, target_sym->offset, buf->code, buf->code + target_sym->offset);
             }
             emit_fn_symbol_value(buf, target_sym);
         }

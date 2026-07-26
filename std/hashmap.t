@@ -25,32 +25,130 @@
 // state: 0 = empty, 1 = live, 2 = tombstone. A tombstone keeps the probe
 // chain intact for later lookups but must not itself be treated as live by
 // copy()/__delete()/iteration.
-
-extern fn printf(u8* fmt, ...) i32
-
 struct Entry[K, V] { K key  V value  u8 state }
 
+// The public key/value pair. Entry carries a third `state` byte that is pure
+// bookkeeping (empty/live/tombstone), and a literal written against Entry would
+// force a caller to supply it -- `{1, 10, 0}`, where the 0 means nothing to
+// them. Pair is what an initializer literal is checked against instead, so the
+// spelling is `{ {1, 10}, {2, 20} }` and the internal state stays internal.
+pub struct Pair[K, V] { K key  V value }
+
+// Field defaults ARE the empty state. Storage is not zeroed (neither `new` nor
+// a local declaration clears it), so a bare `HashMap[K, V] m` would otherwise
+// hold a garbage slots pointer and a garbage capacity -- and there would be no
+// way to tell "never constructed" from "in use". Declaring the defaults here
+// makes `HashMap[K, V] m` a valid empty map that maybe_grow() then allocates on
+// first use, with no constructor call required.
 pub struct HashMap[K, V] {
-    Entry[K, V]* slots
-    u32 capacity
-    u32 size
-    u32 tombstones
+    Entry[K, V]* slots = null
+    u32 capacity = 0
+    u32 size = 0
+    u32 tombstones = 0
 }
 
 pub impl HashMap[K, V] {
+    // ANY type is usable as a key. Resolution is structural and ordered:
+    //
+    //   1. a user-written __hash() wins outright (Hashable), so a type that
+    //      needs a specific hash -- or hashes only part of itself -- says so
+    //      once and every container honours it;
+    //   2. u8* is hashed and compared BY CONTENT, not by address. This is the
+    //      case that silently broke: two identical string literals are two
+    //      different pointers, so `m["hello"] = 1` then `m["hello"]` inserted a
+    //      second entry and read back 0;
+    //   3. scalars mix their bits;
+    //   4. anything else is peeled field-by-field via the structural matcher
+    //      and each field hashed by these same rules, recursively.
+    //
+    // Field-by-field rather than hashing sizeof(K) raw bytes: a struct's
+    // padding is not part of its value, and a pointer field must be followed
+    // rather than hashed as an address. The empty struct terminates the walk.
     static fn hash_key(K k) u32 {
         match K {
-            u32 { return k * 2654435761 }
-            i32 { return (u32)k * 2654435761 }
+            Hashable { return k.__hash() }
+            u8* {
+                u32 h = 2166136261
+                u32 i = 0
+                while k[i] != 0 {
+                    h = (h ^ (u32)k[i]) * 16777619
+                    i = i + 1
+                }
+                return h
+            }
+            u32  { return k * 2654435761 }
+            i32  { return (u32)k * 2654435761 }
+            u64  { return ((u32)k ^ (u32)(k >> 32)) * 2654435761 }
+            i64  { return ((u32)k ^ (u32)((u64)k >> 32)) * 2654435761 }
+            u16  { return (u32)k * 2654435761 }
+            i16  { return (u32)k * 2654435761 }
+            u8   { return (u32)k * 2654435761 }
+            i8   { return (u32)k * 2654435761 }
+            bool { return (u32)k * 2654435761 }
+            struct {} { return 2166136261 }
+            struct { H; Rest... } {
+                unpack {head, rest...} = k
+                u32 hh = HashMap[H, V].hash_key(head)
+                u32 rh = HashMap[Rest, V].hash_key(rest)
+                return (hh ^ rh) * 16777619
+            }
             else { return 0 }
         }
+    }
+
+    // Key equality, resolved by the same rules hash_key uses -- the two MUST
+    // agree, or a lookup hashes to the right slot and then fails to recognise
+    // the key sitting in it. `==` on u8* compares addresses, so string keys
+    // need an explicit content comparison here for the same reason they need
+    // one above.
+    static fn keys_equal(K a, K b) bool {
+        match K {
+            u8* {
+                u32 i = 0
+                while a[i] != 0 {
+                    if a[i] != b[i] { return false }
+                    i = i + 1
+                }
+                return b[i] == 0
+            }
+            // Peeled field-by-field for the same reason hash_key is, and it
+            // must peel wherever hash_key peels or the two disagree. A plain
+            // `a == b` cannot serve here: lanewise struct comparison is
+            // rejected outright once any field is a pointer, so a key like
+            // `struct { Inner i  u8* name }` had no working equality at all --
+            // and a string FIELD would have compared by address even if it did.
+            struct {} { return true }
+            struct { H; Rest... } {
+                unpack {ah, arest...} = a
+                unpack {bh, brest...} = b
+                if !HashMap[H, V].keys_equal(ah, bh) { return false }
+                return HashMap[Rest, V].keys_equal(arest, brest)
+            }
+            else { return a == b }
+        }
+    }
+
+    // A freshly allocated slots array with every slot explicitly marked empty.
+    //
+    // `new` does NOT zero its allocation, so a recycled block arrives holding
+    // whatever the previous owner left. state is the probe loop's only notion of
+    // "is this slot live", so an uninitialized byte that happens to be 1 makes a
+    // stale slot look occupied: lookups then match a garbage key, or stop early
+    // on a chain that should have continued. Marking it here is the one place
+    // that has to know, rather than every reader defending against junk.
+    static fn fresh_slots(u32 n) Entry[K, V]* {
+        Entry[K, V]* s = new[n] Entry[K, V]
+        for u32 i = 0 to n {
+            s[i].state = 0
+        }
+        return s
     }
 
     static fn with_capacity(u32 cap = 16) HashMap[K, V] {
         u32 c = cap
         if c == 0 { c = 16 }
         return {
-            .slots = new[c] Entry[K, V],
+            .slots = HashMap[K, V].fresh_slots(c),
             .capacity = c,
             .size = 0,
             .tombstones = 0
@@ -64,12 +162,21 @@ pub impl HashMap[K, V] {
     // state==1 slots are yielded. Same forward-reference ordering rule as
     // Vector/Array: step() must be declared before begin() in this impl
     // block or the static resolves to a null symbol.
-    static fn step(struct{Entry[K, V]* data  u32 pos  u32 len}* s) Option[V*] {
+    // Yields the whole ENTRY, not just the value, so iteration can see keys:
+    //
+    //     for unpack {k, v} in map { ... }
+    //
+    // Entry's first two fields are `key` and `value`, and a pattern may bind a
+    // PREFIX of a struct's fields, so `{k, v}` destructures a key/value pair and
+    // leaves the internal `state` byte unmentioned. Yielding V* instead made
+    // `for unpack {k, v}` impossible -- there was no pair to destructure, only a
+    // bare value.
+    static fn step(struct{Entry[K, V]* data  u32 pos  u32 len}* s) Option[Entry[K, V]*] {
         while s.pos < s.len {
             u32 cur = s.pos
             s.pos = s.pos + 1
             if s.data[cur].state == 1 {
-                return .Some(&s.data[cur].value)
+                return .Some(&s.data[cur])
             }
         }
         return .None
@@ -112,7 +219,7 @@ pub impl HashMap[K, V] {
                 return {.idx = idx, .found = false}
             }
             if st == 1 {
-                if self.slots[idx].key == key { return {.idx = idx, .found = true} }
+                if HashMap[K, V].keys_equal(self.slots[idx].key, key) { return {.idx = idx, .found = true} }
             }
             if st == 2 {
                 if !has_tomb { first_tomb = idx  has_tomb = true }
@@ -136,7 +243,7 @@ pub impl HashMap[K, V] {
     fn rehash(u32 new_cap) void {
         Entry[K, V]* old_slots = self.slots
         u32 old_cap = self.capacity
-        self.slots = new[new_cap] Entry[K, V]
+        self.slots = HashMap[K, V].fresh_slots(new_cap)
         self.capacity = new_cap
         self.size = 0
         self.tombstones = 0
@@ -155,6 +262,15 @@ pub impl HashMap[K, V] {
     }
 
     fn maybe_grow() void {
+        // A map that was never constructed (`HashMap[K, V] m` on its own, or
+        // one initialized straight from a literal) has capacity 0 and a null
+        // slots pointer. Give it a real table before anything indexes into it:
+        // without this, `capacity * 2` is still 0, every probe divides by zero,
+        // and the first insert dereferences null.
+        if self.capacity == 0 {
+            self.rehash(16)
+            return
+        }
         // Grow past 70% load (counting tombstones too, since they occupy
         // probe-chain slots just as much as live entries do).
         u32 used = self.size + self.tombstones
@@ -207,6 +323,30 @@ pub impl HashMap[K, V] {
         unpack {idx, found} = self.find_slot(key)
         if found { return {.Some = &self.slots[idx].value} }
         return .None
+    }
+
+    // `m[key]` -- a pointer into the slot's value, so the result is both
+    // readable and writable, exactly like Vector.__index()/Array.__index().
+    //
+    // A missing key is INSERTED with a zero value and its address returned,
+    // which is what makes `m[key] = v` work as a genuine insert rather than
+    // only an overwrite. That is C++'s operator[] semantics, and it is chosen
+    // for the same reason: without it, assignment through the index operator
+    // could only ever update keys that already existed, and every insertion
+    // would have to go through insert() instead.
+    //
+    // The consequence to know: a bare READ of a missing key (`m[k]` on the
+    // right-hand side) also inserts it, growing the map. Use get()/contains()
+    // when the lookup must not mutate -- again the same trade C++ makes.
+    fn __index(K key) V* {
+        self.maybe_grow()
+        unpack {idx, found} = self.find_slot(key)
+        if !found {
+            self.slots[idx].key = key
+            self.slots[idx].state = 1
+            self.size = self.size + 1
+        }
+        return &self.slots[idx].value
     }
 
     fn remove(K key) Option[V] {
@@ -282,11 +422,28 @@ pub impl HashMap[K, V] {
     fn cap() u32 { return self.capacity }
     fn is_empty() bool { return self.size == 0 }
 
-    // Iterator support for `for TYPE val in map { ... }` / `for unpack ...`.
-    // Yields live VALUES only (no key), same "state baked into the const-
-    // generic step function" pattern Vector/Array use -- there is no
-    // map-specific cursor implementation here.
-    fn begin() IteratorCursor[V, struct{Entry[K, V]* data  u32 pos  u32 len}, HashMap[K, V].step] {
+    // Whole-map initialization from a literal of key/value pairs:
+    //
+    //     HashMap[i32, i32] m = { {1, 10}, {2, 20} }
+    //
+    // The literal has no type of its own -- what `{1, 10}` MEANS is decided
+    // entirely by the target, which here is this method's declared parameter.
+    // N is inferred from the literal's own element count.
+    fn __assign[u32 N](Pair[K, V][N] pairs) void {
+        for u32 i = 0 to N {
+            unpack {k, v} = pairs[i]
+            self.insert(k, v)
+        }
+    }
+
+    // Iterator support. Yields live ENTRIES, so both spellings work:
+    //
+    //     for Entry[K, V]* e in map { ... }       // e.key, e.value
+    //     for unpack {k, v} in map { ... }        // destructured pair
+    //
+    // Same "state baked into the const-generic step function" pattern
+    // Vector/Array use -- there is no map-specific cursor implementation here.
+    fn begin() IteratorCursor[Entry[K, V], struct{Entry[K, V]* data  u32 pos  u32 len}, HashMap[K, V].step] {
         return {
             .state = {
                 .data = self.slots,

@@ -3351,6 +3351,50 @@ static ASTNode* parse_defer_statement(void) {
     return node;
 }
 
+// `static_assert(COND)` / `static_assert(COND, "message")`
+//
+// COND is folded at compile time; a false (or unfoldable) condition is a
+// compile error reported AT THIS CALL SITE. That location is the whole point:
+// the same guarantee can be faked by naming an identifier that does not exist,
+// but that reports inside the library rather than at the caller, and -- worse
+// -- a user who happens to declare a global with the sentinel's name silently
+// disables the check. A real assert cannot be shadowed.
+static ASTNode* parse_static_assert_statement(void) {
+    Token kw = s_curr;
+    advance();
+    if (s_curr.type != TOK_LPAREN) parse_error("Expected '(' after static_assert");
+    advance();
+    ASTNode* cond = parse_expr_prec(0);
+    const char* msg = NULL;
+    size_t msg_len = 0;
+    if (s_curr.type == TOK_COMMA) {
+        advance();
+        if (s_curr.type != TOK_STRING) parse_error("static_assert message must be a string literal");
+        // A string token carries its DECODED bytes in int_value (escapes already
+        // processed, no surrounding quotes); .start still points at raw source.
+        msg = (const char*)(uintptr_t)s_curr.int_value;
+        msg_len = s_curr.length;
+        advance();
+    }
+    if (s_curr.type != TOK_RPAREN) parse_error("Expected ')' to close static_assert");
+    advance();
+    if (s_curr.type == TOK_SEMI) advance();
+
+    // NOT evaluated here. A `match T` arm is selected during typecheck, so
+    // folding the condition at parse time fires asserts inside arms that were
+    // never taken -- `match T { i32 { static_assert(...) } else { } }` errored
+    // even for T = u8. Build the node and let Typecheck_Tree check it once the
+    // arm it lives in is known to be live.
+    ASTNode* node = new_node(AST_STATIC_ASSERT);
+    node->static_assert_expr.cond = cond;
+    node->static_assert_expr.msg = msg;
+    node->static_assert_expr.msg_len = msg_len;
+    node->line = kw.line;
+    node->column = kw.column;
+    node->filename = kw.filename;
+    return node;
+}
+
 static ASTNode* parse_delete_statement(void) {
     advance();
     ASTNode* node = new_node(AST_DELETE);
@@ -3503,6 +3547,9 @@ static ASTNode* parse_statement(void) {
     }
     if (s_curr.type == TOK_DEFER) {
         return parse_defer_statement();
+    }
+    if (s_curr.type == TOK_STATIC_ASSERT) {
+        return parse_static_assert_statement();
     }
     if (s_curr.type == TOK_DELETE) {
         return parse_delete_statement();

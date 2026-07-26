@@ -172,6 +172,7 @@ Token Lexer_NextToken(void) {
         if (check_keyword(&tok, "auto", TOK_UNPACK)) return tok; // alias for `unpack`
         if (check_keyword(&tok, "extern", TOK_EXTERN)) return tok;
         if (check_keyword(&tok, "pub", TOK_PUB)) return tok;
+        if (check_keyword(&tok, "static_assert", TOK_STATIC_ASSERT)) return tok;
         if (check_keyword(&tok, "static", TOK_STATIC)) return tok;
 
         if (check_keyword(&tok, "const", TOK_CONST)) return tok;
