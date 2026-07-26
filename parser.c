@@ -17,25 +17,26 @@ static ASTNode* parse_top_level(void);
 static ASTNode* parse_impl_block(bool is_pub);
 // impl_type_name/impl_type_len/impl_sd are non-NULL/non-zero only when parsing
 // a method inside an `impl TYPE { ... }` block: the parsed fn is then mangled
-// to `TYPE_method`, gets an injected `TYPE* self` first parameter, and its
-// generic scope is seeded from the struct's own type params before its own
-// (optional) `[...]` extension is parsed. impl_type_name must outlive the
-// call (it's stored on the AST and on self's Type) -- callers pass the
-// original, non-freed token text.
-static ASTNode* parse_fn_decl(bool is_pub, bool is_extern,
+// to `TYPE_method`, gets an injected `TYPE* self` first parameter (unless
+// is_static), and its generic scope is seeded from the struct's own type
+// params before its own (optional) `[...]` extension is parsed. is_static is
+// ignored when impl_type_name is NULL (top-level fn is never impl-static).
+// impl_type_name must outlive the call (it's stored on the AST and on self's
+// Type) -- callers pass the original, non-freed token text.
+static ASTNode* parse_fn_decl(bool is_pub, bool is_extern, bool is_static,
                               const char* impl_type_name, size_t impl_type_len,
                               StructDef* impl_sd);
-static ASTNode* parse_expr_prec(int min_prec);
-static ASTNode* parse_block_body(void);
-static void predeclare_binders(ASTNode* pat); // fwd: used by parse_unpack (defined below)
+ASTNode* parse_expr_prec(int min_prec);
+ASTNode* parse_block_body(void);
+void predeclare_binders(ASTNode* pat); // fwd: used by parse_unpack (defined in match.c)
 static ASTNode* parse_alias_decl(void);
 static ASTNode* parse_const_decl(bool is_pub);
 static ASTNode* parse_const_block(void);
-static void advance(void);
-static void parse_error(const char* msg);
+void advance(void);
+void parse_error(const char* msg);
 static bool token_is_type_start(TokenType t);
 static bool curr_begins_type(void); // token_is_type_start + registered struct/generic names
-static Type* parse_type(void);
+Type* parse_type(void);
 static void parse_generic_param_list(const char*** names_out, Type*** kinds_out, size_t* count_out);
 static void parse_function_type_signature(Type* base_t);
 static Type* parse_generic_value_arg(Type* pin);
@@ -58,19 +59,18 @@ struct GenericSig {
 };
 static struct GenericSig* gsig_find(const char* name, size_t len);
 static Type* parse_type_ex(bool allow_array);
-static Type* parse_type(void);
-static ASTNode* new_node(ASTNodeType type);
+Type* parse_type(void);
+ASTNode* new_node(ASTNodeType type);
 
-static Token s_curr;
+Token s_curr;
 static jmp_buf s_err_buf;
-static SymbolTable* s_symtable;
+// Set by parse_error (any pass), read by Parse_HadError after parsing.
+static bool s_parse_had_error = false;
+SymbolTable* s_symtable;
 
-// Type-parameter names currently in scope (set while parsing a generic function's
-// signature/body). parse_type resolves a bare identifier matching one of these to a
-// TYPE_PARAM placeholder instead of requiring a registered struct.
-static const char** s_type_params = NULL;
-static Type**       s_param_kinds  = NULL;   // parallel to s_type_params; NULL entry = type param
-static size_t s_type_param_count = 0;
+const char** s_type_params = NULL;
+Type**       s_param_kinds  = NULL;   // parallel to s_type_params; NULL entry = type param
+size_t s_type_param_count = 0;
 
 // ─── type aliases ────────────────────────────────────────────────────────────
 // `alias Name = <type>` or `alias Name[P, ...] = <type>`. Purely a parse-time
@@ -111,23 +111,12 @@ static AliasDef* alias_lookup(const char* name, size_t len) {
 // arm body, so the general "unknown type is an error" behaviour is untouched
 // everywhere else. The names of wildcards registered while it's on are collected
 // below so the arm body can reference them and so branch selection can substitute.
-static bool s_in_match_pattern = false;
-
-// `impl {...}` is pattern-only (TYPE_IMPL is a question about a type, not a type), so it
-// may only be PRODUCED where a pattern is being parsed. But "a pattern is allowed here" is
-// a DIFFERENT question from "an undeclared identifier here is a wildcard", and the two must
-// not share a flag: an alias body wants the first (`alias Freeable = impl { fn free() }`)
-// and emphatically NOT the second -- with both on, `alias Buf = u8x` silently binds a
-// wildcard and yields an 8-byte mystery type instead of erroring on the typo.
-//
-// A match arm turns BOTH on. An alias body turns on only this one; its own declared params
-// (`alias P[X] = X*`) are already in s_type_params and resolve through the ordinary path,
-// so it needs no wildcard behaviour at all.
-static bool s_pattern_types_ok = false;
-static const char** s_match_wildcards = NULL; // names registered in the CURRENT arm pattern
-static bool*        s_match_wc_is_size = NULL; // parallel: true = size/value wildcard (u32-pinned)
-static size_t s_match_wildcard_count = 0;
-static size_t s_match_wildcard_cap = 0;
+bool s_in_match_pattern = false;
+bool s_pattern_types_ok = false;
+const char** s_match_wildcards = NULL; // names registered in the CURRENT arm pattern
+bool*        s_match_wc_is_size = NULL; // parallel: true = size/value wildcard (u32-pinned)
+size_t s_match_wildcard_count = 0;
+size_t s_match_wildcard_cap = 0;
 
 // Register a pattern wildcard. `is_size` distinguishes an array-size hole (`N` in
 // `E[N]`, a VALUE param pinned to u32) from a bare type hole (`P`, `E`, a TYPE
@@ -524,12 +513,12 @@ static Type* parse_generic_value_arg(Type* pin) {
         // through as unresolved, and nothing downstream (clone_ast cloning
         // this struct's methods, none of which are themselves generic) ever
         // revisits it -- so it silently reads back as a scalar 0.
-        if (expr->type == AST_IDENT && expr->ident.sym && expr->ident.sym->generic_decl &&
-            expr->ident.type_arg_count > 0) {
+        bool maybe_outer_param = expr_mentions_generic_param(expr) && s_type_param_count > 0;
+        if (!maybe_outer_param && expr->type == AST_IDENT && expr->ident.sym &&
+            expr->ident.sym->generic_decl && expr->ident.type_arg_count > 0) {
             expr->ident.sym = Generic_Instantiate(expr->ident.sym, expr->ident.type_args,
                                                   expr->ident.type_arg_count);
         }
-        bool maybe_outer_param = expr_mentions_generic_param(expr) && s_type_param_count > 0;
         if (maybe_outer_param) {
             // Depends on an outer, not-yet-concrete generic param (e.g. this
             // struct is itself being defined/used inside another generic's
@@ -780,7 +769,7 @@ static bool s_in_struct_literal_field = false;
 static bool s_new_type_no_nl_postfix = false;
 static int s_loop_depth = 0;   // >0 when inside a while/for body
 
-static void advance(void) {
+void advance(void) {
     if (s_with_switch_active) {
         if (s_with_switch_after == 0) {
             // Fire: switch lexer to body source, yield entry's first token.
@@ -797,7 +786,7 @@ static void advance(void) {
 }
 
 
-static void parse_error(const char* msg) {
+void parse_error(const char* msg) {
     // Delegates to the shared error.c formatter (Error_AtToken) instead of
     // rolling its own fprintf, but keeps exactly the same behavior: print,
     // then longjmp back to whichever setjmp is active (Parse_Signatures'
@@ -811,10 +800,20 @@ static void parse_error(const char* msg) {
     // of this refactor). Preserved as-is here rather than silently patched,
     // since suppressing it is a separate, deliberate fix, not a
     // side-effect of sharing the printer.
+    //
+    // Mark the compile as failed BEFORE unwinding. Parse_Block's setjmp sets this
+    // too, but it only sees errors raised while IT is the active recovery point.
+    // Lower_Match (match.c) calls parse_error during TYPECHECK, long after the last
+    // Parse_Block returned, so that longjmp lands on a stale frame: the flag stayed
+    // false, main() concluded the parse was clean, and a program with a genuine
+    // error ("match ... is not exhaustive") was executed anyway -- or crashed
+    // jumping into the dead frame. Setting it here makes "an error was reported"
+    // and "the compile failed" the same fact, whichever pass reported it.
+    s_parse_had_error = true;
     Error_AtToken(s_curr, msg, &s_err_buf);
 }
 
-static ASTNode* new_node(ASTNodeType type) {
+ASTNode* new_node(ASTNodeType type) {
     ASTNode* node = (ASTNode*)calloc(1, sizeof(ASTNode));
     node->type = type;
     // DEMO: stamp the location of whatever token is current when this node
@@ -858,7 +857,7 @@ static ASTNode* make_int_literal(uint64_t value, int lit_kind) {
 // that shape unchanged -- migrating this incrementally, one caller at a time
 // with a full test run after each, rather than deleting the old path before
 // every caller is confirmed moved off it.
-static ASTNode* make_decl_stmt(Type* var_type, const char* name, size_t name_len,
+ASTNode* make_decl_stmt(Type* var_type, const char* name, size_t name_len,
                                 Symbol* sym, ASTNode* init_expr) {
     ASTNode* decl = new_node(AST_DECLARATION);
     decl->decl.var_type = var_type;
@@ -870,6 +869,7 @@ static ASTNode* make_decl_stmt(Type* var_type, const char* name, size_t name_len
     ASTNode* assign = new_node(AST_ASSIGN);
     assign->binary.left = make_ident_node(name, name_len, sym);
     assign->binary.right = init_expr;
+    assign->binary.is_init = true;
 
     ASTNode* blk = new_node(AST_BLOCK);
     blk->block.capacity = 2;
@@ -881,7 +881,7 @@ static ASTNode* make_decl_stmt(Type* var_type, const char* name, size_t name_len
     return blk;
 }
 
-static Type* make_pointer_type(Type* base) {
+Type* make_pointer_type(Type* base) {
     Type* t = (Type*)calloc(1, sizeof(Type));
     t->cls = TYPE_POINTER;
     t->pointer_base = base;
@@ -892,7 +892,7 @@ static Type* make_array_type(Type* elem, uint64_t count, ASTNode* count_expr, co
     Type* t = (Type*)calloc(1, sizeof(Type));
     t->cls = TYPE_ARRAY;
     t->array.element = elem;
-    t->array.count = count;
+    t->array.count = count ? count : ((count_expr && count_expr->type == AST_INT_LITERAL) ? count_expr->int_value : 0);
     t->array.count_expr = count_expr;
     t->array.size_param = size_param;
     return t;
@@ -913,7 +913,7 @@ static ASTNode* make_block(void) {
     return block;
 }
 
-static void append_block_statement(ASTNode* block, ASTNode* stmt) {
+void append_block_statement(ASTNode* block, ASTNode* stmt) {
     if (block->block.count >= block->block.capacity) {
         block->block.capacity *= 2;
         block->block.statements = (ASTNode**)realloc(block->block.statements,
@@ -953,7 +953,7 @@ static ASTNode* parse_braced_block(bool create_scope, bool pop_aliases) {
     return block;
 }
 
-static ASTNode* parse_expr_prec(int min_prec); // used by parse_type for array dims
+ASTNode* parse_expr_prec(int min_prec); // used by parse_type for array dims
 
 // Struct_Find needs a null-terminated name, but every caller here only has a
 // (start, length) pair from a token — this was duplicated three times as an
@@ -1282,171 +1282,26 @@ static Type* parse_alias_or_type_param_type(Type* base_t);
 //   KNOWN name   -- the tag is redundant, so it is a no-op. It is still CHECKED
 //                   against the declaration's actual kind, because a tag that
 //                   can lie is worse than no tag.
-//   UNKNOWN name -- only reachable inside a pattern, where it is a wildcard. The
-//                   tag is REQUIRED here: it is the sole statement of intent that
-//                   distinguishes `struct M[X]` (template applied to X) from the
-//                   untagged `M[X]` (array of M sized X). Brackets are ambiguous;
-//                   tags are not. The asserted kind rides along on the node so
-//                   reflect_unify can check it against the concrete type.
 static const char* nominal_tag_name(unsigned char tag) {
     return tag == 1 ? "struct" : tag == 2 ? "enum" : "union";
 }
 
 static Type* parse_tagged_nominal_type(Type* base_t, unsigned char tag) {
     StructDef* sd = struct_find_by_token_text(s_curr.start, s_curr.length);
-
-    if (!sd && s_in_match_pattern &&
-        !type_param_lookup(s_curr.start, s_curr.length) &&
-        !alias_lookup(s_curr.start, s_curr.length)) {
-        // Unknown name under a tag: a nominal-head wildcard.
-        const char* wname = match_wildcard_lookup(s_curr.start, s_curr.length);
-        if (!wname) wname = register_match_wildcard(s_curr.start, s_curr.length);
-        advance();
-        base_t->cls = TYPE_PARAM;
-        base_t->param_name = wname;
-        base_t->nominal_tag = tag;
-        base_t->app_pack_idx = -1;  // no pack unless a bracket list below says so
-        // Bracket arguments, if any, are the application's type arguments. They
-        // are ordinary pattern types, so each may itself be concrete, a wildcard,
-        // or another tagged application -- recursion falls out for free.
-        if (s_curr.type == TOK_LBRACKET) {
-            base_t->app_has_brackets = true;
-            Type** args = NULL; size_t n = 0, cap = 0;
-            int pack_idx = -1;   // index of a `Rest...` tail among the args, or -1
-            while (s_curr.type == TOK_LBRACKET) {
-                advance();
-                // `struct M[]` -- the empty base case a peeling recursion needs to
-                // terminate on, mirroring `Def[]` for a named head (n stays 0, no
-                // pack). Must be checked before the inner loop unconditionally
-                // tries to parse an argument.
-                if (s_curr.type == TOK_RBRACKET) { advance(); break; }
-                for (;;) {
-                // A bracket argument is a TYPE in the general case, but a template
-                // may declare a const-generic VALUE param (`Vec[T, u32 N]`), so a
-                // literal like `[30]` must be accepted here and pinned as a value.
-                // Which slots are value slots is only knowable from the head, which
-                // is a wildcard -- so accept both spellings and let reflect_unify
-                // decide against the concrete instantiation's own type_args.
-                Type* a = NULL;
-                if (s_curr.type == TOK_INTEGER) {
-                    Type* pin = Type_MakePrim(PRIM_U32);
-                    a = parse_generic_value_arg(pin);
-                } else {
-                    // Everything else is an ordinary type production, parsed by the
-                    // one shared entry point -- so postfix (`E*`, `E[N]`), function
-                    // types, anonymous aggregates and further tagged applications
-                    // all compose here for free. Hand-rolling the wildcard case
-                    // instead would silently drop the postfix loop.
-                    a = parse_type();
-                    // EXPLICIT VALUE SLOT: `<pin-type> <name>` -- the one
-                    // compromise. Under a WILDCARD head the parser cannot know a
-                    // slot is a const-generic value slot (the head M supplies no
-                    // declaration), so bare `M[E, N]` cannot use N as a value in
-                    // the arm body. Writing the value's type explicitly -- `M[E,
-                    // u32 N]` (pin) or `M[E, VT N]` (bind the value-type to VT) --
-                    // states the kind the head can't, mirroring the DECLARATION
-                    // spelling `Vec[T, u32 N]`. The trailing name is the value
-                    // binder; the parsed type `a` is its pin. Same type-then-value
-                    // grammar every binding site uses, reaching the one pattern
-                    // slot that could not otherwise express it.
-                    if (a && s_in_match_pattern && s_curr.type == TOK_IDENTIFIER) {
-                        Type* dummy;
-                        bool known = (param_kind_lookup(s_curr.start, s_curr.length, &dummy) >= 0);
-                        LexerState save; Lexer_Save(&save);
-                        Token idtok = s_curr;
-                        Token nxt = Lexer_NextToken();
-                        Lexer_Restore(&save);
-                        if (!known && (nxt.type == TOK_COMMA || nxt.type == TOK_RBRACKET)) {
-                            const char* wname = match_wildcard_lookup(idtok.start, idtok.length);
-                            if (!wname) wname = register_match_wildcard_kind(idtok.start, idtok.length, true);
-                            advance(); // consume the value-binder name
-                            Type* v = make_const_value_type(a);   // pin = the written type `a`
-                            v->cval.defer = make_ident_node(wname, strlen(wname), NULL);
-                            a = v;
-                        }
-                    }
-                }
-                if (!a) parse_error("Expected a type or value argument after '[' in a tagged nominal pattern");
-                if (n >= cap) { cap = cap ? cap * 2 : 4; args = (Type**)realloc(args, cap * sizeof(Type*)); }
-                args[n++] = a;
-                // `Rest...` -- a pack-tail wildcard, the bracket-position spelling
-                // of `struct { H; Rest... }`, now reaching the wildcard-head path
-                // too: `struct M[H, Rest...]`. The args before it bind positionally;
-                // every remaining concrete type-arg bundles into this tail.
-                if (s_in_match_pattern && s_curr.type == TOK_ELLIPSIS) {
-                    if (pack_idx != -1)
-                        parse_error("at most one `...` tail wildcard is allowed in a generic argument pattern");
-                    pack_idx = (int)(n - 1);
-                    advance();
-                    if (s_curr.type != TOK_RBRACKET)
-                        parse_error("a `...` tail wildcard must be the LAST generic argument in a pattern");
-                }
-                // `struct M[X, Y]` -- the ordinary comma-separated argument list,
-                // same as every other generic use site in the language. The stacked
-                // `struct M[X][Y]` spelling means exactly the same thing; both are
-                // accepted so the tagged form does not need a grammar of its own.
-                if (s_curr.type == TOK_COMMA) { advance(); continue; }
-                if (s_curr.type != TOK_RBRACKET)
-                    parse_error("Expected ']' or ',' after a tagged nominal type argument");
-                advance();
-                break;
-                }
-                break;   // ONE argument group only -- see below
-            }
-            // Exactly one `[...]` carries the arguments; any further brackets are
-            // ordinary POSTFIX and belong to the shared grammar, exactly as they do
-            // for a concrete head. `Box[E][N]` means array-of-Box[E], so
-            // `struct M[E][N]` must mean the same thing -- letting the tagged form
-            // eat a second bracket as a second argument would make it the only
-            // production in the language where `[` changes meaning by position.
-            // Multi-argument templates use the comma list: `struct M[E,F]`.
-            base_t->app_args = args;
-            base_t->app_arg_count = n;
-            base_t->app_pack_idx = pack_idx;
-        }
-        return base_t;
+    if (!sd) {
+        char msg[256];
+        snprintf(msg, sizeof msg, "Unknown %s type '%.*s'", nominal_tag_name(tag), (int)s_curr.length, s_curr.start);
+        parse_error(msg);
     }
-
-    if (sd) {
-        // Known name: the tag must agree with how the type was actually declared.
-        unsigned char actual = sd->is_enum ? 2 : sd->is_overlapping ? 3 : 1;
-        if (actual != tag) {
-            char msg[256];
-            snprintf(msg, sizeof msg,
-                     "'%s' is declared as a %s, not a %s -- the tag must match the declaration",
-                     sd->name, nominal_tag_name(actual), nominal_tag_name(tag));
-            parse_error(msg);
-        }
+    unsigned char actual = sd->is_enum ? 2 : sd->is_overlapping ? 3 : 1;
+    if (actual != tag) {
+        char msg[256];
+        snprintf(msg, sizeof msg,
+                 "'%s' is declared as a %s, not a %s -- the tag must match the declaration",
+                 sd->name, nominal_tag_name(actual), nominal_tag_name(tag));
+        parse_error(msg);
     }
-    // Redundant tag on a known name (or an alias / type param): plain no-op.
     return parse_alias_or_type_param_type(base_t);
-}
-
-// Peek: with s_curr sitting on `[`, does THIS bracket group contain a
-// top-level comma before its matching `]`? Used to disambiguate a higher-kinded
-// application (`M[T, U]`, comma present) from an array-of-type-param (`T[N]`, no
-// comma) without consuming input. Nested `[`/`]` and `(`/`)` are skipped so an
-// inner array size or function type does not produce a false positive.
-static bool bracket_group_has_comma(void) {
-    ParseCheckpoint cp; parser_save(&cp);
-    bool found = false;
-    int depth = 0;
-    // s_curr is the opening '['.
-    for (;;) {
-        if (s_curr.type == TOK_EOF) break;
-        if (s_curr.type == TOK_LBRACKET || s_curr.type == TOK_LPAREN) depth++;
-        else if (s_curr.type == TOK_RPAREN) { if (depth > 0) depth--; }
-        else if (s_curr.type == TOK_RBRACKET) {
-            depth--;
-            if (depth == 0) break;   // matched the opening '['
-        }
-        else if (s_curr.type == TOK_COMMA && depth == 1) { found = true; break; }
-        // advance the lexer manually (can't use advance(): it has side effects
-        // like the `with`-switch machinery; a raw scan is what a peek needs).
-        s_curr = Lexer_NextToken();
-    }
-    parser_restore(&cp);
-    return found;
 }
 
 static Type* parse_alias_or_type_param_type(Type* base_t) {
@@ -1454,57 +1309,6 @@ static Type* parse_alias_or_type_param_type(Type* base_t) {
     if (tp) {
         free(base_t);
         advance();
-        // Higher-kinded APPLICATION: `M[T, U]` where M is a bound template head.
-        // The one and only spelling is the comma list, identical to every other
-        // generic use site in the language. (The old stacked `M[T][U]` form is
-        // gone -- it was the sole place generics chained, and it is ambiguous
-        // with array-of syntax.)
-        //
-        // DISAMBIGUATION: `M[X]` (a single bracket arg) is AMBIGUOUS with an
-        // array-of-type-param (`T[N]` is "array of T, size N", ubiquitous), so a
-        // lone bracket is NOT taken as application here -- it falls through to the
-        // shared postfix array loop, and unary HKT resolves there / in
-        // Type_Substitute exactly as before. A COMMA, however, can only be an
-        // application: arrays never use comma (`i32[3,4]` is not valid; arrays
-        // chain as `i32[3][4]`). So we commit to the application path only when a
-        // comma is present -- 2+ comma-separated args. That keeps `T[N]` an array
-        // and makes `M[T, U]` an unambiguous higher-kinded application.
-        if (s_curr.type == TOK_LBRACKET && bracket_group_has_comma()) {
-            advance();
-            Type** args = NULL; size_t n = 0, cap = 0;
-            for (;;) {
-                Type* a = NULL;
-                Type* vpin = NULL;
-                bool is_value_param = (s_curr.type == TOK_IDENTIFIER &&
-                                       param_kind_lookup(s_curr.start, s_curr.length, &vpin) == 1);
-                if (s_curr.type == TOK_INTEGER) {
-                    // A const-generic VALUE argument written as a literal
-                    // (`M[T, 4]`): pin u32 and parse it, mirroring the value-arg
-                    // spelling used at every other generic application site.
-                    Type* pin = Type_MakePrim(PRIM_U32);
-                    a = parse_generic_value_arg(pin);
-                } else if (is_value_param) {
-                    // The arg names an in-scope VALUE param (`M[T, K]` where K is
-                    // a `u32 K` param): parse it as a value arg pinned to that
-                    // param's own type, so it threads as a const-generic value.
-                    a = parse_generic_value_arg(vpin ? vpin : Type_MakePrim(PRIM_U32));
-                } else {
-                    a = parse_type();
-                }
-                if (!a) parse_error("Expected a type or value argument after '[' in a higher-kinded application");
-                if (n >= cap) { cap = cap ? cap * 2 : 4; args = (Type**)realloc(args, cap * sizeof(Type*)); }
-                args[n++] = a;
-                if (s_curr.type == TOK_COMMA) { advance(); continue; }
-                if (s_curr.type != TOK_RBRACKET)
-                    parse_error("Expected ']' or ',' after a higher-kinded application argument");
-                advance();
-                break;
-            }
-            tp->app_args = args;
-            tp->app_arg_count = n;
-            tp->app_pack_idx = -1;
-            tp->app_has_brackets = true;
-        }
         return tp;
     }
     
@@ -1547,22 +1351,49 @@ static Type* parse_alias_or_type_param_type(Type* base_t) {
     advance();
     if (sd->is_generic) {
         if (s_curr.type != TOK_LBRACKET) {
-            // No `[...]` -- a bare, deliberately unapplied template (e.g. `M`
-            // bound to `Box` in `HKT[Box, i32]`), not an error here.
-            base_t->cls = TYPE_STRUCT;
-            base_t->struct_name = sd->name;
-            base_t->struct_unapplied = true;
-            return base_t;
+            char msg[256];
+            snprintf(msg, sizeof msg, "Generic struct '%s' requires type arguments (e.g. %s[...])", sd->name, sd->name);
+            parse_error(msg);
         }
         advance();
         Type** targs; size_t tcount;
+        // A forward use -- the struct's name and arity come from pass 0a, but its
+        // KINDS are only filled in when pass 1 reaches the real declaration, which
+        // may be later in this file or in a file passed after this one. Until then
+        // fall back to the pass-0b side table, which parsed the genuine header with
+        // the real type grammar (see Parse_Signatures). Without this, a value slot
+        // reads as a type slot and `Cur[T, S, Vector[T].step]` fails on the `.`,
+        // making compilation depend on the order the files were passed in.
+        const char** gp_names = sd->type_params;
+        Type**       gp_kinds = sd->param_kinds;
+        size_t       gp_count = sd->type_param_count;
+        int          gp_pack  = sd->pack_type_param_index;
+        if (!gp_kinds) {
+            struct GenericSig* gs = gsig_find(sd->name, strlen(sd->name));
+            if (gs) {
+                // Trust the side table's arity over sd->type_param_count here.
+                // Pass 0a counts parameters with a flat token scan (every
+                // IDENTIFIER between the brackets), which overcounts any slot
+                // whose pin is more than a bare name: `[T, fn(T, T) T Op]` scans
+                // as 5, not 2. Pass 0b parsed the same header with the real
+                // grammar, so its count and kinds are the authoritative pair --
+                // and they must be taken TOGETHER, since a kinds array only makes
+                // sense against the arity it was built for. Pass 1 overwrites
+                // sd->type_param_count with the same real value when it reaches
+                // the declaration; this just makes the forward use agree early.
+                gp_names = gs->tparams;
+                gp_kinds = gs->pkinds;
+                gp_count = gs->pcount;
+                gp_pack  = gs->ppack;
+            }
+        }
         // Bundling applies in PATTERN position too, so an arm may be written in
         // the same sugar as the use site (`match X { Def[i32, u8] {...} }`).
         // The one carve-out lives in parse_generic_arg_list_packed: a lone
         // wildcard (`Def[E]`) binds the ALREADY-bundled struct rather than being
         // wrapped into struct{E}, which is what makes one arm cover every arity.
-        parse_generic_arg_list_packed(sd->type_params, sd->param_kinds, sd->type_param_count,
-                                      sd->pack_type_param_index, &targs, &tcount);
+        parse_generic_arg_list_packed(gp_names, gp_kinds, gp_count,
+                                      gp_pack, &targs, &tcount);
         if (s_curr.type != TOK_RBRACKET) parse_error("Expected ']' after generic struct type arguments");
         advance();
         StructDef* inst = Struct_Instantiate(sd, targs, tcount);
@@ -1642,6 +1473,27 @@ static Type* parse_type_ex(bool allow_array) {
             advance();
             break;
         }
+        case TOK_TYPEOF: {
+            advance();
+            if (s_curr.type != TOK_LPAREN) parse_error("expected '(' after typeof");
+            advance();
+            bool prev_imp = s_in_match_pattern;
+            s_in_match_pattern = false;
+            ASTNode* expr = parse_expr_prec(0);
+            if (!expr) parse_error("expected expression inside typeof(...)");
+            if (s_curr.type != TOK_RPAREN) parse_error("expected ')' after typeof expression");
+            advance();
+            free(base_t);
+
+            Typecheck_Tree(expr);
+            Type* inferred = Type_Infer(expr);
+            s_in_match_pattern = prev_imp;
+            if (!inferred) {
+                parse_error("cannot infer type of expression in typeof(...)");
+            }
+            base_t = inferred;
+            break;
+        }
         case TOK_FN:
             parse_function_type(base_t);
             break;
@@ -1670,10 +1522,38 @@ static Type* parse_type_ex(bool allow_array) {
         // While parsing `new`'s type, a postfix that starts a new line is the next
         // statement (`new u32` <nl> `*x = 42`), not part of this type.
         if (s_new_type_no_nl_postfix && s_curr_newline_before &&
-            (s_curr.type == TOK_STAR || s_curr.type == TOK_LBRACKET)) break;
+            (s_curr.type == TOK_STAR || s_curr.type == TOK_LBRACKET || s_curr.type == TOK_CARET || s_curr.type == TOK_SINGLE_QUOTE)) break;
         if (s_curr.type == TOK_STAR) {
             advance();
             base_t = make_pointer_type(base_t);
+        } else if (s_curr.type == TOK_CARET) {
+            advance();
+            StructDef* sd = Struct_Find("Shared");
+            if (sd) {
+                Type** targs = (Type**)malloc(sizeof(Type*));
+                targs[0] = base_t;
+                StructDef* inst = Struct_Instantiate(sd, targs, 1);
+                Type* res = (Type*)calloc(1, sizeof(Type));
+                res->cls = TYPE_STRUCT;
+                res->struct_name = inst->name;
+                base_t = res;
+            } else {
+                parse_error("T^ type sugar requires 'Shared' to be defined");
+            }
+        } else if (s_curr.type == TOK_SINGLE_QUOTE) {
+            advance();
+            StructDef* sd = Struct_Find("Unique");
+            if (sd) {
+                Type** targs = (Type**)malloc(sizeof(Type*));
+                targs[0] = base_t;
+                StructDef* inst = Struct_Instantiate(sd, targs, 1);
+                Type* res = (Type*)calloc(1, sizeof(Type));
+                res->cls = TYPE_STRUCT;
+                res->struct_name = inst->name;
+                base_t = res;
+            } else {
+                parse_error("T' type sugar requires 'Unique' to be defined");
+            }
         } else if (allow_array && s_curr.type == TOK_LBRACKET) {
             // Gather the contiguous run of dimensions, then fold right-to-left.
             uint64_t dims[8];
@@ -1743,7 +1623,7 @@ static Type* parse_type_ex(bool allow_array) {
 
 // Default type parse: allows the array suffix (type[N]). `new` uses the
 // no-array form so it can parse a runtime [count] itself.
-static Type* parse_type(void) { return parse_type_ex(true); }
+Type* parse_type(void) { return parse_type_ex(true); }
 
 static bool token_is_type_start(TokenType t) {
     switch (t) {
@@ -1762,6 +1642,7 @@ static bool token_is_type_start(TokenType t) {
         case TOK_STRUCT:
         case TOK_UNION:
         case TOK_ENUM:
+        case TOK_TYPEOF:
             return true;
         case TOK_IMPL:
             // `impl {...}` is a type only as a MATCH PATTERN. Everywhere else `impl`
@@ -1827,11 +1708,11 @@ static ASTNodeType get_op_node_type(TokenType type) {
     }
 }
 
-static ASTNode* parse_expr_prec(int min_prec);
+ASTNode* parse_expr_prec(int min_prec);
 static ASTNode* parse_statement(void);
 static ASTNode* parse_postfix(void);
 
-static ASTNode* parse_block_body(void) {
+ASTNode* parse_block_body(void) {
     return parse_braced_block(true, true);
 }
 
@@ -1904,9 +1785,12 @@ static bool curr_names_enum(void) {
 // parser — same three parallel malloc'd arrays, same grow-on-overflow
 // doubling, same s_in_struct_literal_field save/restore around the value
 // parse — differing only in what happened to sdef before/after the loop.
+static ASTNode* parse_brace_literal(void); // fwd decl: used by `new T{...}` above its own definition
+
 static ASTNode* parse_struct_literal_body(void) {
     ASTNode* node = new_node(AST_STRUCT_LITERAL);
     node->struct_lit.sdef = NULL;
+    node->struct_lit.pack_index = -1;
     size_t cap = 8;
     node->struct_lit.field_names = malloc(cap * sizeof(char*));
     node->struct_lit.field_name_lens = malloc(cap * sizeof(size_t));
@@ -1931,6 +1815,10 @@ static ASTNode* parse_struct_literal_body(void) {
         s_in_struct_literal_field = true;
         node->struct_lit.values[node->struct_lit.count] = parse_expr_prec(2); // above assignment, below comma
         s_in_struct_literal_field = prev_slf;
+        if (s_curr.type == TOK_ELLIPSIS) {
+            advance();
+            node->struct_lit.pack_index = (int)node->struct_lit.count;
+        }
         node->struct_lit.count++;
         if (s_curr.type == TOK_COMMA) advance();
     }
@@ -2187,8 +2075,12 @@ static ASTNode* parse_new_expr(void) {
             // case did this same recursion, just too late for a comptime fold,
             // which runs at parse time, before typecheck).
             if (t->cls != TYPE_STRUCT) parse_error("'new T{...}' initializer requires T to be a struct");
-            advance(); // consume '{'
-            ASTNode* lit = parse_struct_literal_body();
+            // Dispatch on shape (struct-shaped `.field = ...` vs positional) the
+            // SAME way every other brace-literal site does, instead of always
+            // calling the designated-only sub-parser directly — that shortcut is
+            // what silently dropped positional support here. parse_brace_literal
+            // consumes the '{' itself, so don't advance() past it first.
+            ASTNode* lit = parse_brace_literal();
             resolve_brace_literal(lit, t);
             node->new_expr.init = lit;
         }
@@ -2252,7 +2144,7 @@ static ASTNode* make_enum_variant_node(Token vtok) {
 // Parse `Variant` or `Variant(payload)` with the leading `.` ALREADY consumed
 // by the caller. Builds the enum-variant node and fills its optional single
 // `(payload)`. Shared by parse_enum_literal and parse_match_value's arm head.
-static ASTNode* parse_enum_variant_after_dot(void) {
+ASTNode* parse_enum_variant_after_dot(void) {
     if (s_curr.type != TOK_IDENTIFIER) parse_error("Expected variant name after '.'");
     Token vtok = s_curr; advance();
     ASTNode* node = make_enum_variant_node(vtok);
@@ -2531,6 +2423,7 @@ static ASTNode* parse_brace_literal(void) {
     } else {
         ASTNode* node = new_node(AST_ARRAY_LITERAL);
         node->array_lit.elem_type = NULL;
+        node->array_lit.pack_index = -1;
         size_t cap = 8;
         node->array_lit.values = (ASTNode**)malloc(cap * sizeof(ASTNode*));
         node->array_lit.count = 0;
@@ -2539,7 +2432,12 @@ static ASTNode* parse_brace_literal(void) {
                 cap *= 2;
                 node->array_lit.values = realloc(node->array_lit.values, cap * sizeof(ASTNode*));
             }
-            node->array_lit.values[node->array_lit.count++] = parse_expr_prec(2);
+            node->array_lit.values[node->array_lit.count] = parse_expr_prec(2);
+            if (s_curr.type == TOK_ELLIPSIS) {
+                advance();
+                node->array_lit.pack_index = (int)node->array_lit.count;
+            }
+            node->array_lit.count++;
             if (s_curr.type == TOK_COMMA) advance();
         }
         if (s_curr.type != TOK_RBRACE) parse_error("Expected '}' to end array literal");
@@ -2731,6 +2629,43 @@ static ASTNode* parse_postfix(void) {
             fnode->field.sdef = NULL;
             node = fnode;
 
+            // A static method used as a VALUE (`Type.method`, rather than
+            // `Type.method(...)`) is the same function symbol as a static
+            // method call. Lower it to an identifier now so constexpr and
+            // const-generic function-value handling see the real mangled
+            // function, not an AST_FIELD whose base is a type expression.
+            // Calls remain AST_FIELDs and use try_rewrite_method_call(), which
+            // also performs the normal call-specific validation.
+            if (s_curr.type != TOK_LPAREN &&
+                fnode->field.base && fnode->field.base->type == AST_TYPE_EXPR &&
+                fnode->field.base->sizeof_expr.type &&
+                fnode->field.base->sizeof_expr.type->cls == TYPE_STRUCT) {
+                Type* base_type = fnode->field.base->sizeof_expr.type;
+                Symbol* static_sym = Method_Resolve(base_type,
+                                                    fnode->field.field_name,
+                                                    fnode->field.field_name_len);
+                if (static_sym && static_sym->is_static) {
+                    ASTNode* id = new_node(AST_IDENT);
+                    id->ident.name = static_sym->name;
+                    id->ident.name_len = static_sym->name_len;
+                    id->ident.sym = static_sym;
+
+                    // A generic static method in `impl Box[T]` inherits the
+                    // concrete instantiation's type arguments. Carry them as
+                    // explicit args exactly as `box_method[T]` would.
+                    StructDef* sd = Struct_Find(base_type->struct_name);
+                    if (sd && sd->generic_base && sd->type_arg_count > 0 &&
+                        static_sym->generic_decl) {
+                        size_t n = sd->type_arg_count;
+                        id->ident.type_args = malloc(n * sizeof(Type*));
+                        for (size_t i = 0; i < n; i++)
+                            id->ident.type_args[i] = sd->type_args[i];
+                        id->ident.type_arg_count = n;
+                    }
+                    node = id;
+                }
+            }
+
             // `.method[TypeArgs](...)`: explicit generic type arguments on a
             // METHOD call (as opposed to a bare `identity[i32](...)` call,
             // whose own explicit-generic-call parsing lives in
@@ -2814,7 +2749,7 @@ static ASTNode* parse_postfix(void) {
     return node;
 }
 
-static ASTNode* parse_expr_prec(int min_prec) {
+ASTNode* parse_expr_prec(int min_prec) {
     ASTNode* left = parse_postfix();
     
     while (1) {
@@ -2878,828 +2813,13 @@ static ASTNode* parse_expr_prec(int min_prec) {
     return left;
 }
 
-// `match` LOWERS at parse time to an if-chain of EXISTING nodes -- there is no
-// AST_MATCH; the backend/typecheck/constexpr never see `match`, only the if-chain they
-// already compile. So match works wherever an if-chain works (including, eventually,
-// constexpr once it can hold an aggregate). Lowering of
-//   match e { Disconnect r {A}  Connect c {B}  Empty {C} }
-// is, inside a fresh block scope:
-//   EnumType _m = e
-//   if (*(u32*)&_m == 0) { vtype r = _m.Disconnect; A }
-//   else if (*(u32*)&_m == 1) { vtype c = _m.Connect; B }
-//   else if (*(u32*)&_m == 2) { C }                         // exhaustive -> last arm
-// Tag read = *(u32*)&_m (existing cast+deref+addr). Payload read = _m.Variant (a
-// variant IS a StructField -> existing field access). Exhaustiveness is checked here.
-// Primitive-scrutinee path: match on an int/bool value directly. Arms are bare
-// (possibly negative) literal expressions -- no variant name, no payload binding.
-// Shares the same outer-block/synthetic-local shape as the enum path; only the
-// per-arm condition (direct equality vs tag-read + field access) differs.
+// Match lowering engine and match statement parsing relocated to match.c
+ASTNode* Lower_Match(ASTNode* node, Type* st);
+ASTNode* parse_match_type(ASTNode* scrut);
+ASTNode* parse_unpack(void);
+ASTNode* parse_match(void);
 
 
-// Does this pattern match EVERY value of its type -- i.e. can it never reject?
-// True for a bare bind (AST_IDENT), and recursively true for a struct/array
-// destructure pattern where every sub-element also covers all. False for any
-// literal (constrains to one concrete value) and for an enum-variant literal
-// (constrains to one variant among possibly others). Used to decide whether a
-// pattern fully covers a variant's payload for exhaustiveness purposes -- a
-// `{a, b, c}` array-destructure that only binds is just as "catch-all" as a
-// bare identifier would be, since neither can ever fail to match.
-static bool pattern_covers_all(ASTNode* pat) {
-    if (pat->type == AST_IDENT) return true;
-    // A `*name` leaf binds a fresh pointer into the slot -- irrefutable, like a
-    // bare name. (Other lvalue-access shapes are no longer binding leaves.)
-    if (pat->type == AST_DEREF && pat->unary && pat->unary->type == AST_IDENT) return true;
-    if (pat->type == AST_STRUCT_LITERAL && !pat->struct_lit.is_enum_variant) {
-        for (size_t i = 0; i < pat->struct_lit.count; i++)
-            if (!pattern_covers_all(pat->struct_lit.values[i])) return false;
-        return true;
-    }
-    if (pat->type == AST_ARRAY_LITERAL) {
-        for (size_t i = 0; i < pat->array_lit.count; i++)
-            if (!pattern_covers_all(pat->array_lit.values[i])) return false;
-        return true;
-    }
-    return false;
-}
-
-// Read an enum's tag out of `scrut`: *(u32*)&scrut. Both compile_pattern's
-// `.Variant` case and the cursor for-in desugar build this same read to
-// compare against a variant index.
-static ASTNode* make_tag_read(ASTNode* scrut) {
-    ASTNode* addr = new_node(AST_ADDR); addr->unary = scrut;
-    Type* u32t = (Type*)calloc(1, sizeof(Type)); u32t->cls = TYPE_PRIMITIVE; u32t->primitive = PRIM_U32;
-    Type* u32p = (Type*)calloc(1, sizeof(Type)); u32p->cls = TYPE_POINTER; u32p->pointer_base = u32t;
-    ASTNode* c = new_node(AST_CAST); c->cast.target_type = u32p; c->cast.expr = addr;
-    ASTNode* d = new_node(AST_DEREF); d->unary = c;
-    return d;
-}
-// Build `tag(scrut) == idx`.
-static ASTNode* make_tag_eq(ASTNode* scrut, int idx) {
-    ASTNode* tag = make_tag_read(scrut);
-    ASTNode* lit = new_node(AST_INT_LITERAL); lit->lit_kind = LIT_INT; lit->int_value = (uint64_t)idx;
-    ASTNode* eq = new_node(AST_EQ); eq->binary.left = tag; eq->binary.right = lit;
-    return eq;
-}
-
-static void compile_pattern(ASTNode* pat, ASTNode* scrut, Type* scrut_type, ASTNode** out_cond, ASTNode*** out_decls, size_t* decl_count, size_t* decl_cap) {
-    if (pat->type == AST_IDENT) {
-        // A pattern leaf DECLARES a fresh name (binds the slot's value to it). It
-        // may shadow an outer variable -- that's a normal fresh declaration in the
-        // pattern's own scope, NOT an assign-into the outer one (no lvalue swap).
-        // A predeclared binder (predeclare_binders) lives in the CURRENT scope with
-        // a NULL placeholder type -- patch it and emit the decl-init. Any other name
-        // (including one that shadows an outer variable) is a fresh declaration:
-        // SymTable_Add handles it, rejecting only a genuine same-scope duplicate.
-        // Shadowing an enclosing binding is legitimate (a match arm's own scope),
-        // so we must NOT walk parents here -- only the current table's predeclared
-        // slot counts as "already this binder".
-        Symbol* pre = NULL;
-        for (size_t i = 0; i < s_symtable->count; i++) {
-            Symbol* e = s_symtable->symbols[i];
-            if (e->name_len == pat->ident.name_len &&
-                strncmp(e->name, pat->ident.name, pat->ident.name_len) == 0 &&
-                e->type == NULL) { pre = e; break; }
-        }
-        if (pre) {
-            pre->type = scrut_type;
-            ASTNode* decl = make_decl_stmt(scrut_type, pat->ident.name, pat->ident.name_len, pre, scrut);
-            DA_PUSH(*out_decls, *decl_count, *decl_cap, decl);
-            return;
-        }
-        SymbolKind kind = s_symtable->is_function_scope ? SYM_LOCAL : SYM_GLOBAL;
-        Symbol* sym = SymTable_Add(s_symtable, pat->ident.name, pat->ident.name_len, scrut_type, kind);
-        ASTNode* decl = make_decl_stmt(scrut_type, pat->ident.name, pat->ident.name_len, sym, scrut);
-        DA_PUSH(*out_decls, *decl_count, *decl_cap, decl);
-        return;
-    }
-
-    // The ONE hardcoded pattern feature: a `*name` leaf binds `name` as a POINTER
-    // INTO the projected slot (`name = &slot`), so `*name` reads and writes through
-    // the live element -- no copy. `name` is fresh (may shadow an outer var). A
-    // current-scope predeclared binder (NULL type) is patched; otherwise declared.
-    if (pat->type == AST_DEREF && pat->unary && pat->unary->type == AST_IDENT) {
-        const char* nm = pat->unary->ident.name;
-        size_t nml = pat->unary->ident.name_len;
-        Type* ptr_t = make_pointer_type(scrut_type);            // name : Slot*
-        ASTNode* addr = new_node(AST_ADDR); addr->unary = scrut; // &slot
-        Symbol* pre = NULL;
-        for (size_t i = 0; i < s_symtable->count; i++) {
-            Symbol* e = s_symtable->symbols[i];
-            if (e->name_len == nml && strncmp(e->name, nm, nml) == 0 && e->type == NULL) { pre = e; break; }
-        }
-        if (pre) {
-            pre->type = ptr_t;
-            ASTNode* decl = make_decl_stmt(ptr_t, nm, nml, pre, addr);
-            DA_PUSH(*out_decls, *decl_count, *decl_cap, decl);
-        } else {
-            SymbolKind kind = s_symtable->is_function_scope ? SYM_LOCAL : SYM_GLOBAL;
-            Symbol* sym = SymTable_Add(s_symtable, nm, nml, ptr_t, kind);
-            ASTNode* decl = make_decl_stmt(ptr_t, nm, nml, sym, addr);
-            DA_PUSH(*out_decls, *decl_count, *decl_cap, decl);
-        }
-        return;
-    }
-
-    
-    // Enum-variant pattern: `.Variant(payload)` (is_enum_variant=true, field_names[0]
-    // = variant name, values[0] = payload sub-pattern if count==1) OR the designated-
-    // literal idiom `{.Variant = payload}` (is_enum_variant=false, but sdef resolved
-    // to the enum itself with exactly one field -- same shape, different spelling,
-    // see the identical broadening in the exhaustiveness check above). Emit a
-    // tag-equality check ANDed into cond, then recurse into the payload sub-pattern
-    // via a field access on the SAME scrut node (reused, same as every other branch
-    // here -- scrut is always a side-effect-free chain of field/index/ident reads on
-    // top of the one materialized match temp, so reusing the pointer in two places
-    // just re-emits the same read twice).
-    // MUST come before the plain AST_STRUCT_LITERAL branch below: that branch
-    // matches any struct literal unconditionally, including enum-variant ones,
-    // and would treat the variant name as a bogus field name -- worse, for a
-    // no-payload variant its count==0 loop body never runs, so it returns
-    // having added NO condition at all, silently making that arm match always.
-    // Real bug found and fixed via this exact gap: `{.Some = v}` fell through to
-    // the plain-struct branch, read `scrut.Some` unconditionally with no tag
-    // check, and silently returned garbage/wrong values on a `.None`-tagged scrut
-    // instead of failing to match.
-    bool is_variant_pat = pat->type == AST_STRUCT_LITERAL &&
-        (pat->struct_lit.is_enum_variant ||
-         (scrut_type && scrut_type->cls == TYPE_STRUCT && pat->struct_lit.sdef &&
-          pat->struct_lit.sdef->is_enum && pat->struct_lit.count == 1));
-    if (is_variant_pat) {
-        StructDef* sd = (scrut_type && scrut_type->cls == TYPE_STRUCT) ? Struct_Find(scrut_type->struct_name) : NULL;
-        if (!sd || !sd->is_enum) parse_error("'.Variant' pattern used against a non-enum scrutinee");
-
-        int vidx = Enum_VariantIndex(sd, pat->struct_lit.field_names[0], pat->struct_lit.field_name_lens[0]);
-        if (vidx < 0) parse_error("match arm names a variant this enum does not have");
-
-        ASTNode* eq = make_tag_eq(scrut, vidx);
-
-        if (*out_cond == NULL) {
-            *out_cond = eq;
-        } else {
-            ASTNode* and_node = new_node(AST_LOGICAL_AND);
-            and_node->binary.left = *out_cond;
-            and_node->binary.right = eq;
-            *out_cond = and_node;
-        }
-
-        if (pat->struct_lit.count == 1) {
-            Type* ptype = sd->fields[vidx].type;
-            if (!ptype) parse_error("match arm binds a payload but this variant has none");
-            ASTNode* payload_scrut = new_node(AST_FIELD);
-            payload_scrut->field.base = scrut;
-            payload_scrut->field.field_name = pat->struct_lit.field_names[0];
-            payload_scrut->field.field_name_len = pat->struct_lit.field_name_lens[0];
-            compile_pattern(pat->struct_lit.values[0], payload_scrut, ptype, out_cond, out_decls, decl_count, decl_cap);
-        }
-        return;
-    }
-
-    if (pat->type == AST_STRUCT_LITERAL) {
-        for (size_t i = 0; i < pat->struct_lit.count; i++) {
-            ASTNode* elem_pat = pat->struct_lit.values[i];
-            ASTNode* elem_scrut = new_node(AST_FIELD);
-            elem_scrut->field.base = scrut;
-            elem_scrut->field.field_name = pat->struct_lit.field_names[i];
-            elem_scrut->field.field_name_len = pat->struct_lit.field_name_lens[i];
-            Type* elem_type = NULL;
-            if (scrut_type && scrut_type->cls == TYPE_STRUCT) {
-                StructDef* sd = Struct_Find(scrut_type->struct_name);
-                if (sd) {
-                    StructField* field = Struct_FindField(sd, pat->struct_lit.field_names[i], pat->struct_lit.field_name_lens[i]);
-                    if (field) elem_type = field->type;
-                }
-            }
-            compile_pattern(elem_pat, elem_scrut, elem_type, out_cond, out_decls, decl_count, decl_cap);
-        }
-        return;
-    }
-
-    if (pat->type == AST_ARRAY_LITERAL) {
-        for (size_t i = 0; i < pat->array_lit.count; i++) {
-            ASTNode* elem_pat = pat->array_lit.values[i];
-            ASTNode* index = new_node(AST_INT_LITERAL);
-            index->lit_kind = LIT_INT;
-            index->int_value = i;
-            ASTNode* elem_scrut = new_node(AST_INDEX);
-            elem_scrut->index.base = scrut;
-            elem_scrut->index.index = index;
-            Type* elem_type = NULL;
-            if (scrut_type && scrut_type->cls == TYPE_ARRAY) {
-                elem_type = scrut_type->array.element;
-            }
-            compile_pattern(elem_pat, elem_scrut, elem_type, out_cond, out_decls, decl_count, decl_cap);
-        }
-        return;
-    }
-    
-    ASTNode* eq = new_node(AST_EQ);
-    eq->binary.left = scrut;
-    eq->binary.right = pat;
-    
-    if (*out_cond == NULL) {
-        *out_cond = eq;
-    } else {
-        ASTNode* and_node = new_node(AST_LOGICAL_AND);
-        and_node->binary.left = *out_cond;
-        and_node->binary.right = eq;
-        *out_cond = and_node;
-    }
-}
-
-// ─── shared match-arm if-chain skeleton ────────────────────────────────────
-// parse_match_value (value scrutinee) and parse_match_type (type scrutinee)
-// both lower their arms to the SAME shape: a block containing zero or more
-// `if (cond) {A} else if (cond2) {B} else {C}`-style chains built one arm at
-// a time, where each new arm either becomes the first statement in the
-// block or gets threaded onto the previous arm's false_block. That threading
-// (and the underlying growable statement list) used to be hand-copied in
-// both functions, including an identical block-growth macro under two
-// different names (PUSH / PUSH_T). It is pure tree shape -- neither
-// function's arm-specific logic (value-pattern exhaustiveness vs.
-// type-pattern wildcard scoping) needs to know how the chain is threaded --
-// so it now lives once, here.
-typedef struct {
-    ASTNode* outer;         // the block the caller returns
-    ASTNode* chain_tail_if; // innermost if whose false_block extends next; NULL = chain not started
-} MatchChain;
-
-static MatchChain matchchain_begin(void) {
-    MatchChain mc;
-    mc.outer = new_node(AST_BLOCK);
-    mc.outer->block.capacity = 4;
-    mc.outer->block.count = 0;
-    mc.outer->block.statements = malloc(mc.outer->block.capacity * sizeof(ASTNode*));
-    mc.chain_tail_if = NULL;
-    return mc;
-}
-
-static void matchchain_push_stmt(MatchChain* mc, ASTNode* stmt) {
-    append_block_statement(mc->outer, stmt);
-}
-
-// Attach one arm to the chain. `armblk` is the arm's already-parsed body.
-// `ifn` is NULL for a terminal wildcard/else arm (armblk is linked directly);
-// otherwise ifn is the AST_IF node the caller built for a conditional arm
-// (with true_block == armblk), and this function threads it onto the chain.
-// Returns false once a terminal (wildcard) arm has been attached, signaling
-// the caller's loop to stop.
-static bool matchchain_add_arm(MatchChain* mc, ASTNode* ifn, ASTNode* armblk, bool is_terminal) {
-    ASTNode* to_link = is_terminal ? armblk : ifn;
-    if (!mc->chain_tail_if) matchchain_push_stmt(mc, to_link);
-    else mc->chain_tail_if->if_stmt.false_block = to_link;
-    mc->chain_tail_if = is_terminal ? NULL : ifn;
-    return !is_terminal;
-}
-
-// Lower an already-parsed value AST_MATCH into an if-chain, now that the scrutinee
-// type `st` is known (typecheck time, generic params concrete). The arm bodies were
-// already parsed into their own scopes by parse_match, so any pattern BINDINGS
-// (enum payloads) are prepended to each arm body here via compile_pattern, whose
-// decls slot in ahead of the already-parsed statements. Reuses compile_pattern +
-// matchchain + the enum/bool exhaustiveness logic; the ONLY thing that moved is
-// WHEN this runs (after Type_Infer, not during parsing), which is what lets a
-// scrutinee like `N + 1` or `arr[N]` resolve at all.
-ASTNode* Lower_Match(ASTNode* node, Type* st) {
-    ASTNode* scrut = node->match_stmt.scrutinee;
-    size_t narms = node->match_stmt.arm_count;
-    uint64_t sz = Type_SizeOf(st); if (sz == 0) sz = 1;
-    bool is_bool = (st->cls == TYPE_PRIMITIVE && st->primitive == PRIM_BOOL);
-
-    SymbolTable* prev_table = s_symtable;
-    s_symtable = SymTable_Create(prev_table);
-    s_symtable->is_function_scope = prev_table->is_function_scope;
-    SymbolKind kind = s_symtable->is_function_scope ? SYM_LOCAL : SYM_GLOBAL;
-
-    static int s_switch_ctr = 0;
-    char* mname = malloc(32); int mn = snprintf(mname, 32, "$s%d", s_switch_ctr++);
-
-    // REFERENCE.md's `unpack`/`match` write-through contract: "Write-through
-    // reaches the original only when the scrutinee is itself addressable
-    // storage ... a real lvalue." To honor that, an lvalue scrutinee must be
-    // bound by REFERENCE ($s0 = &scrut, a pointer), not by value -- otherwise
-    // every `*name` leaf (see compile_pattern's AST_DEREF case, which takes
-    // &scrut of whatever node SREF() hands it) ends up aliasing a throwaway
-    // copy instead of the original, silently breaking the documented
-    // semantics. Non-lvalue scrutinees (call results, arithmetic, etc.) have
-    // no original to alias, so they keep the by-value temp path unchanged.
-    bool scrut_is_lvalue = base_is_lvalue(scrut);
-    Type* msym_type = scrut_is_lvalue ? make_pointer_type(st) : st;
-    Symbol* msym = SymTable_Add(s_symtable, mname, mn, msym_type, kind);
-
-    MatchChain mc = matchchain_begin();
-    ASTNode* outer = mc.outer;
-    // An `unpack` lowers to a TRANSPARENT block: its binders escape into the
-    // enclosing scope (that's unpack's defining difference from a match arm), and
-    // ConstEval must not scope them away either -- so `const K = f()` where f
-    // unpacks folds, matching the old parse-time lowering this replaced.
-    if (node->match_stmt.is_unpack) outer->block.transparent = true;
-    if (scrut_is_lvalue) {
-        ASTNode* addr_of_scrut = new_node(AST_ADDR); addr_of_scrut->unary = scrut;
-        matchchain_push_stmt(&mc, make_decl_stmt(msym_type, mname, mn, msym, addr_of_scrut));
-    } else {
-        matchchain_push_stmt(&mc, make_decl_stmt(st, mname, mn, msym, scrut));
-    }
-    #define SREF() ({ ASTNode* r = new_node(AST_IDENT); r->ident.name = mname; \
-                      r->ident.name_len = mn; r->ident.sym = msym; \
-                      scrut_is_lvalue ? ({ ASTNode* d = new_node(AST_DEREF); d->unary = r; d; }) : r; })
-
-
-    StructDef* enum_sd = (st->cls == TYPE_STRUCT) ? Struct_Find(st->struct_name) : NULL;
-    bool is_enum_match = enum_sd && enum_sd->is_enum;
-    bool* enum_covered = is_enum_match ? calloc(enum_sd->field_count, sizeof(bool)) : NULL;
-    bool covered_true = false, covered_false = false, has_wildcard = false;
-    uint8_t** seen = NULL; size_t seen_count = 0, seen_cap = 0; // folded constant arm values, for duplicate detection
-
-    for (size_t a = 0; a < narms; a++) {
-        ASTNode* pat  = node->match_stmt.arm_patterns[a];
-        ASTNode* body = node->match_stmt.arm_bodies[a];
-        SymbolTable* arm_scope = node->match_stmt.arm_scopes[a];
-        bool is_wildcard = (pat == NULL);
-
-        if (!is_wildcard && Type_IsAggregate(st)) resolve_brace_literal(pat, st);
-
-        // Enum-variant exhaustiveness tracking (same rule as parse_match_value).
-        bool is_variant_pattern = !is_wildcard && is_enum_match && pat->type == AST_STRUCT_LITERAL &&
-            (pat->struct_lit.is_enum_variant ||
-             (pat->struct_lit.sdef == enum_sd && pat->struct_lit.count == 1));
-        if (is_variant_pattern) {
-            int vidx = Enum_VariantIndex(enum_sd, pat->struct_lit.field_names[0], pat->struct_lit.field_name_lens[0]);
-            if (vidx >= 0) {
-                if (enum_covered[vidx]) parse_error("unreachable match arm: this variant is already fully covered by an earlier arm");
-                bool covers_all = (pat->struct_lit.count == 0) ||
-                                   (pat->struct_lit.count == 1 && pattern_covers_all(pat->struct_lit.values[0]));
-                if (covers_all) enum_covered[vidx] = true;
-            }
-        }
-
-        // An `unpack` arm carries all of parse_unpack's concrete-path logic here, so
-        // it runs at typecheck when `st` is concrete -- uniformly for a generic OR a
-        // concrete scrutinee (one path, not two). Pointer-to-aggregate auto-deref and
-        // positional brace-name-fill happen against the now-known type; proj_scrut/
-        // proj_type feed compile_pattern. (A refutable enum pattern is already rejected
-        // earlier -- pattern_covers_all for a variant pattern, resolve_brace_literal for
-        // a positional literal on an enum -- so no enum-specific check is needed here.)
-        ASTNode* proj_scrut = NULL; Type* proj_type = st;
-        if (node->match_stmt.is_unpack && !is_wildcard) {
-            proj_scrut = SREF();
-            if (st->cls == TYPE_POINTER && st->pointer_base && pat->type != AST_IDENT &&
-                Type_IsAggregate(st->pointer_base)) {
-                ASTNode* d = new_node(AST_DEREF); d->unary = proj_scrut; proj_scrut = d;
-                proj_type = st->pointer_base;
-            }
-            if (Type_IsAggregate(proj_type)) resolve_brace_literal(pat, proj_type);
-        }
-
-        ASTNode* cond = NULL;
-        if (!is_wildcard) {
-            ASTNode** decls = NULL; size_t dc = 0, dcap = 0;
-            // Compile the pattern IN THE ARM'S OWN SCOPE, so its binders resolve to
-            // the exact symbols predeclare_binders registered (now getting their
-            // real projected types via compile_pattern's placeholder-patch leaf).
-            SymbolTable* save = s_symtable;
-            s_symtable = arm_scope;
-            compile_pattern(pat, proj_scrut ? proj_scrut : SREF(), proj_type, &cond, &decls, &dc, &dcap);
-            s_symtable = save;
-            // An unpack is unconditional: its binder decls go DIRECTLY into the
-            // transparent `outer` block, NOT inside an `if(1){}` arm block. The arm
-            // if-block is a real (non-transparent) scope, so at const-fold time it
-            // would unwind the binders before the statements AFTER the unpack (which
-            // reference them) run -- the runtime worked, comptime lost them. Emitting
-            // the decls into the transparent block keeps them alive both places, and
-            // matches the plain-decl block the old parse-time unpack produced.
-            if (node->match_stmt.is_unpack) {
-                for (size_t i = 0; i < dc; i++) matchchain_push_stmt(&mc, decls[i]);
-                if (decls) free(decls);
-                continue; // no if-chain arm: unpack always matches
-            }
-            // Prepend the pattern's binding decls ahead of the arm body's own statements.
-            if (dc > 0) {
-                ASTNode* merged = new_node(AST_BLOCK);
-                merged->block.capacity = dc + body->block.count;
-                merged->block.statements = malloc(merged->block.capacity * sizeof(ASTNode*));
-                merged->block.count = 0;
-                for (size_t i = 0; i < dc; i++) merged->block.statements[merged->block.count++] = decls[i];
-                for (size_t i = 0; i < body->block.count; i++) merged->block.statements[merged->block.count++] = body->block.statements[i];
-                body = merged;
-            }
-            if (decls) free(decls);
-            // Duplicate-arm / literal-fit checks for constant-valued patterns (same
-            // as parse_match_value): fold the pattern to bytes and compare against
-            // earlier arms. Covers primitives and constant aggregate/enum literals.
-            uint8_t* bytes = (uint8_t*)calloc(1, sz);
-            if (ConstEval_Bytes(pat, bytes, sz)) {
-                // Integer fit-check only for INTEGER scrutinees. Floats are allowed
-                // as scrutinees (unlike the old `match`, which arbitrarily banned
-                // them); an integer-range check is meaningless for a float literal.
-                if (st->cls == TYPE_PRIMITIVE && !Type_IsFloat(st)) {
-                    int64_t val = 0; ConstEval(pat, &val);
-                    if (!Type_IntLiteralFits(val, st)) parse_error("match arm literal does not fit the scrutinee's type (use a cast to truncate, or widen the scrutinee)");
-                }
-                for (size_t i = 0; i < seen_count; i++)
-                    if (memcmp(seen[i], bytes, sz) == 0) parse_error("duplicate match arm for this value");
-                DA_PUSH(seen, seen_count, seen_cap, bytes);
-                if (is_bool) { if (bytes[0]) covered_true = true; else covered_false = true; }
-            } else {
-                free(bytes);
-            }
-        } else {
-            has_wildcard = true;
-        }
-
-        if (is_wildcard) { matchchain_add_arm(&mc, NULL, body, true); break; }
-        if (!cond) { cond = new_node(AST_INT_LITERAL); cond->lit_kind = LIT_BOOL; cond->int_value = 1; }
-        ASTNode* ifn = new_node(AST_IF);
-        ifn->if_stmt.condition = cond; ifn->if_stmt.true_block = body; ifn->if_stmt.false_block = NULL;
-        matchchain_add_arm(&mc, ifn, body, false);
-    }
-
-    // An `unpack` is irrefutable by construction (parse_unpack ran pattern_covers_all)
-    // -- its single arm always matches, so it needs no exhaustiveness check and no else.
-    if (!has_wildcard && !node->match_stmt.is_unpack) {
-        bool exhaustive = is_bool && covered_true && covered_false;
-        if (is_enum_match) {
-            exhaustive = true;
-            for (size_t i = 0; i < enum_sd->field_count; i++) if (!enum_covered[i]) { exhaustive = false; break; }
-        }
-        if (!exhaustive) {
-            s_symtable = prev_table;
-            if (is_enum_match) parse_error("match on this enum is not exhaustive -- add an `else` arm or handle every variant");
-            else if (st->cls == TYPE_PRIMITIVE && !is_bool) parse_error("match on this type is not exhaustive -- add an `else` arm (only bool can be exhaustive without one)");
-            else parse_error("match on a struct/array/pointer/function value is not exhaustive -- add an `else` arm");
-        }
-        if (mc.chain_tail_if) mc.chain_tail_if->if_stmt.exhaustive_tail = true;
-    }
-    if (enum_covered) free(enum_covered);
-    for (size_t i = 0; i < seen_count; i++) free(seen[i]);
-    free(seen);
-    #undef SREF
-    s_symtable = prev_table;
-    return outer;
-}
-
-// TYPE-scrutinee match: `match T { P* {..} E[N] {..} u32 {..} else {..} }`.
-//
-// This is reflection over a type's shape. It lowers, exactly like the enum path,
-// to a chain of AST_IF nodes — but each arm is a TYPE PATTERN, not a tag read:
-//
-//   match T {
-//       P*   { body_a }      ->  if <reflect P* against T>   { body_a }
-//       E[N] { body_b }               else if <reflect E[N] against T> { body_b }
-//       else { body_c }               else { body_c }
-//   }
-//
-// Each arm's pattern is parsed with s_in_match_pattern = true, so an undeclared
-// identifier becomes a fresh wildcard (parse_type_ex, above). The wildcard names
-// are then published into the type-param scope while the arm BODY is parsed, so
-// the body can reference P / E / N as ordinary types. The AST_IF carries the
-// pattern and scrutinee type; branch selection (types.c AST_IF case) runs
-// reflect_unify and, on a match, substitutes the bindings into the body. No new
-// evaluator, no TypeInfo structs, no magic integers — the shape falls out of the
-// existing if-chain + monomorphization machinery, matching Torrent's design rule.
-static ASTNode* parse_match_type(ASTNode* scrut) {
-    Type* scrut_type = scrut->sizeof_expr.type;
-
-    if (s_curr.type != TOK_LBRACE) parse_error("Expected '{' to begin match arms");
-    advance();
-
-    MatchChain mc = matchchain_begin();
-    ASTNode* outer = mc.outer;
-    bool has_wildcard = false;
-
-    while (s_curr.type != TOK_RBRACE && s_curr.type != TOK_EOF) {
-        bool is_else = (s_curr.type == TOK_ELSE);
-
-        Type* pattern = NULL;
-        // Snapshot the wildcard set for THIS arm (it's per-arm state).
-        size_t wc_start = s_match_wildcard_count;
-
-        if (is_else) {
-            advance();
-        } else {
-            // Parse the pattern type in match-pattern mode: undeclared identifiers
-            // become fresh wildcards, registered into s_match_wildcards[wc_start..].
-            bool prev = s_in_match_pattern;
-            s_in_match_pattern = true;
-            bool prev_pt = s_pattern_types_ok; s_pattern_types_ok = true;
-            pattern = parse_type();
-            s_in_match_pattern = prev;
-            s_pattern_types_ok = prev_pt;
-            if (!pattern) parse_error("Expected a type pattern in match arm");
-        }
-
-        // Publish this arm's wildcards into the type-param scope so the BODY can
-        // reference them (P, E as types; N as a value param). We extend the scope
-        // arrays temporarily and restore them after the body. A size wildcard `N`
-        // is a VALUE param (pinned u32); a bare `P`/`E` is a TYPE param (NULL pin).
-        const char** prev_tp = s_type_params;
-        Type** prev_pk = s_param_kinds;
-        size_t prev_tpc = s_type_param_count;
-        size_t nwc = s_match_wildcard_count - wc_start;
-        const char** merged_names = NULL;
-        Type** merged_kinds = NULL;
-        if (nwc > 0) {
-            size_t total = prev_tpc + nwc;
-            merged_names = (const char**)malloc(total * sizeof(char*));
-            merged_kinds = (Type**)malloc(total * sizeof(Type*));
-            for (size_t i = 0; i < prev_tpc; i++) { merged_names[i] = prev_tp[i]; merged_kinds[i] = prev_pk ? prev_pk[i] : NULL; }
-            for (size_t i = 0; i < nwc; i++) {
-                merged_names[prev_tpc + i] = s_match_wildcards[wc_start + i];
-                // A size wildcard (`N` in `E[N]`) is a VALUE param: pin it to u32 so
-                // that when the body uses it as a value (`(i32)N`), it parses as an
-                // AST_IDENT value param (not an AST_TYPE_EXPR) and clone_ast lowers
-                // it from its bound TYPE_CONST_VALUE to a pinned literal — the exact
-                // path const generics already use. A bare type wildcard (`P`, `E`)
-                // stays a type param (NULL pin).
-                // Whether a TAGGED application's bracket wildcard (`struct M[X][N]`)
-                // is a type slot or a const-generic VALUE slot depends on the
-                // template the head binds to -- unknown here, since the head is
-                // itself a wildcard. Publish those as u32-pinned VALUE params too:
-                // clone_ast lowers a binding that turns out to be a TYPE_CONST_VALUE
-                // to a literal, and leaves a genuine type binding alone, so the pin
-                // costs nothing when the slot was a type after all.
-                bool is_val = (s_match_wc_is_size && s_match_wc_is_size[wc_start + i]);
-                merged_kinds[prev_tpc + i] = is_val ? Type_MakePrim(PRIM_U32) : NULL;
-            }
-            s_type_params = merged_names;
-            s_param_kinds = merged_kinds;
-            s_type_param_count = total;
-        }
-
-        // Parse the arm body as a block in its own symbol scope.
-        ASTNode* armblk = parse_block_body();
-
-        // Restore the type-param scope.
-        s_type_params = prev_tp;
-        s_param_kinds = prev_pk;
-        s_type_param_count = prev_tpc;
-
-        // Retire this arm's wildcards. match_wildcard_lookup scans the live slice,
-        // so trimming back to wc_start means the NEXT arm starts fresh — a wildcard
-        // name reused across arms (`fn(A) A` in one arm, `fn(A) B` in another) is a
-        // brand-new hole per arm, not a shared binding. Without this, arm 2's `A`
-        // would alias arm 1's `A` and consistency checks would compare across arms.
-        s_match_wildcard_count = wc_start;
-
-        if (is_else) {
-            has_wildcard = true;
-            matchchain_add_arm(&mc, NULL, armblk, true);
-            break;
-        }
-
-        // Build the arm as an AST_IF carrying the reflect pattern. The condition is
-        // a placeholder literal (never actually evaluated as a runtime condition —
-        // branch selection uses reflect_unify); it only needs to be a valid node so
-        // ordinary tree walks don't trip on a NULL condition.
-        ASTNode* placeholder = new_node(AST_INT_LITERAL);
-        placeholder->lit_kind = LIT_BOOL; placeholder->int_value = 0;
-        ASTNode* ifn = new_node(AST_IF);
-        ifn->if_stmt.condition = placeholder;
-        ifn->if_stmt.true_block = armblk;
-        ifn->if_stmt.false_block = NULL;
-        ifn->if_stmt.reflect_pattern = pattern;
-        ifn->if_stmt.reflect_scrutinee = scrut_type;
-
-        matchchain_add_arm(&mc, ifn, armblk, false);
-    }
-    if (s_curr.type != TOK_RBRACE) parse_error("Expected '}' to end match");
-    advance();
-
-    (void)has_wildcard; // exhaustiveness of type matches isn't checkable in general
-    return outer;
-}
-
-// Shared scrutinee-type classification for `match` and `unpack`. Both are the
-// same underlying operation (bind names via compile_pattern's pattern walk)
-// at different refutability -- match allows patterns that can fail (needs
-// exhaustiveness reasoning), unpack requires pattern_covers_all instead. That
-// difference is real and stays in each caller; what was NOT a real difference
-// was the legality check for which TYPE a pattern can be matched against at
-// all -- previously duplicated as two independently hand-written boolean
-// blocks that had drifted (match excluded floats for its own NaN/duplicate-
-// arm reasons; unpack never had a reason to, and simply didn't). This is the
-// one classification both entry points actually need.
-//
-// Pointers and function values were excluded here for years with no
-// documented reason, and no downstream code depends on the exclusion:
-// compile_pattern's AST_IDENT case is `SymTable_Add` + a read, and never
-// inspects st->cls. A bare-identifier (identity) pattern binds any type.
-// They're included now.
-typedef struct {
-    bool is_enum;
-    bool is_primitive;
-    bool is_aggregate;   // struct or array, and not an enum
-    bool is_ptr_or_fn;   // pointer, function, or fn-literal
-} ScrutKind;
-
-static ScrutKind classify_scrutinee_type(Type* st) {
-    ScrutKind k = {0};
-    // A TYPE_PARAM is an unresolved generic placeholder (e.g. T) at template-
-    // parse time.  Accept it now — the concrete type will be substituted by
-    // clone_ast at instantiation, and Typecheck_Tree will re-validate then.
-    if (st && st->cls == TYPE_PARAM) {
-        k.is_primitive = true;
-        return k;
-    }
-    k.is_enum = st && st->cls == TYPE_STRUCT && Struct_Find(st->struct_name)
-                && Struct_Find(st->struct_name)->is_enum;
-    k.is_primitive = st && st->cls == TYPE_PRIMITIVE;
-    k.is_aggregate = Type_IsAggregate(st) && !k.is_enum;
-    k.is_ptr_or_fn = st && (st->cls == TYPE_POINTER || st->cls == TYPE_FUNCTION || st->cls == TYPE_FN_LITERAL);
-    return k;
-}
-
-
-// `unpack <pattern> = <expr>` -- sugar for a `match` whose pattern is known,
-// at compile time, to always match: no `else` is possible or needed, and the
-// names the pattern binds escape into the ENCLOSING scope (unlike a match arm,
-// whose bindings die at the arm's closing brace). This reuses the exact same
-// pattern grammar and compile_pattern walk that match's struct/array arms use
-// -- `{.x=px, .y=py}`, `{px, py}` positional, nested, array `{a, b, c}`, and a
-// bare identifier that binds the whole scrutinee with no peel at all -- so
-// anything you could write as an irrefutable match arm, you can write here.
-//
-// Because there's no `else`, only patterns pattern_covers_all() accepts are
-// allowed: no literal pins (`{.x=3, .y=py}`), no enum-variant patterns
-// (`.Circle{r}`) -- those can fail at runtime and this form has nowhere to
-// send the failure. Use `match` for anything refutable.
-static ASTNode* parse_unpack(void) {
-    advance(); // 'unpack'
-
-    ASTNode* pat = parse_expr_prec(2); // above assignment (prec 1) -- stop before the '='
-
-    if (s_curr.type != TOK_EQ) parse_error("Expected '=' after unpack pattern");
-    advance(); // '='
-
-    ASTNode* scrut = parse_expr_prec(0);
-
-    // ONE PATH. `unpack` desugars to a single irrefutable `match` arm, and ALL of its
-    // lowering -- scrutinee typing, enum-reject, pointer-to-aggregate auto-deref,
-    // positional brace-name-fill, the compile_pattern destructure -- happens in
-    // Lower_Match (the is_unpack branch), which runs at typecheck (runtime) AND from
-    // ConstEval (comptime), for a concrete OR a still-generic scrutinee alike. So the
-    // four cases (match/unpack x runtime/comptime) collapse to the one Lower_Match.
-    // parse_unpack does no classification: it only captures the pattern + scrutinee
-    // and pre-declares the pattern's binders into the ENCLOSING scope (unpack's
-    // binders escape, unlike a match arm's) so later statements can reference them.
-    if (!pattern_covers_all(pat))
-        parse_error("unpack pattern must always match -- no literal-pinned fields "
-                     "(e.g. `{.x=3, .y=py}`) or enum-variant patterns are allowed here; "
-                     "use `match` if the pattern can fail");
-    predeclare_binders(pat);
-    ASTNode* node = new_node(AST_MATCH);
-    node->match_stmt.scrutinee = scrut;
-    node->match_stmt.is_type_match = false;
-    node->match_stmt.is_unpack = true;
-    node->match_stmt.arm_patterns = malloc(sizeof(ASTNode*));
-    node->match_stmt.arm_bodies   = malloc(sizeof(ASTNode*));
-    node->match_stmt.arm_scopes   = malloc(sizeof(SymbolTable*));
-    node->match_stmt.arm_patterns[0] = pat;
-    ASTNode* empty = new_node(AST_BLOCK);
-    empty->block.capacity = 0; empty->block.count = 0; empty->block.statements = NULL;
-    node->match_stmt.arm_bodies[0] = empty;
-    node->match_stmt.arm_scopes[0] = s_symtable; // enclosing scope: binders escape
-    node->match_stmt.arm_count = 1;
-    if (s_curr.type == TOK_SEMI) advance();
-    return node;
-}
-
-// Pre-declare a pattern's binder NAMES into the current scope at parse time, so an
-// arm body referencing them (`{.Some = v} { return v }`) parses without knowing the
-// scrutinee's type yet. Types are placeholders here; Lower_Match patches each
-// symbol's real type once st is known, and compile_pattern's "name already in
-// scope -> assign into it" leaf (GENERALIZE-LEAF) reuses these exact symbols. Only
-// fresh identifiers in binding position declare; literals / existing lvalues don't.
-static void predeclare_binders(ASTNode* pat) {
-    if (!pat) return;
-    // A `*name` leaf declares `name` (a pointer INTO the projected slot). Predeclare
-    // with a NULL placeholder type; compile_pattern patches it to `slot*` once the
-    // scrutinee type is known.
-    if (pat->type == AST_DEREF && pat->unary && pat->unary->type == AST_IDENT) {
-        bool here = false;
-        for (size_t i = 0; i < s_symtable->count; i++) {
-            Symbol* e = s_symtable->symbols[i];
-            if (e->name_len == pat->unary->ident.name_len &&
-                strncmp(e->name, pat->unary->ident.name, pat->unary->ident.name_len) == 0) { here = true; break; }
-        }
-        if (!here) {
-            SymbolKind k = s_symtable->is_function_scope ? SYM_LOCAL : SYM_GLOBAL;
-            SymTable_Add(s_symtable, pat->unary->ident.name, pat->unary->ident.name_len, NULL, k);
-        }
-        return;
-    }
-    if (pat->type == AST_IDENT) {
-        // A bare name binds fresh; may shadow an outer var. Predeclare it in the
-        // CURRENT scope unless it's already this scope's binder.
-        bool here = false;
-        for (size_t i = 0; i < s_symtable->count; i++) {
-            Symbol* e = s_symtable->symbols[i];
-            if (e->name_len == pat->ident.name_len &&
-                strncmp(e->name, pat->ident.name, pat->ident.name_len) == 0) { here = true; break; }
-        }
-        if (!here) {
-            SymbolKind k = s_symtable->is_function_scope ? SYM_LOCAL : SYM_GLOBAL;
-            SymTable_Add(s_symtable, pat->ident.name, pat->ident.name_len, NULL, k);
-        }
-        return;
-    }
-    if (pat->type == AST_STRUCT_LITERAL) {
-        for (size_t i = 0; i < pat->struct_lit.count; i++) predeclare_binders(pat->struct_lit.values[i]);
-        return;
-    }
-    if (pat->type == AST_ARRAY_LITERAL) {
-        for (size_t i = 0; i < pat->array_lit.count; i++) predeclare_binders(pat->array_lit.values[i]);
-        return;
-    }
-    // literals, .Variant heads with no payload, lvalue accesses: nothing to declare.
-}
-
-// ── `match` ──────────────────────────────────────────────────────────────────
-// A previous value-match implementation resolved the scrutinee's TYPE at parse
-// time (to pick enum/primitive/aggregate lowering), which broke whenever the
-// scrutinee mentioned a still-abstract generic param (`match N + 1`, `match arr[N]`)
-// and forced a series of parse-time special-cases. This implementation instead
-// captures the scrutinee expression and the raw arm patterns/bodies into an
-// AST_MATCH node WITHOUT any Type_Infer, and defers all classification + lowering to
-// Lower_Match, which runs at typecheck time when generic params are concrete. The
-// only decision kept at parse time is the irreducible one: value-scrutinee vs
-// type-scrutinee, since their arm grammars differ. The type-scrutinee case delegates
-// to parse_match_type (which already resolves correctly at instantiation, via
-// reflect_unify); only the value case is captured as AST_MATCH.
-//
-// Because parse time makes NO type query on the value path, there is no parse-time
-// resolution that can fail against an abstract param -- the bug class that motivated
-// this rewrite is structurally absent, not merely handled.
-static ASTNode* parse_match(void) {
-    advance(); // 'match'
-
-    // Grouped-type scrutinee probe: `match (fn() T)[4] {...}`.
-    if (s_curr.type == TOK_LPAREN) {
-        LexerState msave; Lexer_Save(&msave);
-        Token cur_save = s_curr;
-        Type* tt = parse_type();
-        if (tt && s_curr.type == TOK_LBRACE) {
-            ASTNode* te = new_node(AST_TYPE_EXPR);
-            te->sizeof_expr.type = tt;
-            return parse_match_type(te); // type-match already resolves at instantiation
-        }
-        Lexer_Restore(&msave); s_curr = cur_save;
-    }
-
-    ASTNode* scrut = parse_expr_prec(0);
-
-    // A bare-type scrutinee (`match T`, `match Foo*`) parses as an AST_TYPE_EXPR:
-    // type reflection, handled by parse_match_type.
-    if (scrut->type == AST_TYPE_EXPR) return parse_match_type(scrut);
-
-    // Value scrutinee: capture arms raw, NO scrutinee typechecking here.
-    if (s_curr.type != TOK_LBRACE) parse_error("Expected '{' to begin match arms");
-    advance();
-
-    ASTNode* node = new_node(AST_MATCH);
-    node->match_stmt.scrutinee = scrut;
-    node->match_stmt.is_type_match = false;
-    ASTNode** pats = NULL; size_t np = 0, pcap = 0;
-    ASTNode** bodies = NULL; size_t nb = 0, bcap = 0;
-    SymbolTable** scopes = NULL; size_t ns = 0, scap = 0;
-
-    while (s_curr.type != TOK_RBRACE && s_curr.type != TOK_EOF) {
-        ASTNode* pat = NULL; // NULL => else arm
-        if (s_curr.type == TOK_ELSE) {
-            advance();
-        } else if (s_curr.type == TOK_DOT) {
-            advance(); // '.'
-            pat = parse_enum_variant_after_dot();
-        } else {
-            pat = parse_expr_prec(0);
-        }
-
-        // Each arm body parses in its OWN scope. Pre-declare the pattern's binders
-        // (name-only; types patched by Lower_Match) so `{.Some = v} { return v }`
-        // resolves. Stash the scope so Lower_Match reuses the same binder symbols.
-        if (s_curr.type != TOK_LBRACE) parse_error("Expected '{' for match arm block");
-        SymbolTable* prev = s_symtable;
-        s_symtable = SymTable_Create(prev);
-        s_symtable->is_function_scope = prev->is_function_scope;
-        if (pat) predeclare_binders(pat);
-        SymbolTable* arm_scope = s_symtable;
-        ASTNode* body = parse_block_body();
-        s_symtable = prev;
-
-        DA_PUSH(pats, np, pcap, pat);
-        DA_PUSH(bodies, nb, bcap, body);
-        DA_PUSH(scopes, ns, scap, arm_scope);
-
-        if (!pat) break; // else is terminal
-    }
-    if (s_curr.type != TOK_RBRACE) parse_error("Expected '}' to end match");
-    advance();
-
-    node->match_stmt.arm_patterns = pats;
-    node->match_stmt.arm_bodies = bodies;
-    node->match_stmt.arm_scopes = scopes;
-    node->match_stmt.arm_count = np;
-    return node;
-}
 
 static ASTNode* parse_while_statement(void) {
     advance();
@@ -4231,9 +3351,65 @@ static ASTNode* parse_defer_statement(void) {
     return node;
 }
 
+// `static_assert(COND)` / `static_assert(COND, "message")`
+//
+// COND is folded at compile time; a false (or unfoldable) condition is a
+// compile error reported AT THIS CALL SITE. That location is the whole point:
+// the same guarantee can be faked by naming an identifier that does not exist,
+// but that reports inside the library rather than at the caller, and -- worse
+// -- a user who happens to declare a global with the sentinel's name silently
+// disables the check. A real assert cannot be shadowed.
+static ASTNode* parse_static_assert_statement(void) {
+    Token kw = s_curr;
+    advance();
+    if (s_curr.type != TOK_LPAREN) parse_error("Expected '(' after static_assert");
+    advance();
+    ASTNode* cond = parse_expr_prec(0);
+    const char* msg = NULL;
+    size_t msg_len = 0;
+    if (s_curr.type == TOK_COMMA) {
+        advance();
+        if (s_curr.type != TOK_STRING) parse_error("static_assert message must be a string literal");
+        // A string token carries its DECODED bytes in int_value (escapes already
+        // processed, no surrounding quotes); .start still points at raw source.
+        msg = (const char*)(uintptr_t)s_curr.int_value;
+        msg_len = s_curr.length;
+        advance();
+    }
+    if (s_curr.type != TOK_RPAREN) parse_error("Expected ')' to close static_assert");
+    advance();
+    if (s_curr.type == TOK_SEMI) advance();
+
+    // NOT evaluated here. A `match T` arm is selected during typecheck, so
+    // folding the condition at parse time fires asserts inside arms that were
+    // never taken -- `match T { i32 { static_assert(...) } else { } }` errored
+    // even for T = u8. Build the node and let Typecheck_Tree check it once the
+    // arm it lives in is known to be live.
+    ASTNode* node = new_node(AST_STATIC_ASSERT);
+    node->static_assert_expr.cond = cond;
+    node->static_assert_expr.msg = msg;
+    node->static_assert_expr.msg_len = msg_len;
+    node->line = kw.line;
+    node->column = kw.column;
+    node->filename = kw.filename;
+    return node;
+}
+
 static ASTNode* parse_delete_statement(void) {
     advance();
     ASTNode* node = new_node(AST_DELETE);
+    // `delete[] p` -- the array form. Empty brackets only: the element count is
+    // never written by hand, it is read back from the cookie `new[n] T` stored.
+    // (`delete[expr] p` is deliberately NOT grammar -- a count the user supplies
+    // is a count the user can get wrong, and the allocation already knows it.)
+    if (s_curr.type == TOK_LBRACKET) {
+        advance();
+        if (s_curr.type != TOK_RBRACKET)
+            parse_error("`delete[]` takes no count -- write `delete[] p`; the element "
+                        "count is recovered from the allocation itself");
+        advance();
+        node->delete_expr.is_array = true;
+    }
     node->delete_expr.ptr = parse_expr_prec(0);
     if (s_curr.type == TOK_SEMI) advance();
     return node;
@@ -4372,6 +3548,9 @@ static ASTNode* parse_statement(void) {
     if (s_curr.type == TOK_DEFER) {
         return parse_defer_statement();
     }
+    if (s_curr.type == TOK_STATIC_ASSERT) {
+        return parse_static_assert_statement();
+    }
     if (s_curr.type == TOK_DELETE) {
         return parse_delete_statement();
     }
@@ -4478,20 +3657,18 @@ static ASTNode* parse_struct_decl_ex(bool is_enum, bool is_overlapping, bool is_
             // alias, or anything else a field type can be.
             Type* super_pt = parse_type();
             if (!super_pt) parse_error("Expected type name after 'super'");
-            if (super_pt->cls != TYPE_STRUCT && super_pt->cls != TYPE_PARAM)
-                parse_error("'super' type must be a struct/enum/union, or this template's own type parameter");
             if (s_curr.type != TOK_IDENTIFIER) parse_error("Expected field name after 'super TypeName'");
             Token super_field_name = s_curr;
             advance();
 
             char* base_name = strndup(super_field_name.start, super_field_name.length);
+            StructDef* super_sd = (super_pt->struct_name) ? Struct_Find(super_pt->struct_name) : NULL;
 
-            if (super_pt->cls == TYPE_PARAM) {
-                // `super T base` where T is still an unresolved type parameter of the
-                // enclosing generic template -- there is no StructDef to promote fields
-                // FROM yet (T isn't bound to anything until instantiation). Record just
-                // the `base`-shaped field (type T), flagged is_super_param, and defer the
-                // actual promotion-splice to Struct_Instantiate, once T is concrete.
+            if (!super_sd) {
+                // Unresolved type (type parameter T, dependent type) --
+                // there is no StructDef to promote fields FROM yet. Record just the
+                // `base`-shaped field, flag is_super_param, and defer the promotion-splice
+                // to Struct_Instantiate once concrete.
                 StructField f = { .name = base_name, .type = super_pt };
                 Struct_AppendField(&sd->fields, &sd->field_count, &cap, f);
                 sd->fields[sd->field_count - 1].is_super_param = true;
@@ -4500,9 +3677,6 @@ static ASTNode* parse_struct_decl_ex(bool is_enum, bool is_overlapping, bool is_
                 if (s_curr.type == TOK_SEMI) advance(); // optional separator
                 continue;
             }
-
-            StructDef* super_sd = Struct_Find(super_pt->struct_name);
-            if (!super_sd) parse_error("Unknown type after 'super'");
 
             for (size_t si = 0; si < super_sd->field_count; si++) {
                 Struct_AppendField(&sd->fields, &sd->field_count, &cap, super_sd->fields[si]);
@@ -4984,7 +4158,7 @@ static ASTNode* parse_top_level(void) {
         if (s_curr.type != TOK_FN) parse_error("Expected 'fn' after 'extern'");
     }
 
-    { ASTNode* r = parse_fn_decl(is_pub, is_extern, NULL, 0, NULL); if (r) return r; }
+    { ASTNode* r = parse_fn_decl(is_pub, is_extern, false, NULL, 0, NULL); if (r) return r; }
 }
 
 // impl TypeName { fn method(...) RT { ... } ... }
@@ -4992,9 +4166,10 @@ static ASTNode* parse_top_level(void) {
 // Produces a block of normal AST_FUNC_DECL nodes — no new AST node type needed.
 static ASTNode* parse_impl_block(bool is_pub) {
     advance(); // consume 'impl'
-    if (s_curr.type != TOK_IDENTIFIER) parse_error("Expected type name after 'impl'");
+    if (s_curr.type != TOK_IDENTIFIER && !token_is_type_start(s_curr.type)) parse_error("Expected type name after 'impl'");
     const char* impl_type = strndup(s_curr.start, s_curr.length);
     size_t impl_type_len  = s_curr.length;
+    bool is_prim_impl     = token_is_type_start(s_curr.type);
     advance(); // consume type name
 
     // `impl` is a type site, and an alias is interchangeable with what it names
@@ -5117,10 +4292,16 @@ static ASTNode* parse_impl_block(bool is_pub) {
     block->block.count = 0;
 
     while (s_curr.type != TOK_RBRACE && s_curr.type != TOK_EOF) {
-        if (s_curr.type != TOK_FN) parse_error("Expected 'fn' inside impl block");
+        // `static fn name(...)`: no self injection, called as Type.name(...).
+        // Only `static` on a `fn` is recognized here -- static DATA declarations
+        // inside impl are a separate, not-yet-supported extension.
+        bool method_is_static = false;
+        if (s_curr.type == TOK_STATIC) { method_is_static = true; advance(); }
+        if (s_curr.type != TOK_FN) parse_error("Expected 'fn' (optionally 'static fn') inside impl block");
         // parse_fn_decl handles the whole method: name mangling, self
-        // injection, generic-param merge with the struct's own, body.
-        ASTNode* node = parse_fn_decl(is_pub, false, impl_type, impl_type_len, impl_sd);
+        // injection (skipped for static), generic-param merge with the
+        // struct's own, body.
+        ASTNode* node = parse_fn_decl(is_pub, false, method_is_static, impl_type, impl_type_len, impl_sd);
 
         // parse_fn_decl restores s_type_params to whatever was active on
         // entry -- which for a method with no [U] extension already is the
@@ -5148,7 +4329,7 @@ static ASTNode* parse_impl_block(bool is_pub) {
 //
 // Takes the modifiers as parameters because they are consumed BEFORE the dispatch
 // (`pub extern fn ...`), so they cannot be re-read from s_curr here.
-static ASTNode* parse_fn_decl(bool is_pub, bool is_extern,
+static ASTNode* parse_fn_decl(bool is_pub, bool is_extern, bool is_static,
                               const char* impl_type_name, size_t impl_type_len,
                               StructDef* impl_sd) {
     if (s_curr.type == TOK_FN) {
@@ -5218,21 +4399,36 @@ static ASTNode* parse_fn_decl(bool is_pub, bool is_extern,
         ASTNode* node = new_node(AST_FUNC_DECL);
         node->func_decl.name = impl_type_name ? mname : name.start;
         node->func_decl.name_len = impl_type_name ? mname_len : name.length;
+        node->func_decl.is_static = impl_type_name ? is_static : false;
         node->func_decl.param_count = 0;
         node->func_decl.pack_param_index = -1; // packs not supported on impl methods yet
         size_t param_cap = 6;
         node->func_decl.param_syms = (Symbol**)calloc(param_cap, sizeof(Symbol*));
+        node->func_decl.param_defaults = (ASTNode**)calloc(param_cap, sizeof(ASTNode*));
 
         // Temporarily set up a scope for the parameters
         SymbolTable* prev_table = s_symtable;
         s_symtable = SymTable_Create(prev_table);
         s_symtable->is_function_scope = true;
 
-        if (impl_type_name) {
+        if (impl_type_name && !is_static) {
             // Inject self as first param (name "self"), type TYPE*.
             Type* self_base = (Type*)calloc(1, sizeof(Type));
-            self_base->cls = TYPE_STRUCT;
-            self_base->struct_name = impl_type_name;
+            if (strcmp(impl_type_name, "u8") == 0) { self_base->cls = TYPE_PRIMITIVE; self_base->primitive = PRIM_U8; }
+            else if (strcmp(impl_type_name, "u16") == 0) { self_base->cls = TYPE_PRIMITIVE; self_base->primitive = PRIM_U16; }
+            else if (strcmp(impl_type_name, "u32") == 0) { self_base->cls = TYPE_PRIMITIVE; self_base->primitive = PRIM_U32; }
+            else if (strcmp(impl_type_name, "u64") == 0) { self_base->cls = TYPE_PRIMITIVE; self_base->primitive = PRIM_U64; }
+            else if (strcmp(impl_type_name, "i8") == 0) { self_base->cls = TYPE_PRIMITIVE; self_base->primitive = PRIM_I8; }
+            else if (strcmp(impl_type_name, "i16") == 0) { self_base->cls = TYPE_PRIMITIVE; self_base->primitive = PRIM_I16; }
+            else if (strcmp(impl_type_name, "i32") == 0) { self_base->cls = TYPE_PRIMITIVE; self_base->primitive = PRIM_I32; }
+            else if (strcmp(impl_type_name, "i64") == 0) { self_base->cls = TYPE_PRIMITIVE; self_base->primitive = PRIM_I64; }
+            else if (strcmp(impl_type_name, "bool") == 0) { self_base->cls = TYPE_PRIMITIVE; self_base->primitive = PRIM_BOOL; }
+            else if (strcmp(impl_type_name, "f32") == 0) { self_base->cls = TYPE_PRIMITIVE; self_base->primitive = PRIM_F32; }
+            else if (strcmp(impl_type_name, "f64") == 0) { self_base->cls = TYPE_PRIMITIVE; self_base->primitive = PRIM_F64; }
+            else {
+                self_base->cls = TYPE_STRUCT;
+                self_base->struct_name = impl_type_name;
+            }
 
             Type* self_type = (Type*)calloc(1, sizeof(Type));
             self_type->cls = TYPE_POINTER;
@@ -5243,6 +4439,7 @@ static ASTNode* parse_fn_decl(bool is_pub, bool is_extern,
         }
 
         bool is_vararg = false;
+        bool has_defaults_started = false;
         if (s_curr.type != TOK_RPAREN) {
             while (1) {
                 if (s_curr.type == TOK_ELLIPSIS) {
@@ -5253,6 +4450,8 @@ static ASTNode* parse_fn_decl(bool is_pub, bool is_extern,
                 if (node->func_decl.param_count >= param_cap) {
                     param_cap *= 2;
                     node->func_decl.param_syms = (Symbol**)realloc(node->func_decl.param_syms, param_cap * sizeof(Symbol*));
+                    node->func_decl.param_defaults = (ASTNode**)realloc(node->func_decl.param_defaults, param_cap * sizeof(ASTNode*));
+                    memset(node->func_decl.param_defaults + param_cap / 2, 0, (param_cap / 2) * sizeof(ASTNode*));
                 }
                 // Spec: parameters are `type name`, same order as declarations.
                 Type* param_type = parse_type();
@@ -5265,6 +4464,9 @@ static ASTNode* parse_fn_decl(bool is_pub, bool is_extern,
                 if (s_curr.type == TOK_ELLIPSIS) {
                     is_pack_param = true;
                     advance();
+                    if (param_type->cls != TYPE_PARAM) {
+                        parse_error("a variadic pack parameter 'T... name' must be a generic type parameter (e.g. T... args)");
+                    }
                     if (node->func_decl.pack_param_index != -1)
                         parse_error("at most one `T...` pack parameter is allowed per function");
                 }
@@ -5273,9 +4475,29 @@ static ASTNode* parse_fn_decl(bool is_pub, bool is_extern,
                 Token param_name = s_curr;
                 advance();
 
+                ASTNode* default_expr = NULL;
+                if (s_curr.type == TOK_EQ) {
+                    advance();
+                    default_expr = parse_expr_prec(0);
+                    if (default_expr && param_type && (default_expr->type == AST_STRUCT_LITERAL || default_expr->type == AST_ARRAY_LITERAL)) {
+                        resolve_brace_literal(default_expr, param_type);
+                    }
+                    int64_t dummy_val;
+                    if (s_type_param_count == 0 && !ConstEval(default_expr, &dummy_val)) {
+                        parse_error("function default argument must be a constant expression (constexpr)");
+                    }
+                    has_defaults_started = true;
+                } else if (has_defaults_started && !is_pack_param) {
+                    char err_msg[256];
+                    snprintf(err_msg, sizeof(err_msg), "non-default parameter '%.*s' follows default parameter",
+                             (int)param_name.length, param_name.start);
+                    parse_error(err_msg);
+                }
+
                 Symbol* psym = SymTable_Add(s_symtable, param_name.start, param_name.length, param_type, SYM_LOCAL);
                 psym->is_pack = is_pack_param;
                 node->func_decl.param_syms[node->func_decl.param_count] = psym;
+                node->func_decl.param_defaults[node->func_decl.param_count] = default_expr;
                 if (is_pack_param) node->func_decl.pack_param_index = (int)node->func_decl.param_count;
                 node->func_decl.param_count++;
                 
@@ -5325,12 +4547,28 @@ static ASTNode* parse_fn_decl(bool is_pub, bool is_extern,
             ftype->function.param_types[i] = node->func_decl.param_syms[i]->type;
         }
         
-        Symbol* func_sym = impl_type_name
-            ? SymTable_Add(prev_table, mname, mname_len, ftype, SYM_FUNCTION)
-            : SymTable_Add(prev_table, name.start, name.length, ftype, SYM_FUNCTION);
+        // A `static fn` in an impl block was already given a stub symbol by the
+        // block's pre-scan (see parse_impl_block), so that a method declared
+        // EARLIER can name one declared LATER. Fill that stub in rather than
+        // adding a second symbol -- SymTable_Add exits on a duplicate.
+        Symbol* func_sym = NULL;
+        if (impl_type_name && is_static) {
+            func_sym = SymTable_Find(prev_table, mname, mname_len);
+            if (func_sym && func_sym->kind == SYM_FUNCTION) {
+                func_sym->type = ftype;   // stub carried no signature yet
+            } else {
+                func_sym = NULL;
+            }
+        }
+        if (!func_sym) {
+            func_sym = impl_type_name
+                ? SymTable_Add(prev_table, mname, mname_len, ftype, SYM_FUNCTION)
+                : SymTable_Add(prev_table, name.start, name.length, ftype, SYM_FUNCTION);
+        }
         node->func_decl.sym = func_sym;
         if (is_extern) func_sym->is_extern = true;
         if (is_pub) func_sym->is_pub = true;
+        func_sym->is_static = node->func_decl.is_static;
         func_sym->has_init = true;
         func_sym->func_decl = node; // for constexpr interpretation of the body
         node->func_decl.type_params = tparams;
@@ -5443,6 +4681,71 @@ void Parse_Signatures(const char* filename, const char* source) {
         if (s_curr.type == TOK_PUB) { advance(); continue; }
         if (s_curr.type == TOK_EXTERN) { advance(); continue; }
 
+        // `impl TYPE { ... }`: register a stub symbol for every `static fn` in
+        // the block, under its mangled `TYPE_name`, before ANY body is parsed.
+        //
+        // Methods are parsed sequentially, so a body only sees the methods above
+        // it. An ordinary call survives that (calls resolve late, at typecheck),
+        // but a static used as a const-generic VALUE must fold to the function's
+        // symbol AT PARSE TIME -- `IteratorCursor[..., Array[T, N].step]`, the
+        // iterator protocol. Forward-referencing one yielded a null symbol that
+        // surfaced later as "LIT_FN_SYMBOL literal doesn't hold a valid function
+        // symbol", forcing every impl block to be hand-ordered with `step` above
+        // `begin`. This pass already exists to make forward references work; it
+        // simply did not look inside impl.
+        //
+        // The stub carries name and kind only -- parse_fn_decl adopts it and
+        // fills in the real signature. Statics only: an instance method can
+        // never be a const-generic value.
+        if (s_curr.type == TOK_IMPL) {
+            advance();
+            if (s_curr.type != TOK_IDENTIFIER) continue;
+            Token tname = s_curr;
+            advance();
+            if (s_curr.type == TOK_LBRACKET) {   // skip the generic param list
+                int d = 1;
+                advance();
+                while (d > 0 && s_curr.type != TOK_EOF) {
+                    if (s_curr.type == TOK_LBRACKET) d++;
+                    else if (s_curr.type == TOK_RBRACKET) d--;
+                    advance();
+                }
+            }
+            if (s_curr.type != TOK_LBRACE) continue;
+            advance();   // enter the block
+            int depth = 0;
+            while (s_curr.type != TOK_EOF) {
+                if (s_curr.type == TOK_LBRACE) { depth++; advance(); continue; }
+                if (s_curr.type == TOK_RBRACE) {
+                    if (depth == 0) { advance(); break; }
+                    depth--; advance(); continue;
+                }
+                if (depth == 0 && s_curr.type == TOK_STATIC) {
+                    advance();
+                    if (s_curr.type == TOK_FN) {
+                        advance();
+                        if (s_curr.type == TOK_IDENTIFIER) {
+                            size_t ml = tname.length + 1 + s_curr.length;
+                            char* mn = (char*)malloc(ml + 1);
+                            memcpy(mn, tname.start, tname.length);
+                            mn[tname.length] = '_';
+                            memcpy(mn + tname.length + 1, s_curr.start, s_curr.length);
+                            mn[ml] = '\0';
+                            if (!SymTable_Find(s_symtable, mn, ml)) {
+                                Symbol* stub = SymTable_Add(s_symtable, mn, ml, NULL, SYM_FUNCTION);
+                                stub->is_static = true;
+                            } else {
+                                free(mn);
+                            }
+                        }
+                    }
+                    continue;
+                }
+                advance();
+            }
+            continue;
+        }
+
         bool is_struct = (s_curr.type == TOK_STRUCT || s_curr.type == TOK_ENUM || s_curr.type == TOK_UNION);
         bool is_fn     = (s_curr.type == TOK_FN);
         if (!is_struct && !is_fn) { advance(); continue; }
@@ -5465,19 +4768,32 @@ void Parse_Signatures(const char* filename, const char* source) {
         s_type_params = prev_tp; s_param_kinds = prev_pk; s_type_param_count = prev_tpc;
 
         if (is_struct) {
-            // Deliberately NOT recording struct kinds here.
+            // Record the struct's generic header in the SAME side table functions
+            // use, rather than installing type_params/param_kinds onto the StructDef.
             //
-            // Pass 0a already gives structs their arity, and the remaining gap (a
-            // forward use with an explicit VALUE arg, `Box[i32, 4]` above `struct
-            // Box[T, u32 N]`) turns out not to be fixable this way: installing
-            // type_params/param_kinds from THIS pass's arena leaves pass 1 re-parsing the
-            // real declaration and installing different pointers, while instantiations
-            // may already have cached against the pass-0b ones -- which silently produced
-            // an empty layout (sizeof == 0) instead of an error. Trading a loud failure
-            // for a silent wrong answer is the worst possible move (§1), so leave it.
+            // That distinction is the whole reason this is safe now. Installing them
+            // on the StructDef is what the earlier attempt did, and it silently broke:
+            // pass 1 re-parses the real declaration and installs DIFFERENT pointers,
+            // so any instantiation already cached against the pass-0b arena kept a
+            // stale layout and produced sizeof == 0 -- a silent wrong answer, which is
+            // worse than the loud failure it replaced (§1). A side table has no such
+            // hazard: it is consulted ONLY as a fallback, when the StructDef does not
+            // yet carry its own kinds (i.e. exactly the forward-reference case), and
+            // pass 1's real kinds always win once they exist. Nothing caches against it.
             //
-            // Functions have no such hazard: their kinds live in a side table that only
-            // the call site reads, and pass 1 builds the real func_decl independently.
+            // Without this, a generic struct whose header has a const-generic VALUE
+            // slot cannot be used before its declaration: parsing
+            // `IteratorCursor[T, S, Vector[T].step]` (std/vector.t) needs to know slot 3
+            // is a value slot, and a parser that reads it as a TYPE dies on the `.`
+            // ("Expected ']' after generic struct type arguments"). That made whole
+            // files order-dependent -- std/vector.t compiled after std/iterator.t and
+            // failed before it, which reads as "vector.t is broken" when nothing is.
+            //
+            // The kinds recorded here are parsed by the REAL type grammar
+            // (parse_generic_param_list, just above), so a pin can be anything the
+            // language allows -- `u32 N`, `Cfg C`, `T[3] arr`, `fn(T, T) T Op` --
+            // with nothing assumed or synthesized about it.
+            gsig_register(name.start, name.length, tparams, pkinds, pcount, gpack);
             skip_braced_body();
             continue;
         } else {
@@ -5496,7 +4812,6 @@ void Parse_Signatures(const char* filename, const char* source) {
 }
 
 
-static bool s_parse_had_error = false;
 bool Parse_HadError(void) { return s_parse_had_error; }
 
 ASTNode* Parse_Block(void) {

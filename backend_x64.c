@@ -37,6 +37,65 @@ typedef struct DeferCtx {
 
 static DeferCtx* s_defer_stack = NULL;
 
+// Owning temporaries: a call returning a struct BY VALUE writes into a
+// caller-allocated sret slot, and if that struct has a destructor the slot owns
+// a resource nothing else releases (`v.push(make())`, `make()` discarded).
+//
+// Registered at the ONE site that allocates an sret slot, unregistered at the
+// ONE site where a destination adopts one (aggregate assignment). What survives
+// to the end of the statement is what nobody took -- exactly what leaks. Both
+// directions being single sites is what makes this complete without a walk over
+// node kinds.
+//
+// Unregistering is not optional: `T x = make()` memcpys the struct, so the
+// buffer POINTER is copied and destroying the temp would free what x holds.
+typedef struct TempCtx {
+    int offset;          // rbp-relative slot holding the temporary
+    struct Type* type;   // its type -- destruction is transitive, so a single
+                         // Symbol* would miss owning fields/enum payloads
+    struct TempCtx* next;
+} TempCtx;
+
+static TempCtx* s_temp_list = NULL;
+
+static int s_last_sret_off = 0;   // slot of the most recently compiled aggregate call
+
+// KNOWN GAP -- an owning TEMPORARY is never destroyed, so it leaks.
+//
+// A call returning a struct by value writes into a caller-allocated sret slot.
+// When that struct has a destructor and the result is not bound to a name, the
+// slot owns a resource that nothing ever releases:
+//
+//     v.push(make())      // leaks whatever make() returned
+//     make()              // discarded result, same leak
+//     make().len()        // chained receiver, same leak
+//
+// A NAMED result (`T x = make()`) does not leak -- it is an ordinary local and
+// RAII destroys it. The fix is C++'s full-expression rule: destroy a temporary
+// at the end of the statement that created it. Hexen needs it for the same
+// reason C++ does, minus moves (push() deep-copies, so the temporary keeps its
+// own buffer and destroying it cannot disturb what the container took).
+//
+// Two attempts, both wrong, recorded so they are not repeated:
+//
+//  1. Walk the AST for calls returning an owning type. Not provable: it is a
+//     hand-written switch over ~50 node kinds with no exhaustiveness check, and
+//     the first version already mis-handled AST_LOGICAL_NOT by sweeping unary
+//     nodes into a binary range test.
+//
+//  2. Register every sret slot at the single site that allocates one (below).
+//     COMPLETE -- every aggregate call result passes through it -- but not
+//     CORRECT: for `T x = make()` the sret slot IS x's storage, written in
+//     place, so destroying it at statement end double-frees against x's own
+//     RAII destructor. The allocation site cannot tell "temporary" from
+//     "materialized directly into a named local".
+//
+// What a correct fix needs is that missing bit: whether the sret slot was
+// adopted as a declaration's storage. That is known at the AST_DECLARATION
+// that consumes the call, not at the call itself -- so the flag has to travel
+// from the declaration down to the sret allocation, and only slots that were
+// NOT adopted get destroyed at statement end.
+
 #include "elf.h"
 
 bool g_aot_mode = false;
@@ -151,6 +210,117 @@ static void emit_u64(JITBuffer* buf, uint64_t val) {
 
 static void emit_u32(JITBuffer* buf, uint32_t val) {
     emit_bytes(buf, (const uint8_t*)&val, 4);
+}
+
+// --- transitive destruction -------------------------------------------------
+//
+// A type owns something if it declares __delete() OR if any of its parts do.
+// Without the second half, destruction was shallow: a struct with an owning
+// FIELD, or an enum whose active VARIANT owns a buffer, released nothing --
+// which is why Option[Vector[u8]] (what pop() returns) leaked its payload.
+//
+// Resolution is by LAYOUT KIND, never by a hardcoded type name:
+//   struct (sequential fields) -> destroy every owning field
+//   enum   (u32 tag + payload) -> destroy the ACTIVE variant's payload only
+//   union  (overlap, NO tag)   -> cannot: nothing records which member is live
+//
+// The union case is a genuine limit, not an omission: an untagged overlap has
+// no runtime discriminant to switch on, so destroying it would guess. Such a
+// type stays non-owning and its members are the programmer's business.
+static bool type_owns_resource(Type* t);
+
+static bool struct_owns_resource(StructDef* sd) {
+    if (!sd) return false;
+    if (sd->is_overlapping) return false;   // untagged union: no tag, no safe choice
+    for (size_t i = 0; i < sd->field_count; i++) {
+        if (type_owns_resource(sd->fields[i].type)) return true;
+    }
+    return false;
+}
+
+static bool type_owns_resource(Type* t) {
+    if (!t) return false;
+    if (t->cls == TYPE_ARRAY) return type_owns_resource(t->array.element);
+    if (t->cls != TYPE_STRUCT) return false;
+    if (Method_Resolve(t, "__delete", 8)) return true;
+    return struct_owns_resource(Struct_Find(t->struct_name));
+}
+
+// A type's own __delete, monomorphized when the type is a generic instantiation
+// (the template's symbol would emit a fixup to an uncompiled generic).
+static Symbol* resolve_dtor(Type* t) {
+    if (!t || t->cls != TYPE_STRUCT) return NULL;
+    Symbol* d = Method_Resolve(t, "__delete", 8);
+    if (!d) return NULL;
+    StructDef* sd = Struct_Find(t->struct_name);
+    if (sd && sd->generic_base && sd->type_arg_count > 0 && d->generic_decl) {
+        d = Generic_Instantiate(d, sd->type_args, sd->type_arg_count);
+    }
+    return d;
+}
+
+// Destroy the value of type `t` living at the address currently in RAX.
+// Clobbers rax/rcx/rdi; callers that need the address afterwards must spill it.
+//
+// Order mirrors scope-exit RAII: a type's own __delete() runs FIRST (it is the
+// outer resource), then its parts, so a hand-written destructor still sees its
+// fields intact -- the same order C++ uses for a destructor body vs its members.
+static void emit_destroy_at_rax(JITBuffer* buf, Type* t) {
+    if (!type_owns_resource(t)) return;
+
+    if (t->cls == TYPE_ARRAY) {
+        uint64_t n = t->array.count;
+        uint64_t esz = Type_SizeOf(t->array.element);
+        for (uint64_t i = 0; i < n; i++) {
+            emit_byte(buf,0x50);                                     // push base
+            if (i) { emit_byte(buf,0x48);emit_byte(buf,0x05);emit_u32(buf,(uint32_t)(i*esz)); } // add rax, i*esz
+            emit_destroy_at_rax(buf, t->array.element);
+            emit_byte(buf,0x58);                                     // pop base
+        }
+        return;
+    }
+
+    Symbol* own = resolve_dtor(t);
+    if (own) {
+        emit_byte(buf,0x50);                                          // push self
+        emit_byte(buf,0x48);emit_byte(buf,0x89);emit_byte(buf,0xc7);  // mov rdi, rax
+        emit_byte(buf,0xe8); add_fixup(buf->size, own); emit_u32(buf,0);
+        emit_byte(buf,0x58);                                          // pop self
+    }
+
+    StructDef* sd = Struct_Find(t->struct_name);
+    if (!sd || sd->is_overlapping) return;   // untagged union: no discriminant
+
+    if (sd->is_enum) {
+        // Tag is a u32 at offset 0; every payload sits at offset 4. Destroy only
+        // the ACTIVE variant: compare the tag against each owning variant's index
+        // and jump past its destruction when it does not match.
+        for (size_t i = 0; i < sd->field_count; i++) {
+            Type* pt = sd->fields[i].type;
+            if (!pt || !type_owns_resource(pt)) continue;
+            emit_byte(buf,0x81);emit_byte(buf,0x38);emit_u32(buf,(uint32_t)i);  // cmp dword [rax], i
+            emit_byte(buf,0x0f);emit_byte(buf,0x85);                            // jne skip
+            size_t patch = buf->size; emit_u32(buf,0);
+            emit_byte(buf,0x50);                                                 // push base
+            emit_byte(buf,0x48);emit_byte(buf,0x05);emit_u32(buf,(uint32_t)sd->fields[i].offset); // add rax, payload_off
+            emit_destroy_at_rax(buf, pt);
+            emit_byte(buf,0x58);                                                 // pop base
+            uint32_t rel = (uint32_t)(int32_t)((int64_t)buf->size - (int64_t)(patch + 4));
+            memcpy(buf->code + patch, &rel, 4);
+        }
+        return;
+    }
+
+    // Plain struct: every owning field, in reverse declaration order (LIFO, the
+    // same order locals are destroyed in).
+    for (size_t k = sd->field_count; k > 0; k--) {
+        StructField* f = &sd->fields[k - 1];
+        if (!f->type || !type_owns_resource(f->type)) continue;
+        emit_byte(buf,0x50);                                             // push base
+        if (f->offset) { emit_byte(buf,0x48);emit_byte(buf,0x05);emit_u32(buf,(uint32_t)f->offset); }
+        emit_destroy_at_rax(buf, f->type);
+        emit_byte(buf,0x58);                                             // pop base
+    }
 }
 
 // Emits code that leaves a real, callable address for `target_sym` in rax:
@@ -282,7 +452,7 @@ static void compile_lvalue(JITBuffer* buf, ASTNode* node, LoopContext* loop) {
         // Address of base.field = base_address + field->offset.
         // base_address: if base is a struct value -> its lvalue address;
         //               if base is a pointer-to-struct -> the pointer value (auto-deref).
-        Type_Infer(node); // ensure field.field/sdef are resolved (needed for cloned generic ASTs)
+        node->result_type = NULL; Type_Infer(node); // ensure field.field/sdef are resolved (needed for cloned generic ASTs)
         Type* bt = Type_Infer(node->field.base);
         if (bt && bt->cls == TYPE_POINTER) {
             compile_node_ctx(buf, node->field.base, loop); // pointer value in rax
@@ -301,7 +471,7 @@ static void compile_lvalue(JITBuffer* buf, ASTNode* node, LoopContext* loop) {
             emit_byte(buf, 0x48); emit_byte(buf, 0x05); emit_u32(buf, (uint32_t)off);
         }
     } else if (node->type == AST_INDEX) {
-        // Address of a[i] = base_address + i * elem_size.
+        if (node->index.base) node->index.base->result_type = NULL;
         Type* bt = Type_Infer(node->index.base);
         Type* elem;
         // Base address into rax: array value -> lvalue address; pointer -> its value.
@@ -975,7 +1145,23 @@ static void compile_node_ctx(JITBuffer* buf, ASTNode* node, LoopContext* loop) {
                 d->next = s_defer_stack;
                 s_defer_stack = d;
             } else {
+                // Temporaries belong to the statement that made them. Save/restore
+                // around each: a nested block re-enters this loop, and its
+                // temporaries must not be drained by the outer statement.
+                TempCtx* saved_temps = s_temp_list;
+                s_temp_list = NULL;
                 compile_node_ctx(buf, node->block.statements[i], loop);
+                while (s_temp_list) {
+                    TempCtx* t = s_temp_list;
+                    // rdi = &temp, call its __delete. The statement's value has
+                    // already been consumed, so nothing else is live here.
+                    emit_byte(buf,0x48);emit_byte(buf,0x8d);emit_byte(buf,0x85);
+                    emit_u32(buf,(uint32_t)(-t->offset));   // lea rax, [rbp-off]
+                    emit_destroy_at_rax(buf, t->type);
+                    s_temp_list = t->next;
+                    free(t);
+                }
+                s_temp_list = saved_temps;
             }
         }
         while (s_defer_stack != old_stack) {
@@ -1154,6 +1340,16 @@ static void compile_node_ctx(JITBuffer* buf, ASTNode* node, LoopContext* loop) {
         Type* et = node->new_expr.alloc_type;
         uint64_t elem_size = Type_SizeOf(et);
 
+        // Array cookie: `delete[] p` must destroy EVERY element, but nothing at
+        // the delete site knows n. So store it the way C++ does -- when T has a
+        // destructor, over-allocate 8 bytes, put n there, hand back ptr+8.
+        // Gated on the same Method_Resolve on both sides, so allocation and free
+        // cannot disagree. A T with no destructor is byte-identical to before
+        // (`new[1024] u8` stays a plain malloc pointer, safe to hand to C).
+        bool array_cookie = (node->new_expr.count != NULL &&
+                             et && et->cls == TYPE_STRUCT &&
+                             Method_Resolve(et, "__delete", 8) != NULL);
+
         // The byte count is needed twice (once to size the malloc, once to size the
         // zeroing memset below) but must only be EVALUATED once: `count` can have
         // side effects (new[n()] u8), and a stack push doesn't survive the malloc
@@ -1161,9 +1357,17 @@ static void compile_node_ctx(JITBuffer* buf, ASTNode* node, LoopContext* loop) {
         // and discards whatever was below rsp). So spill the computed byte count to
         // a stable rbp-relative frame slot instead, which the call can't disturb.
         int count_slot = 0;
+        int elemcount_slot = 0;
         if (node->new_expr.count) {
             // new T[expr]: size = count * elem_size. Evaluate count -> rax, multiply.
             compile_node_ctx(buf, node->new_expr.count, loop); // rax = count (evaluated exactly once)
+            if (array_cookie) {
+                // Keep the ELEMENT count (pre-multiply) -- it is what goes in the
+                // cookie, and `count` must not be re-evaluated to recover it.
+                s_func->current_local_offset += 8;
+                elemcount_slot = s_func->current_local_offset;
+                emit_byte(buf,0x48);emit_byte(buf,0x89);emit_byte(buf,0x85);emit_u32(buf,(uint32_t)(-elemcount_slot)); // mov [rbp-elemcount], rax
+            }
             emit_byte(buf,0x48);emit_byte(buf,0xbf);emit_u64(buf,elem_size); // mov rdi, elem_size
             emit_byte(buf,0x48);emit_byte(buf,0x0f);emit_byte(buf,0xaf);emit_byte(buf,0xc7); // imul rax, rdi
 
@@ -1172,11 +1376,26 @@ static void compile_node_ctx(JITBuffer* buf, ASTNode* node, LoopContext* loop) {
             emit_byte(buf,0x48);emit_byte(buf,0x89);emit_byte(buf,0x85);emit_u32(buf,(uint32_t)(-count_slot)); // mov [rbp-slot], rax
 
             emit_byte(buf,0x48);emit_byte(buf,0x89);emit_byte(buf,0xc7); // mov rdi, rax (size arg)
+            if (array_cookie) {
+                // Room for the cookie itself, ahead of the elements.
+                emit_byte(buf,0x48);emit_byte(buf,0x81);emit_byte(buf,0xc7);emit_u32(buf,8); // add rdi, 8
+            }
         } else {
             // new T or new T{...}: size = elem_size.
             emit_byte(buf,0x48);emit_byte(buf,0xbf);emit_u64(buf,elem_size); // mov rdi, elem_size
         }
         emit_call_extern(buf, (void*)malloc, "malloc"); // rax = allocated pointer
+        if (array_cookie) {
+            // [base] = element count, then hand back base+8. Everything downstream
+            // (the zeroing memset, the initializer fill, the value the expression
+            // yields) sees the SHIFTED pointer, so the cookie is invisible to all
+            // of it -- only AST_DELETE ever looks back at [p-8].
+            emit_byte(buf,0x48);emit_byte(buf,0x8b);emit_byte(buf,0x8d);emit_u32(buf,(uint32_t)(-elemcount_slot)); // mov rcx, [rbp-elemcount]
+            emit_byte(buf,0x48);emit_byte(buf,0x89);emit_byte(buf,0x08); // mov [rax], rcx
+            emit_byte(buf,0x48);emit_byte(buf,0x83);emit_byte(buf,0xc0);emit_byte(buf,0x08); // add rax, 8
+        }
+        // EXPERIMENT: heap zero-init disabled to measure what depends on it.
+        if (0) {
         // Zero the allocation (new always zero-inits). Save ptr in r12 (callee-saved),
         // memset via rep stosb, then restore the pointer to rax.
         emit_byte(buf,0x41);emit_byte(buf,0x54);                 // push r12
@@ -1191,6 +1410,7 @@ static void compile_node_ctx(JITBuffer* buf, ASTNode* node, LoopContext* loop) {
         emit_byte(buf,0xf3);emit_byte(buf,0xaa);                     // rep stosb
         emit_byte(buf,0x4c);emit_byte(buf,0x89);emit_byte(buf,0xe0); // mov rax, r12 (ptr back)
         emit_byte(buf,0x41);emit_byte(buf,0x5c);                     // pop r12
+        }
 
         // new T{...}: fill the just-allocated object from the initializer literal.
         if (node->new_expr.init) {
@@ -1203,7 +1423,75 @@ static void compile_node_ctx(JITBuffer* buf, ASTNode* node, LoopContext* loop) {
 
     if (node->type == AST_DELETE) {
         compile_node_ctx(buf, node->delete_expr.ptr, loop); // rax = pointer
-        emit_byte(buf,0x48);emit_byte(buf,0x89);emit_byte(buf,0xc7); // mov rdi, rax
+
+        // `delete[] p` where the element type has a destructor: destroy all n
+        // elements (n read back from the array cookie the allocation wrote --
+        // see AST_NEW), then free the TRUE base at p-8.
+        Symbol* dtor = NULL;
+        Type* dpointee = NULL;
+        if (node->delete_expr.is_array) {
+            Type* dpt = Type_Infer(node->delete_expr.ptr);
+            dpointee = (dpt && dpt->cls == TYPE_POINTER) ? dpt->pointer_base : NULL;
+            if (dpointee && dpointee->cls == TYPE_STRUCT) {
+                dtor = Method_Resolve(dpointee, "__delete", 8);
+                // A GENERIC element type (Vector[u8], Buf[T]...) resolves to the
+                // base TEMPLATE symbol above -- calling that emits a fixup to an
+                // uncompiled generic and destroys nothing. Monomorphize it the
+                // same way an ordinary method call does: take the element
+                // struct's own type arguments and instantiate. Without this,
+                // `delete[]` silently no-ops on exactly the element types that
+                // most need it (a container of containers).
+                if (dtor) {
+                    StructDef* esd = Struct_Find(dpointee->struct_name);
+                    if (esd && esd->generic_base && esd->type_arg_count > 0 &&
+                        dtor->generic_decl) {
+                        dtor = Generic_Instantiate(dtor, esd->type_args, esd->type_arg_count);
+                    }
+                }
+            }
+        }
+
+        if (dtor) {
+            uint64_t esz = Type_SizeOf(dpointee);
+            // Spill the pointer: it is needed again after the loop, and the
+            // expression must be evaluated exactly once (`delete[] f()`).
+            s_func->current_local_offset += 8;
+            int ptr_slot = s_func->current_local_offset;
+            emit_byte(buf,0x48);emit_byte(buf,0x89);emit_byte(buf,0x85);emit_u32(buf,(uint32_t)(-ptr_slot)); // mov [rbp-ptr], rax
+
+            // r12 = cursor, r13 = remaining. Callee-saved, so both survive the
+            // __delete() call in the loop body.
+            emit_byte(buf,0x41);emit_byte(buf,0x54);                     // push r12
+            emit_byte(buf,0x41);emit_byte(buf,0x55);                     // push r13
+            emit_byte(buf,0x49);emit_byte(buf,0x89);emit_byte(buf,0xc4); // mov r12, rax
+            emit_byte(buf,0x4c);emit_byte(buf,0x8b);emit_byte(buf,0x68);emit_byte(buf,0xf8); // mov r13, [rax-8]
+
+            size_t loop_top = buf->size;
+            emit_byte(buf,0x4d);emit_byte(buf,0x85);emit_byte(buf,0xed); // test r13, r13
+            emit_byte(buf,0x0f);emit_byte(buf,0x84);                     // jz exit
+            size_t exit_patch = buf->size;
+            emit_u32(buf, 0);
+
+            emit_byte(buf,0x4c);emit_byte(buf,0x89);emit_byte(buf,0xe7); // mov rdi, r12 (self)
+            emit_byte(buf,0xe8);                                          // call __delete
+            add_fixup(buf->size, dtor);
+            emit_u32(buf, 0);
+
+            emit_byte(buf,0x49);emit_byte(buf,0x81);emit_byte(buf,0xc4);emit_u32(buf,(uint32_t)esz); // add r12, esz
+            emit_byte(buf,0x49);emit_byte(buf,0xff);emit_byte(buf,0xcd); // dec r13
+            emit_byte(buf,0xe9);                                          // jmp loop_top
+            emit_u32(buf, (uint32_t)(int32_t)((int64_t)loop_top - (int64_t)(buf->size + 4)));
+
+            uint32_t after = (uint32_t)(int32_t)((int64_t)buf->size - (int64_t)(exit_patch + 4));
+            memcpy(buf->code + exit_patch, &after, 4);
+
+            emit_byte(buf,0x41);emit_byte(buf,0x5d);                     // pop r13
+            emit_byte(buf,0x41);emit_byte(buf,0x5c);                     // pop r12
+            emit_byte(buf,0x48);emit_byte(buf,0x8b);emit_byte(buf,0xbd);emit_u32(buf,(uint32_t)(-ptr_slot)); // mov rdi, [rbp-ptr]
+            emit_byte(buf,0x48);emit_byte(buf,0x83);emit_byte(buf,0xef);emit_byte(buf,0x08); // sub rdi, 8
+        } else {
+            emit_byte(buf,0x48);emit_byte(buf,0x89);emit_byte(buf,0xc7); // mov rdi, rax
+        }
         emit_call_extern(buf, (void*)free, "free");
         return;
     }
@@ -1341,6 +1629,17 @@ static void compile_node_ctx(JITBuffer* buf, ASTNode* node, LoopContext* loop) {
             int roff = s_func->current_local_offset;
             emit_byte(buf, 0x48); emit_byte(buf, 0x8d); emit_byte(buf, 0x9d);
             emit_u32(buf, (uint32_t)(-roff)); // lea rbx, [rbp - roff]
+
+            // Record as an owning temporary (see TempCtx).
+            s_last_sret_off = roff;
+            if (type_owns_resource(crt)) {
+                TempCtx* tc = (TempCtx*)malloc(sizeof(TempCtx));
+                tc->offset = roff;
+                tc->type = crt;
+                tc->next = s_temp_list;
+                s_temp_list = tc;
+            }
+
         }
 
         // Evaluate args left-to-right; each pushes the value destined for its register
@@ -1794,15 +2093,40 @@ static void compile_node_ctx(JITBuffer* buf, ASTNode* node, LoopContext* loop) {
             sym->kind == SYM_GLOBAL) {
             return;
         }
-        if (vt && (vt->cls == TYPE_STRUCT || vt->cls == TYPE_ARRAY)) {
-            uint64_t sz = Type_SizeOf(vt);
-            emit_var_addr(buf, sym);                                  // rax = &var
-            emit_byte(buf, 0x49); emit_byte(buf, 0x89); emit_byte(buf, 0xc0); // mov r8, rax (save base)
-            for (uint64_t b = 0; b < sz; b += 8) {
-                // mov qword [r8 + b], 0
-                emit_byte(buf, 0x49); emit_byte(buf, 0xc7); emit_byte(buf, 0x80);
-                emit_u32(buf, (uint32_t)b);
-                emit_u32(buf, 0);
+        // A bare aggregate declaration writes its FIELD DEFAULTS and nothing
+        // else. Storage is otherwise left as-is: `new`/locals are not zeroed, so
+        // a type that needs a valid empty state declares it (`u32 capacity = 0`)
+        // rather than relying on the allocator.
+        //
+        // Deliberately NOT a blanket zero-fill. Zeroing every declaration is an
+        // overhead no systems language pays, and it scales with SIZE, not with
+        // usefulness -- `Array[i32, 1000000000] a` would memset 4 GB before the
+        // program did any work. Only fields carrying an explicit default cost
+        // anything; a struct with no defaults, or a bare array, emits nothing.
+        // An ARRAY has no field defaults of its own -- nothing to write, and it
+        // must not fall through to the scalar path below (which would emit a
+        // bogus 8-byte store over the array's first element).
+        if (vt && vt->cls == TYPE_ARRAY) {
+            return;
+        }
+        if (vt && vt->cls == TYPE_STRUCT && sym->kind == SYM_LOCAL) {
+            StructDef* dsd = Struct_Find(vt->struct_name);
+            bool any_default = false;
+            if (dsd) {
+                for (size_t i = 0; i < dsd->field_count; i++)
+                    if (dsd->fields[i].has_default) { any_default = true; break; }
+            }
+            if (any_default) {
+                emit_var_addr(buf, sym);      // rax = &var
+                emit_byte(buf, 0x50);          // push base (the sink reads [rsp])
+                X64LayoutCtx lc = { .buf = buf, .loop = loop };
+                for (size_t i = 0; i < dsd->field_count; i++) {
+                    StructField* f = &dsd->fields[i];
+                    if (!f->has_default) continue;
+                    x64_sink_put_default(&lc, f->offset, Type_SizeOf(f->type),
+                                         f->default_val_buf);
+                }
+                emit_byte(buf, 0x58);          // pop base
             }
             return;
         }
@@ -1854,9 +2178,6 @@ static void compile_node_ctx(JITBuffer* buf, ASTNode* node, LoopContext* loop) {
             if (node->ident.type_arg_count > 0 && sym->generic_decl) {
                 target_sym = Generic_Instantiate(sym, node->ident.type_args, node->ident.type_arg_count);
             }
-            if (!target_sym->is_extern) {
-                printf("Function %.*s resolved: offset=%d, JIT=%p, addr=%p\n", (int)target_sym->name_len, target_sym->name, target_sym->offset, buf->code, buf->code + target_sym->offset);
-            }
             emit_fn_symbol_value(buf, target_sym);
         }
         return;
@@ -1871,7 +2192,24 @@ static void compile_node_ctx(JITBuffer* buf, ASTNode* node, LoopContext* loop) {
             if (!rt || !Type_Equals(lt, rt)) {
                 Error_AtNode(node, "compiler bug: aggregate assignment type mismatch reached backend", NULL);
             }
+            s_last_sret_off = 0;
             compile_node_ctx(buf, node->binary.right, loop); // rax = &source
+            // ADOPTION: the memcpy below hands the temporary's resource to the
+            // destination, whose RAII destructor now owns it. Drop the
+            // registration or it frees the buffer the destination still holds.
+            if (s_last_sret_off) {
+                TempCtx** pp = &s_temp_list;
+                while (*pp) {
+                    if ((*pp)->offset == s_last_sret_off) {
+                        TempCtx* dead = *pp;
+                        *pp = dead->next;
+                        free(dead);
+                        break;
+                    }
+                    pp = &(*pp)->next;
+                }
+                s_last_sret_off = 0;
+            }
             emit_byte(buf, 0x50); // push src addr
             compile_lvalue(buf, node->binary.left, loop);    // rax = dest addr
             emit_byte(buf, 0x48); emit_byte(buf, 0x89); emit_byte(buf, 0xc7); // mov rdi, rax (dst)

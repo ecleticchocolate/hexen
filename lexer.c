@@ -166,10 +166,14 @@ Token Lexer_NextToken(void) {
         if (check_keyword(&tok, "enum", TOK_ENUM)) return tok;
         if (check_keyword(&tok, "union", TOK_UNION)) return tok;
         if (check_keyword(&tok, "match", TOK_MATCH)) return tok;
+        if (check_keyword(&tok, "switch", TOK_MATCH)) return tok; // alias for `match`
+        if (check_keyword(&tok, "case", TOK_CASE)) return tok;
         if (check_keyword(&tok, "unpack", TOK_UNPACK)) return tok;
         if (check_keyword(&tok, "auto", TOK_UNPACK)) return tok; // alias for `unpack`
         if (check_keyword(&tok, "extern", TOK_EXTERN)) return tok;
         if (check_keyword(&tok, "pub", TOK_PUB)) return tok;
+        if (check_keyword(&tok, "static_assert", TOK_STATIC_ASSERT)) return tok;
+        if (check_keyword(&tok, "static", TOK_STATIC)) return tok;
 
         if (check_keyword(&tok, "const", TOK_CONST)) return tok;
         if (check_keyword(&tok, "with",  TOK_WITH))  return tok;
@@ -179,6 +183,7 @@ Token Lexer_NextToken(void) {
         if (check_keyword(&tok, "alignof", TOK_ALIGNOF)) return tok;
         if (check_keyword(&tok, "offsetof", TOK_OFFSETOF)) return tok;
         if (check_keyword(&tok, "nameof", TOK_NAMEOF)) return tok;
+        if (check_keyword(&tok, "typeof", TOK_TYPEOF)) return tok;
         if (check_keyword(&tok, "true", TOK_TRUE)) return tok;
         if (check_keyword(&tok, "false", TOK_FALSE)) return tok;
         if (check_keyword(&tok, "null", TOK_NULL)) return tok;
@@ -246,15 +251,22 @@ Token Lexer_NextToken(void) {
     }
 
     if (c == '\'') {
-        // Char literal -> u8 integer. Escapes: \n \t \0 \\ \" \' \xNN
-        s_pos++; // opening quote
+        // If followed by char content and closing quote, it's a char literal ('a' or '\n').
+        // Otherwise, a standalone apostrophe T' is TOK_SINGLE_QUOTE (type sugar for Unique[T]).
+        size_t save = s_pos;
+        s_pos++; // skip opening quote
         int val = decode_char();
-        if (val < 0) { tok.type = TOK_ERROR; return tok; }
-        if (s_source[s_pos] != '\'') { tok.type = TOK_ERROR; return tok; }
-        s_pos++; // closing quote
-        tok.type = TOK_INTEGER; // char literals desugar to u8-valued integers
-        tok.int_value = (uint64_t)val;
-        tok.length = (s_source + s_pos) - tok.start;
+        if (val >= 0 && s_source[s_pos] == '\'') {
+            s_pos++; // closing quote
+            tok.type = TOK_INTEGER; // char literals desugar to u8-valued integers
+            tok.int_value = (uint64_t)val;
+            tok.length = (s_source + s_pos) - tok.start;
+            return tok;
+        }
+        // Standalone apostrophe
+        s_pos = save + 1;
+        tok.type = TOK_SINGLE_QUOTE;
+        tok.length = 1;
         return tok;
     }
 

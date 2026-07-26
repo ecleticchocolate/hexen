@@ -140,35 +140,6 @@ static Type* fn_param_getter(void* ctx, size_t i) {
     return ((Type*)ctx)->function.param_types[i];
 }
 
-static Type* flat_args_getter(void* ctx, size_t i) {
-    return ((Type**)ctx)[i];
-}
-
-// A struct's own `type_args` array is already collapsed at ITS declaration's
-// granularity: an ordinary (non-pack) param passes through as one slot, but
-// the ONE declared param at the struct's own pack_type_param_index holds a
-// pre-bundled anon carrier (Struct_MakeAnon) whose FIELDS are the true
-// individual type arguments that got bundled there. A wildcard-head pattern
-// peeling `H, Rest...` needs to walk that true flat sequence, not the
-// already-collapsed one -- otherwise `struct M[H, Rest...]` against
-// `Def[Ts...]` instantiated as `Def[i32, u8]` would bind H to the WHOLE
-// carrier struct{i32,u8} instead of i32 alone. Unpack the carrier's fields
-// back into a flat array so the fixed prefix and the pack tail below can be
-// positioned exactly like they are for an ordinary (non-bundled) struct.
-// Returns a malloc'd array the caller must free UNLESS it equals `type_args`
-// itself (the no-pack-in-declaration fast path, returned unowned).
-static Type** flatten_type_args(StructDef* tmpl_sd, Type** type_args, size_t nargs, size_t* out_count) {
-    int p = tmpl_sd->pack_type_param_index;
-    if (p < 0 || (size_t)p >= nargs) { *out_count = nargs; return type_args; }
-    StructDef* carrier = Struct_Find(type_args[p]->struct_name);
-    size_t carrier_n = carrier ? carrier->field_count : 0;
-    size_t total = (size_t)p + carrier_n;
-    Type** flat = (Type**)malloc((total ? total : 1) * sizeof(Type*));
-    for (size_t i = 0; i < (size_t)p; i++) flat[i] = type_args[i];
-    for (size_t i = 0; i < carrier_n; i++) flat[(size_t)p + i] = carrier->fields[i].type;
-    *out_count = total;
-    return flat;
-}
 
 // Build the DECLARED view of a struct's field list for type-pattern matching.
 // Struct_Layout stores a `super A base` field as its PROMOTED PREFIX (A's own
@@ -208,79 +179,14 @@ static bool field_slot_unify(StructField* concrete, StructField* pat, ReflectBin
 bool reflect_unify(Type* concrete, Type* pattern, ReflectBindings* out) {
     if (!concrete && !pattern) return true;
 
-    // ── Tagged nominal pattern: `struct M`, `struct M[X]`, `enum M[X]`, ... ──
-    // The tag states the KIND, which is the one fact brackets can never carry, so
-    // it is checked against the concrete declaration. The head then binds to the
-    // concrete's own template (left UNAPPLIED, so it stays usable as `M[u8]`
-    // later), and each bracket argument unifies pairwise against the concrete
-    // instantiation's type_args -- ordinary reflect_unify recursion, so nested
-    // tagged applications, wildcards and concrete args all work at any depth.
-    if (pattern && concrete && is_hole(pattern) && pattern->nominal_tag) {
-        if (concrete->cls != TYPE_STRUCT || !concrete->struct_name) return false;
-        StructDef* csd = Struct_Find(concrete->struct_name);
-        if (!csd) return false;
-
-        unsigned char actual = csd->is_enum ? 2 : csd->is_overlapping ? 3 : 1;
-        if (actual != pattern->nominal_tag) return false;   // kind assertion
-
-        StructDef* tmpl_sd = csd->generic_base ? csd->generic_base : csd;
-        size_t nargs = csd->generic_base ? csd->type_arg_count : 0;
-
-        // Bare `struct M` (no brackets written at all) means "any struct,
-        // don't care about type args" -- skip the arg-count check below
-        // entirely rather than letting it silently inherit the "exactly
-        // zero args" requirement that only makes sense for an EXPLICIT
-        // `M[]`. Without this, `struct M` could never match a generic
-        // instantiation with any args, since app_arg_count defaults to 0
-        // whether or not `[...]` was actually written.
-        //
-        // An explicit `[...]` (even empty, `M[]`) asserts a real type-arg
-        // list, which only a generic instantiation has. A plain,
-        // non-generic struct has no type-arg list to be empty OR
-        // non-empty -- `nargs` above collapses that "not applicable" case
-        // to 0 for convenience elsewhere, but that must not let `M[]`
-        // coincidentally match every non-generic struct regardless of its
-        // field count. Require a real instantiation before the arg-count
-        // check is even meaningful.
-        if (pattern->app_has_brackets && !csd->generic_base) return false;
-
-        Type* tmpl = (Type*)calloc(1, sizeof(Type));
-        tmpl->cls = TYPE_STRUCT;
-        tmpl->struct_name = tmpl_sd->name;
-        tmpl->struct_unapplied = (nargs > 0);
-        if (!bind(out, pattern->param_name, tmpl)) return false;
-
-        if (!pattern->app_has_brackets) return true;
-
-        // `struct M[H, Rest...]` -- the wildcard-head sibling of the named-head
-        // pack destructure (`Def[H, Rest...]`), now reaching this path too. Flatten
-        // csd's own type_args first (its declared pack slot, if any, holds a
-        // pre-bundled carrier -- unpack it back to individual args), unify the
-        // fixed prefix positionally exactly as the no-pack case below already does,
-        // then hand the tail to the same pack_tail_unify core the fn-param and
-        // struct-field pack tails already share. A fixed slot ahead of the pack may
-        // itself be a const-generic VALUE (`struct M[u32 N, Ts...]`) -- that just
-        // works here, unchanged, because it unifies through the ordinary
-        // reflect_unify(TYPE_CONST_VALUE, ...) recursion like any other fixed slot.
-        if (pattern->app_pack_idx >= 0) {
-            size_t flat_n;
-            Type** flat = flatten_type_args(tmpl_sd, csd->type_args, nargs, &flat_n);
-            size_t fixed = (size_t)pattern->app_pack_idx;
-            bool ok = flat_n >= fixed;
-            for (size_t i = 0; ok && i < fixed; i++)
-                ok = reflect_unify(flat[i], pattern->app_args[i], out);
-            if (ok)
-                ok = pack_tail_unify(flat_n, fixed, pattern->app_args[fixed],
-                                     flat_args_getter, (void*)flat, false, out);
-            if (flat != csd->type_args) free(flat);
-            return ok;
-        }
-
-        if (pattern->app_arg_count != nargs) return false;  // arity from concrete
-        for (size_t i = 0; i < nargs; i++)
-            if (!reflect_unify(csd->type_args[i], pattern->app_args[i], out)) return false;
-        return true;
-    }
+    // A bare top-level function reference carries TYPE_FN_LITERAL (see its
+    // construction in types.c AST_IDENT case) so generic instantiation can
+    // track WHICH function was passed. Every other consumer unwraps this via
+    // Type_FnLitShape to see the plain TYPE_FUNCTION shape underneath -- match
+    // on type must do the same, or `match F { fn(A) B {...} }` silently fails
+    // to match a scrutinee that came from a bare function name.
+    concrete = Type_FnLitShape(concrete);
+    pattern  = Type_FnLitShape(pattern);
 
     // Pattern hole: bind it to whatever the concrete side is here, and succeed.
     if (pattern && is_hole(pattern)) {
@@ -342,6 +248,33 @@ bool reflect_unify(Type* concrete, Type* pattern, ReflectBindings* out) {
             mangled[manglen] = '\0';
             Symbol* msym = SymTable_Find(Get_SymTable(), mangled, manglen);
             free(mangled);
+
+            // Not declared directly on this struct -- look through a `super`
+            // embedding, the same way a CALL does.
+            //
+            // `super` forwarding is a call-site REWRITE (`o.len()` becomes
+            // `View_len(&o.v)`), so no `Owned_len` symbol is ever created. A
+            // lookup by mangled name therefore answers "no method" for a type
+            // whose method calls plainly work -- `o.len()` compiled and ran while
+            // `match S { impl { fn len() u32 } }` took the else arm. Walking the
+            // embedding here is what makes the query agree with the call.
+            if ((!msym || msym->kind != SYM_FUNCTION) && sd) {
+                for (size_t f = 0; f < sd->field_count; f++) {
+                    StructField* sf = &sd->fields[f];
+                    if (!sf->is_super_alias && !sf->is_super_param) continue;
+                    Type* sup = sf->type;
+                    if (sup && sup->cls == TYPE_POINTER) sup = sup->pointer_base;
+                    if (!sup || sup->cls != TYPE_STRUCT || !sup->struct_name) continue;
+                    size_t smanglen = 0;
+                    char* sm = Method_Mangle(sup, pattern->impl_pat.method_names[m],
+                                             mlen, &smanglen);
+                    if (!sm) continue;
+                    Symbol* ssym = SymTable_Find(Get_SymTable(), sm, smanglen);
+                    free(sm);
+                    if (ssym && ssym->kind == SYM_FUNCTION) { msym = ssym; break; }
+                }
+            }
+
             if (!msym || msym->kind != SYM_FUNCTION || !msym->type ||
                 msym->type->cls != TYPE_FUNCTION)
                 return false;

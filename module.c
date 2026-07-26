@@ -93,10 +93,9 @@ void Module_Generate(const char* out_filename) {
         }
     }
 
-    size_t const_count = 0;
-    ConstDef* consts = Const_GetAll(&const_count);
+    size_t const_count = Const_Count();
     for (size_t i = 0; i < const_count; i++) {
-        ConstDef* c = &consts[i];
+        ConstDef* c = Const_At(i);
         if (!c->is_pub) continue;
         char tbuf[256];
         Type_ToString(c->type, tbuf, sizeof(tbuf));

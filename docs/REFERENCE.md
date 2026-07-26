@@ -1,7 +1,27 @@
-"# Hexen Language Reference
+""# Hexen Language Reference
 
 Terse, complete, no rationale. One construct per entry: signature, then a
 minimal example. For "why," see `specs.md`. For workflow, see `GUIDE.md`.
+
+## Statement layout — READ FIRST
+
+**One statement per line.** Do not put two statements on the same line unless
+you genuinely have to. Cramming multiple statements onto one line is **not**
+idiomatic Hexen and should not be treated as the house style — much of the
+existing test corpus crams for brevity, but that is test shorthand, not a
+model to imitate. Write normal, one-per-line code.
+
+**Never put a second statement on a line when either statement dereferences.**
+A leading `*` (or `&`) at a statement boundary is **ambiguous with a binary
+operator against the previous expression**: `*px = 100  *py = 55` parses `100
+*py` as a multiplication, not as two write-through assignments. This is not a
+compiler bug — it is inherent to the grammar. Put each deref/write-through
+statement on its own line:
+
+```
+*px = 100
+*py = 55
+```
 
 ```
 extern fn printf(u8* fmt, ...) i32
@@ -44,8 +64,6 @@ always `true`. See Showcases for the idiomatic uses this enables.
 syntax as in C, just the same cast grammar every other type already uses —
 and reads naturally as "discard the result" since `void` holds nothing.
 
----
-
 ## Declarations
 
 ```
@@ -63,6 +81,31 @@ extern fn name(TYPE a) RETTYPE           // no body; links against libc/host
 extern fn printf(u8* fmt, ...) i32       // "..." = C varargs (extern only)
 pub fn name(...) ...                     // exported via -emit-mod
 ```
+
+### Function Default Arguments
+
+Parameters can specify default expressions (`= expr`). Default expressions must be valid `constexpr` expressions evaluated at compile time (literals, struct/array literals, constant math, `sizeof`, or `constexpr` functions).
+
+```hexen
+fn default_port() u16 { return 8080 }
+
+fn connect(u8* host = "localhost", u16 port = default_port()) i32 { ... }
+
+struct Point { i32 x  i32 y }
+fn process(Point p = {.x = 100, .y = 200}, i32[3] arr = {10, 20, 30}) i32 { ... }
+
+impl Server {
+    fn listen(u16 port = 8080, u32 max_clients = 100) bool { ... }
+}
+
+connect()            // Rewritten to connect("localhost", default_port())
+connect("127.0.0.1") // Rewritten to connect("127.0.0.1", default_port())
+```
+
+- **Compile-Time Constant Initializers**: Default expressions must be strictly `constexpr` (evaluated at parse time via `ConstEval`).
+- **Struct and Array Defaults**: Aggregate brace literals (`{.x = 100}` or `{10, 20, 30}`) derive their layout top-down from the parameter type and fold at compile time.
+- **Raw Function Pointers**: `fn(...)` raw pointer variables do not carry defaults; calling through a function pointer requires passing all positional parameters explicitly.
+- **Trailing Order**: All parameters with default values must come after non-default parameters (except variadic pack parameters `T... args`).
 
 ---
 
@@ -90,12 +133,46 @@ return x                    // y is undeclared from here on
 
 ```
 type      ::= base postfix*
-base      ::= primitive | named | fn_type | anon_struct | "(" type ")"
+base      ::= primitive | named | fn_type | anon_struct | "(" type ")" | "typeof" "(" expr ")"
 postfix   ::= "*" | "[" constexpr "]" | "[" "]"
 named     ::= IDENT | IDENT "[" type_or_value ("," type_or_value)* "]"
 fn_type   ::= "fn" "(" (type ("," type)*)? ")" type?
 anon_struct ::= "struct" "{" (type IDENT)* "}"
 ```
+
+### Type Query — `typeof(expr)`
+
+Queries the static type signature of `expr` at compile time without evaluating `expr` (unevaluated operand context, identical to `sizeof(expr)`).
+
+```hexen
+i32 val = 42
+
+// 1. Variable & field declarations:
+typeof(val) x = 100
+struct Container { typeof(val) count }
+
+// 2. Function parameters & return types:
+fn add(typeof(10) a, typeof(20) b) typeof(a + b) { return a + b }
+
+// 3. Postfix composition & casts:
+typeof(val)* ptr = &x
+typeof(val)[4] arr = {1, 2, 3, 4}
+typeof(val) casted = (typeof(val)) 3.14
+
+// 4. Aliases & generic arguments:
+alias MyInt = typeof(val)
+Box[typeof(val), 5] b
+
+// 5. Type match & reflection:
+match typeof(val) {
+    i32 { return 100 }
+    else { return 200 }
+}
+```
+
+- **Unevaluated Context**: `expr` is inspected purely at compile time via static type inference (`Type_Infer`). Expressions inside `typeof(...)` are never executed or emitted into runtime machine code.
+- **Universal Orthogonality**: `typeof(expr)` is a type `base` in `parse_type_ex` and can be used anywhere a type is expected.
+- **Self-Reference Guard**: Referencing an un-inferred identifier currently being declared (`typeof(x) x`) is cleanly rejected as an undeclared/un-inferred symbol error.
 
 Postfixes bind left-to-right over what's built so far:
 
@@ -118,8 +195,23 @@ Anonymous struct type (not a declaration — usable anywhere a type is):
 ```
 struct { i32 x  i32 y } p
 ```
-Identity is structural (keyed on field types): two anonymous structs with
-the same field types are the same type. Named structs stay nominal.
+Identity is keyed on field types **and field names**: `struct { f32 x  f32 y }`
+and `struct { f32 lat  f32 lon }` are different types, the same way two named
+structs with identical fields are. Named structs stay nominal too.
+
+A field written with **no name** is positional — it gets a synthesized `_0`,
+`_1`, ... and carries no naming to disagree about:
+
+```
+struct { i32; i32 } t      // positional (a tuple); fields are _0, _1
+struct { i32 a  i32 b } r  // named
+```
+
+A **positional** value converts freely into a named-field target of the same
+field types (that is what makes a `T... args` pack — always positional — usable
+as an `alias`-declared vtable struct; see the hand-built existential in
+Showcases). Two values that both name their fields do **not** convert, in any
+position: assignment, parameter passing, and generic arguments all reject it.
 
 ---
 
@@ -160,7 +252,9 @@ u8* arr = new[1024] u8                          // array (count, not bytes)
 delete n
 delete arr
 ```
-No GC, no RAII, no destructor call on `delete`.
+No GC. Allocation is manual; **destruction is not** — a struct that defines
+`__delete()` is destroyed automatically, both by `delete` and at scope exit.
+See "Ownership and `__delete`" below for the exact rules and their limits.
 
 ---
 
@@ -209,7 +303,9 @@ struct Derived {
   by value (`f(d.info)` passes an ordinary independent *value* copy).
 - Works in `struct` and `union` bodies. Embedded type may be a generic
   param (`super T base`), resolved at instantiation.
-- Copies fields only, never methods.
+- Method forwarding: calling a method on `Derived` (`d.method()`) automatically
+  forwards to `d.info.method()` if `Derived` does not define `method` itself.
+  Works across both concrete structs and generic parameter embeddings (`super T payload`).
 - `(Base*)&derived_val` reads through the shared prefix (see Casts) — the same
   bytes `d.info` names.
 
@@ -345,8 +441,31 @@ impl Counter {
   `Counter_m(&x, a)` (or `Counter_m(x, a)` if `x` is already `Counter*`).
 - Field lookup wins over method lookup — a method never shadows a field.
 - `pub impl` exports every method; no per-method `pub`.
-- Only `fn` inside `impl`. No nested types, no `const`, no static methods,
-  no constructors (write an ordinary function returning the struct instead).
+- Only `fn` inside `impl`. No nested types, no `const`.
+
+### `static fn` — associated functions
+
+A method marked `static` takes **no `self`** and is called on the *type*, not
+on an instance. This is the constructor idiom: a `static fn` returning the
+struct, rather than a dedicated constructor form.
+
+```
+struct P { i32 x }
+impl P {
+    static fn make(i32 v) P { return {.x = v} }
+    static fn origin() P    { return P.make(0) }   // statics call statics
+    fn get() i32            { return self.x }      // ordinary method: has self
+}
+P a = P.make(5)
+i32 v = a.get()
+```
+- Called as `Type.name(args)`. Calling one through an instance (`a.make(1)`)
+  is not the access path; go through the type.
+- Works on a generic `impl`, with the type arguments supplied on the type:
+  `Vector[u8].create()`, `Vector[T].with_capacity(16)`. Combined with default
+  arguments this replaces the usual `create()`/`with_capacity()` duplication —
+  see `std/vector.t`.
+- `self` is not in scope in a `static fn` body; referring to it is an error.
 - Generic struct: `impl Box[T] { ... }` — params read from the struct's own
   declaration. `impl Box[u8]` (a concrete instantiation) is a compile error.
 - A method may declare its own extra type params: `fn map[U](U v) U { ... }`.
@@ -535,79 +654,6 @@ values because every value carries its own type; nothing is lost. `Ts...`
 bundles types, and a type has no value — so `Nums[1, 2, 3]` (values into a
 bracket pack) is a category error, not a missing feature. Value-parameterize
 with a const-generic before the pack (`[u32 N, Ts...]`) instead.
-
-### Higher-kinded parameters (unapplied templates)
-
-A generic parameter can bind a **still-generic template**, unapplied — no
-`[args]` — and the body applies it later:
-```
-struct Box[T]    { T val }
-struct HKT[M, T] { M[T] data }     // M binds a bare template; M[T] applies it
-
-HKT[Box, i32] h                    // M = Box (unapplied), then Box[i32] inside
-h.data = { .val = 5 }
-```
-`M` here is higher-kinded: it stands for a type *constructor*, not a type. `M[T]`
-in the body is the deferred application, routed through instantiation (not read
-as an array size). Arity is checked — a template applied to the wrong number of
-arguments is rejected.
-
-**Matching the head.** `match` on a higher-kinded parameter distinguishes *which*
-template it is bound to — the head is a first-class thing to pattern on:
-```
-fn describe[M, T](HKT[M, T] h) i32 {
-    match M {
-        Box  { return 1 }      // M is genuinely the bare template Box
-        else { return 0 }
-    }
-}
-```
-**Const-generic value under a wildcard head.** A concrete head supplies each
-slot's kind from its declaration, so `Vec[E, N]` knows `N` is a value with no
-annotation. A **wildcard head** (`struct M[...]`) supplies no declaration — so to
-*use* a value slot as a value in the arm body, the pattern must state the value's
-type, with the same type-then-value grammar a declaration uses. Two spellings,
-the ordinary pin-vs-bind duality:
-```
-struct Vec[T, u32 N] { T[N] e }
-match S {
-    struct M[E, u32 N]  { /* PIN:  value-type u32 written; N usable as a value  */ }
-}
-struct Row[VT, T, VT N] { T[3] e }
-match S {
-    struct M[VT, E, VT N] { /* BIND: value-type -> VT; both VT (as type) and N   */ }
-}                          /*        (as value) usable in the body               */
-```
-The trailing name binds the value; the type before it is its pin — checked
-against the concrete (`M[E, u32 N]` will not match a `u64`-typed slot). This is
-the one place in `match` where a type annotation is *required* rather than
-inferred, and for the same reason a `struct` tag is required on a wildcard head:
-the head cannot supply the fact, so the pattern must. A bare `struct M[E, N]`
-still matches and binds `N`, but `N` cannot be read as a value without the
-annotation.
-
-### Nominal-kind tags in patterns
-
-A pattern can pin the **nominal kind** of a slot. Position decides what the
-keyword means: in a **type position** (`fn(struct Point)`, `struct Point p`) a
-leading `struct`/`enum`/`union` is a redundant C-style tag on an already-known
-type — accepted, carries no information. In a **match pattern** the *same*
-keyword is a meaningful **kind assertion**: `struct M[X]` matches only when the
-head is a struct, binds the head to `M` and its argument to `X`; `enum M[X]`
-matches only enums, and so on:
-```
-struct Box[T] { T v }
-enum   Opt[T] { T Some  None }
-match S {
-    enum   M[X] { }   // fires only if S's head is an ENUM  (Opt[..] yes, Box[..] no)
-    struct M[X] { }   // fires only if S's head is a STRUCT (Box[..] yes, Opt[..] no)
-    else        { }
-}
-```
-Tagged applications nest — the argument of one may be another tagged application,
-inner wildcards binding normally: `struct M[struct N[X]]` matches
-`Box[Wrap[u64]]` with `M=Box`, `N=Wrap`, `X=u64`. Where the kind is already
-known from context the tag is a no-op, so it never *hurts* to write it.
 
 ### Repeated wildcards and back-inference
 
@@ -832,6 +878,24 @@ a[i]                                    -> __index(i)   (T* return -> also writa
 a = b                                   -> __assign(b)  (only when b doesn't already fit a's own type)
 ```
 
+**Operands may be taken by pointer.** An overload's parameter is an ordinary
+parameter, checked the ordinary way — declare it `T*` and the operand is passed
+by pointer instead of copied. Nothing is inferred and nothing is inserted: the
+call site must supply a matching pointer, or it is a type error.
+```
+impl Big {
+    fn __eq(Big* o) bool { return self.key == o.key }   // no copy of Big
+}
+a == &b       // matches Big*
+a == x        // also fine: x is already a Big*
+a == b        // type error: cannot assign Big to Big*
+```
+By-value and by-pointer overloads coexist freely (different types may each
+choose), and both work inside generic functions. Applies to the whole family —
+`__add`, `__lt`, `__index`, … — since all of them are just functions. Prefer
+`T*` for aggregates, where the by-value form copies the whole struct per
+operation.
+
 `__index(i) T*` (pointer INTO the container, e.g. `&self.data[i]`, not `T`)
 makes `v[i]` both readable and writable — see `std/vector.t`. Known gap:
 `v[i]` as a direct argument to a variadic extern call (`printf`) is unreliable;
@@ -861,6 +925,93 @@ impl Vector[T] {
 }
 // delete v  ->  calls v.__delete() then frees v
 ```
+
+---
+
+## Ownership and `__delete`
+
+Defining `__delete()` on a struct makes it an **owning** type, and that one
+fact drives everything below. There is no `Drop` trait, no ownership
+annotation, no borrow checker — the destructor's mere existence is the whole
+declaration, queried structurally wherever it matters.
+
+### Two automatic call sites
+
+`__delete()` is called for you in exactly two places:
+
+```
+R* p = new R{...}
+delete p              // 1. explicit: __delete(), THEN the free
+{ R local = {...} }   // 2. scope exit: __delete() at the closing brace
+```
+
+Scope exit is real RAII and applies to every block kind — a bare `{ }`, a
+function body, an `if`/`while`/`for` body. Locals are destroyed in **LIFO**
+order, and the destructor runs on early `return` as well as on fall-through,
+because it is implemented as a synthesized `defer` (same machinery, same
+ordering rules as a hand-written one):
+
+```
+{
+    R a = {.id = 1}
+    R b = {.id = 2}
+}   // drops b, then a
+```
+
+`delete` always frees the storage afterward — `__delete()` is cleanup logic
+layered on top of the free, never a replacement for it.
+
+### `Owning` — the capability alias
+
+Generic code asks "does `T` own something?" with an ordinary structural
+`impl` query, which reads best behind an alias:
+
+```
+alias Owning = impl { fn __delete() }
+
+fn store[T](T item) void {
+    match T {
+        Owning { ... }   // T has a destructor: deep-copy it
+        else   { ... }   // plain data: a field copy is fine
+    }
+}
+```
+This resolves at compile time and costs nothing at runtime. `std/vector.t`
+declares `pub alias Owning` and routes every ownership decision through it, so
+the predicate is written once rather than respelled per call site.
+
+### What is NOT automatic — read before writing an owning type
+
+The rules below are the ones that bite. None of them are checked for you.
+
+**`b = a` is always a shallow memcpy** — never a hook, never recursive, for
+structs and arrays alike. There is no copy constructor and no move semantics,
+so a copy of an owning struct duplicates the *pointer* and now aliases the
+same resource. Deep copying is an ordinary, visible method call (`a.copy()`),
+by convention on the `Owning` branch of a `match` — see `std/vector.t`.
+
+Function parameters are copies and are **not** destroyed on return; the
+caller's original still owns the resource.
+
+**Owning fields are not destroyed recursively.** A struct's own `__delete()`
+is called; the destructors of its *fields* are not called for you. A container
+must walk its elements itself (`destroy_elems()` in `std/vector.t`).
+
+**Copy-binding in a `match` arm duplicates the payload.** Match a payload of
+an owning type with the write-through form `{.Some = *v}` (a pointer into the
+slot), never `{.Some = v}` (a copy):
+```
+match v.pop() {
+    {.Some = *x} { ... }   // aliases the payload
+    .None        { }
+}
+```
+
+**A returned local is not destroyed** — the value escapes to the caller, who
+destroys it. This holds for a `return r` anywhere in the function, including
+inside an `if`, loop, or `match` arm, not only as the final statement. The
+check is conservative: any `return r` at all suppresses `r`'s destructor, so a
+return that never executes at runtime leaks rather than double-frees.
 
 ---
 
@@ -1109,4 +1260,4 @@ gcc -o out aot_shim.c out.o          # link with the C entry-point shim to get a
 ./torrent file.t -- arg1 arg2        # args after -- go to your program's argv
 ./torrent -emit-mod out.tmod file.t  # write pub interface file
 ```
-"
+""

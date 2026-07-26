@@ -6,7 +6,13 @@
 
 // --- Named-constant registry (top-level, single namespace) ---
 
-static ConstDef* s_consts = NULL;
+// Stable storage: each ConstDef is individually heap-allocated and never moves,
+// so a ConstDef* handed out by Const_Register/Const_Find stays valid for the
+// life of the program. (Previously this was a contiguous array that realloc'd
+// on growth, invalidating every ConstDef* already stored in sym->cdef / pending
+// uses — a use-after-free the parser hit while resolving a const referenced
+// after the table had grown. Storing pointers, not inline structs, fixes it.)
+static ConstDef** s_consts = NULL;
 static size_t s_const_count = 0;
 static size_t s_const_capacity = 0;
 
@@ -30,27 +36,31 @@ void Global_RegisterForEmit(Symbol* sym) {
 size_t  Global_EmitCount(void)      { return s_emit_count; }
 Symbol* Global_EmitAt(size_t i)     { return (i < s_emit_count) ? s_emit_globals[i] : NULL; }
 
-ConstDef* Const_GetAll(size_t* out_count) {
-    if (out_count) *out_count = s_const_count;
-    return s_consts;
-}
+// Number of registered consts, and indexed access. (The old Const_GetAll
+// returned a flat ConstDef* array; storage is now a pointer-array, so callers
+// use Const_Count + Const_At instead of indexing a contiguous block.)
+size_t Const_Count(void) { return s_const_count; }
+ConstDef* Const_At(size_t i) { return (i < s_const_count) ? s_consts[i] : NULL; }
 
 ConstDef* Const_Find(const char* name, size_t len) {
     for (size_t i = 0; i < s_const_count; i++) {
-        if (strlen(s_consts[i].name) == len &&
-            strncmp(s_consts[i].name, name, len) == 0) {
-            return &s_consts[i];
+        if (strlen(s_consts[i]->name) == len &&
+            strncmp(s_consts[i]->name, name, len) == 0) {
+            return s_consts[i];
         }
     }
     return NULL;
 }
 
 ConstDef* Const_Register(const char* name, size_t len, int64_t value, Type* type) {
+    // The pointer-array may realloc/move on growth, but the ConstDef objects it
+    // points to never do — so previously handed-out ConstDef* stay valid.
     if (s_const_count >= s_const_capacity) {
         s_const_capacity = s_const_capacity ? s_const_capacity * 2 : 8;
-        s_consts = (ConstDef*)realloc(s_consts, s_const_capacity * sizeof(ConstDef));
+        s_consts = (ConstDef**)realloc(s_consts, s_const_capacity * sizeof(ConstDef*));
     }
-    ConstDef* c = &s_consts[s_const_count++];
+    ConstDef* c = (ConstDef*)calloc(1, sizeof(ConstDef));
+    s_consts[s_const_count++] = c;
     c->name = strndup(name, len);
     c->value = value;
     c->type = type;
@@ -87,15 +97,15 @@ bool Const_ResolvePending(void) {
     while (progress) {
         progress = false;
         for (size_t i = 0; i < s_const_count; i++) {
-            ConstDef* c = &s_consts[i];
+            ConstDef* c = s_consts[i];
             if (!c->pending_expr) continue;
             int64_t v;
             if (ConstEval(c->pending_expr, &v)) { c->value = v; c->pending_expr = NULL; progress = true; }
         }
     }
     for (size_t i = 0; i < s_const_count; i++) {
-        if (s_consts[i].pending_expr) {
-            fprintf(stderr, "Error: const '%s' initializer is not a constant expression\n", s_consts[i].name);
+        if (s_consts[i]->pending_expr) {
+            fprintf(stderr, "Error: const '%s' initializer is not a constant expression\n", s_consts[i]->name);
             return false;
         }
     }
@@ -901,8 +911,10 @@ static bool ce_eval_call(ASTNode* node, int64_t* out) {
                 fsym = isym;
                 fn = isym->func_decl;
             }
-            if (!fn) return false;
             if (fn->func_decl.type_param_count > 0) return false; // still generic after the above: not foldable
+
+            expand_call_default_args(node, fn->func_decl.param_defaults, fn->func_decl.param_count, fn->func_decl.pack_param_index, NULL);
+
             if (node->call.arg_count != fn->func_decl.param_count) return false;
 
             // Budget/arena lifecycle belongs SOLELY to ConstEval's own s_ce_depth
@@ -1197,8 +1209,25 @@ static bool ce_eval_ident(ASTNode* node, int64_t* out) {
             // a plain (non-generic) function folded fine.
             if (node->ident.sym && node->ident.sym->kind == SYM_FUNCTION &&
                 node->ident.sym->generic_decl && node->ident.type_arg_count > 0) {
-                Symbol* isym = Generic_Instantiate(node->ident.sym, node->ident.type_args,
-                                                    node->ident.type_arg_count);
+                // Same substitution the AST_CALL fold path already does a few
+                // hundred lines up: a generic fn value referenced with explicit
+                // type args (`vec_step[T]` stored as a const-generic value on
+                // Cursor[E,S,F]) must have those args substituted through the
+                // currently-installed generic frame before instantiating, or a
+                // deferred re-fold at outer monomorphization time still sees T
+                // abstract while self.state is already concrete.
+                Type** targs = node->ident.type_args;
+                size_t targc = node->ident.type_arg_count;
+                Type** sub_targs = NULL;
+                if (targc > 0 && s_ce_generic_n > 0) {
+                    sub_targs = malloc(targc * sizeof(Type*));
+                    for (size_t i = 0; i < targc; i++)
+                        sub_targs[i] = Type_Substitute(targs[i], s_ce_generic_params,
+                                                       s_ce_generic_args, s_ce_generic_n);
+                    targs = sub_targs;
+                }
+                Symbol* isym = Generic_Instantiate(node->ident.sym, targs, targc);
+                if (sub_targs) free(sub_targs);
                 *out = (int64_t)(intptr_t)isym;
                 s_ce_isfloat = false; s_ce_isagg = false; s_ce_isfnsym = true;
                 return true;
@@ -1410,6 +1439,14 @@ static bool ConstEval_inner(ASTNode* node, int64_t* out) {
     // comment.)
     if (try_rewrite_operator_method(node) || try_rewrite_index_method(node) ||
         try_rewrite_unary_operator_method(node) || try_rewrite_cast_operator(node)) {
+        // Same follow-up the runtime path runs (Type_Infer / infer_generic): an
+        // __index returning T* must become `*(v.__index(i))`. Without it the
+        // comptime interpreter folded the ADDRESS -- `const R = v[0]` on a
+        // 5-element vector baked in 84 instead of 5, silently, while v.len()
+        // and v.get(0) folded correctly. Shared helper, not a second copy of
+        // the rule, so the two phases cannot disagree about when to deref.
+        try_rewrite_method_call(node);
+        wrap_index_result_deref(node);
         return ConstEval(node, out);
     }
 

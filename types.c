@@ -20,6 +20,14 @@ Type* Type_FnLitShape(Type* t) {
 }
 #define fn_lit_shape Type_FnLitShape
 
+Type* Type_FromStruct(StructDef* sd) {
+    if (!sd) return NULL;
+    Type* t = (Type*)calloc(1, sizeof(Type));
+    t->cls = TYPE_STRUCT;
+    t->struct_name = sd->name;
+    return t;
+}
+
 // --- Primitive classification ---
 
 // The one shared width table for every REAL (non-void) primitive. Exported
@@ -525,6 +533,29 @@ static void check_assignable(Type* dst, ASTNode* src, const char* where);
 // the context type (decl, return, param, field, element). Recurses for nested
 // literals (a field/element value that is itself a bare `{...}`). No-op if the
 // node is already resolved or isn't a bare literal.
+void expand_call_default_args(ASTNode* node, ASTNode** pdefaults, size_t pcount, int pack_idx, Type** ptypes) {
+    if (!pdefaults || node->call.arg_count >= pcount) return;
+    size_t check_until = (pack_idx >= 0) ? (size_t)pack_idx : pcount;
+    if (node->call.arg_count >= check_until) return;
+
+    for (size_t k = node->call.arg_count; k < check_until; k++) {
+        if (!pdefaults[k]) return;
+    }
+
+    size_t fill_count = check_until;
+    ASTNode** expanded_args = (ASTNode**)realloc(node->call.args, fill_count * sizeof(ASTNode*));
+    if (expanded_args) {
+        node->call.args = expanded_args;
+        for (size_t k = node->call.arg_count; k < fill_count; k++) {
+            node->call.args[k] = clone_ast(pdefaults[k], NULL, NULL, 0, false);
+            if (ptypes && ptypes[k]) {
+                resolve_brace_literal(node->call.args[k], ptypes[k]);
+            }
+        }
+        node->call.arg_count = fill_count;
+    }
+}
+
 void resolve_brace_literal(ASTNode* node, Type* target) {
     if (!node || !target) return;
 
@@ -579,6 +610,9 @@ void resolve_brace_literal(ASTNode* node, Type* target) {
         // Validate each named field exists; recurse so nested `{...}` field values
         // resolve against the field's declared type.
         for (size_t i = 0; i < node->struct_lit.count; i++) {
+            if (node->struct_lit.pack_index >= 0 && (int)i == node->struct_lit.pack_index && i >= sd->field_count) {
+                continue;
+            }
             StructField* f = Struct_FindField(sd, node->struct_lit.field_names[i],
                                               node->struct_lit.field_name_lens[i]);
             if (!f) {
@@ -602,6 +636,34 @@ void resolve_brace_literal(ASTNode* node, Type* target) {
             ASTNode* fv = node->struct_lit.values[i];
             if (is_untyped_literal(fv)) {
                 check_assignable(f->type, fv, "struct field");
+            } else {
+                // A TYPED field value was NOT CHECKED AT ALL: `H{.a = b}` accepted
+                // an unrelated struct -- even one of a different SIZE -- and simply
+                // reinterpreted its bytes. Silent wrongness, and also the reason a
+                // source type's __cast never got a chance to convert.
+                //
+                // Check it like every other assignability site. check_assignable
+                // also inserts a __cast conversion when the source declares one,
+                // so `H{.a = w}` converts rather than failing.
+                //
+                // Skipped for a DESTRUCTURE pattern: this same resolver walk runs
+                // over `match`/`unpack` patterns (`{.x = a, .y = b}`), where a field
+                // "value" is a bare binder that has no symbol and no type yet --
+                // checking one would error "void vs value" on a legitimate pattern.
+                // A binder is exactly an AST_IDENT with no resolved symbol.
+                // A pattern binder has no type yet and must not be checked: a bare
+                // `a` (AST_IDENT with no symbol), a write-through `*px` (AST_DEREF
+                // over one), or a nested destructure `{...}`. Type_Infer hard-errors
+                // on those, so they are excluded by SHAPE rather than by asking.
+                ASTNode* probe = fv;
+                if (probe->type == AST_DEREF && probe->unary) probe = probe->unary;
+                bool is_pattern_slot =
+                    (probe->type == AST_IDENT && !probe->ident.sym) ||
+                    probe->type == AST_STRUCT_LITERAL ||
+                    probe->type == AST_ARRAY_LITERAL;
+                if (!is_pattern_slot) {
+                    check_assignable(f->type, fv, "struct field");
+                }
             }
         }
         node->result_type = target;
@@ -609,6 +671,12 @@ void resolve_brace_literal(ASTNode* node, Type* target) {
     }
 
     if (node->type == AST_ARRAY_LITERAL && node->array_lit.elem_type == NULL) {
+        if (target->cls == TYPE_ARRAY && target->array.count == 0 && target->array.count_expr) {
+            int64_t v;
+            if (ConstEval(target->array.count_expr, &v)) {
+                target->array.count = (uint64_t)v;
+            }
+        }
         // Zero-initialization of scalar targets: `(i32){}` or `(ptr){}` becomes `0`.
         // This is crucial for generic bodies that use `(T){}` to zero-initialize any T.
         if ((target->cls == TYPE_PRIMITIVE || target->cls == TYPE_POINTER) && node->array_lit.count == 0) {
@@ -637,7 +705,7 @@ void resolve_brace_literal(ASTNode* node, Type* target) {
                          "use `.Variant{..}` or %s.Variant{..}", sd->name, sd->name);
                 Error_AtNode(node, msg, NULL);
             }
-            if (node->array_lit.count > sd->field_count) {
+            if (node->array_lit.pack_index < 0 && node->array_lit.count > sd->field_count) {
                 char msg[256];
                 snprintf(msg, sizeof(msg),
                          "positional literal for struct %s has %zu values, expected %zu fields",
@@ -649,22 +717,29 @@ void resolve_brace_literal(ASTNode* node, Type* target) {
             size_t n = sd->field_count;
             size_t provided = node->array_lit.count;
             ASTNode** orig_vals = node->array_lit.values;
-            ASTNode** vals = (ASTNode**)malloc(n * sizeof(ASTNode*));
+            ASTNode** vals = (ASTNode**)malloc(provided * sizeof(ASTNode*));
             for (size_t i = 0; i < provided; i++) vals[i] = orig_vals[i];
             // Un-provided fields are handled by codegen: pre-zero covers no-default fields,
             // and has_default fields are stamped from default_val_buf. Don't synthesize
             // explicit zeros — they would overwrite defaults. Only emit entries for
             // the values that were actually provided (positional order).
+            int orig_pack_index = node->array_lit.pack_index;
             node->type = AST_STRUCT_LITERAL;
             node->struct_lit.sdef = NULL;              // set by the struct resolver below
             node->struct_lit.is_enum_variant = false;
+            node->struct_lit.pack_index = orig_pack_index;
             node->struct_lit.count = provided;
             node->struct_lit.values = vals;
-            node->struct_lit.field_names = (const char**)malloc((n ? n : 1) * sizeof(char*));
-            node->struct_lit.field_name_lens = (size_t*)malloc((n ? n : 1) * sizeof(size_t));
-            for (size_t i = 0; i < n; i++) {
-                node->struct_lit.field_names[i] = sd->fields[i].name;
-                node->struct_lit.field_name_lens[i] = strlen(sd->fields[i].name);
+            node->struct_lit.field_names = (const char**)malloc((provided ? provided : 1) * sizeof(char*));
+            node->struct_lit.field_name_lens = (size_t*)malloc((provided ? provided : 1) * sizeof(size_t));
+            for (size_t i = 0; i < provided; i++) {
+                if (i < sd->field_count) {
+                    node->struct_lit.field_names[i] = sd->fields[i].name;
+                    node->struct_lit.field_name_lens[i] = strlen(sd->fields[i].name);
+                } else {
+                    node->struct_lit.field_names[i] = "";
+                    node->struct_lit.field_name_lens[i] = 0;
+                }
             }
             // Now an AST_STRUCT_LITERAL with sdef==NULL: re-run the resolver so the
             // struct branch above fills sdef and recurses into each positional value.
@@ -714,6 +789,7 @@ void resolve_brace_literal(ASTNode* node, Type* target) {
                 check_assignable(elem, ev, "array element");
             }
         }
+        node->result_type = target;
         if (target->array.count_expr) {
             Type* concrete = (Type*)malloc(sizeof(Type));
             *concrete = *target;
@@ -766,8 +842,7 @@ static void ce_generic_frame_restore(CeGenericFrame saved) {
 }
 
 // Fold one array-postfix count_expr under a substitution frame: ConstEval,
-// positive check, else defer. Shared by Type_Substitute's own TYPE_ARRAY
-// case and array_substitute_maybe_hkt's outer-dimension rebuild.
+// positive check, else defer. Shared by Type_Substitute's own TYPE_ARRAY case.
 static void fold_array_count(ASTNode* ce, const char** params, Type** args, size_t n,
                               uint64_t* count_out, ASTNode** count_expr_out) {
     if (!ce) { *count_expr_out = NULL; return; }
@@ -788,144 +863,6 @@ static void fold_array_count(ASTNode* ce, const char** params, Type** args, size
     }
 }
 
-// One array-postfix dimension as a Type* type argument, or NULL if it's an
-// ordinary (non-type) array-size expression.
-// One bracket of an HKT application, resolved against the applied template's OWN
-// declared kind for that slot (`pin` = sd->param_kinds[k]: NULL for a type param,
-// non-NULL for a value param).
-//
-// `pin` is what lets a VALUE argument resolve here at all. `M[i32][30]` where M is
-// bound to `Vec[T, u32 N]` has a second bracket that is not type-shaped, so without
-// a kind to fold it against it was rejected and the whole application failed --
-// meaning a bound HKT head could only ever be applied to TYPE arguments, never to a
-// const-generic value. `folded` carries the already-folded literal for the common
-// case where the parser resolved `[30]` to a concrete array count and dropped the
-// expr (count_expr == NULL), which is exactly what a plain literal bracket does.
-static Type* count_expr_as_type_arg(ASTNode* count_expr, const char** params, Type** args, size_t n,
-                                     Type* pin, uint64_t folded, const char* size_param) {
-    // A size WILDCARD (`M[E][N]`): the parser leaves count==0/no expr and stashes the
-    // name in array.size_param. Hand it back as an unbound TYPE_PARAM so reflect_unify
-    // binds it exactly like any other hole -- the value-slot pin is irrelevant here
-    // because nothing is being folded, only bound.
-    if (size_param) {
-        Type* h = (Type*)calloc(1, sizeof(Type));
-        h->cls = TYPE_PARAM;
-        h->param_name = size_param;
-        return h;
-    }
-    if (count_expr) {
-        if (count_expr->type == AST_TYPE_EXPR) {
-            return Type_Substitute(count_expr->sizeof_expr.type, params, args, n);
-        }
-        if (count_expr->type == AST_IDENT) {
-            for (size_t i = 0; i < n; i++) {
-                if (strcmp(count_expr->ident.name, params[i]) == 0) return args[i];
-            }
-        }
-    }
-    // VALUE slot: produce the pinned constant. Either fold the surviving expr (with
-    // the generic frame installed so an in-scope `N` resolves), or -- when the parser
-    // already folded it away -- use the count it left behind.
-    if (pin) {
-        int64_t v; bool ok = false;
-        if (count_expr) {
-            CeGenericFrame saved = ce_generic_frame_install(params, args, n);
-            ok = ConstEval(count_expr, &v);
-            ce_generic_frame_restore(saved);
-        } else if (folded > 0) {
-            v = (int64_t)folded; ok = true;
-        }
-        if (ok) {
-            Type* cv = (Type*)calloc(1, sizeof(Type));
-            cv->cls = TYPE_CONST_VALUE;
-            cv->cval.pin = pin;
-            cv->cval.scalar = v;
-            return cv;
-        }
-    }
-    return NULL;
-}
-
-// `M[T][N]`, M an unapplied template: leftmost bracket is outermost (same
-// fold as u32[2][3]), so T (M's type arg) wraps N (a real array dim) --
-// backwards from what M[T] needs. Consumes `arity` brackets from the
-// outside in as type args; whatever's left wraps the instantiated result
-// as ordinary array dims. NULL (no-op) unless the base is confirmed a
-// still-generic template -- T[N]/Mat[T,R,C]{T[R][C]} never reach that.
-static Type* array_substitute_maybe_hkt(Type* t, const char** params, Type** args, size_t n) {
-    size_t depth = 0;
-    Type* base = t;
-    for (; base->cls == TYPE_ARRAY; base = base->array.element) depth++;
-    if (depth == 0) return NULL;
-
-    ASTNode** count_exprs = (ASTNode**)malloc(depth * sizeof(ASTNode*));
-    uint64_t* count_vals = (uint64_t*)malloc(depth * sizeof(uint64_t));
-    const char** size_params = (const char**)malloc(depth * sizeof(const char*));
-    size_t i = 0;
-    for (Type* cur = t; cur->cls == TYPE_ARRAY; cur = cur->array.element) {
-        count_vals[i] = cur->array.count;
-        size_params[i] = cur->array.size_param;
-        count_exprs[i++] = cur->array.count_expr;
-    }
-    Type* base_sub = Type_Substitute(base, params, args, n);
-
-    if (!base_sub || base_sub->cls != TYPE_STRUCT) { free(count_exprs); free(count_vals); free(size_params); return NULL; }
-    StructDef* esd = Struct_Find(base_sub->struct_name);
-    if (!esd || !esd->is_generic || esd->type_param_count == 0) { free(count_exprs); free(count_vals); free(size_params); return NULL; }
-    if (esd->type_param_count > depth) {
-        // A bare, deliberately-unapplied template (struct_unapplied, from an
-        // HKT slot) with FEWER brackets than its arity is under-applied -- an
-        // error, not a silent fallthrough that leaves it unapplied and
-        // zero-sized. An ordinary generic struct named as an array element
-        // (not struct_unapplied) is genuinely not an HKT here; leave it alone.
-        if (base_sub->struct_unapplied) {
-            fprintf(stderr, "Error: generic struct '%s' expects %zu type arguments, "
-                            "but is applied to only %zu here\n",
-                            esd->name, esd->type_param_count, depth);
-            exit(1);
-        }
-        free(count_exprs); free(count_vals); free(size_params); return NULL;
-    }
-
-    size_t arity = esd->type_param_count;
-    Type** type_args = (Type**)malloc(arity * sizeof(Type*));
-    for (size_t k = 0; k < arity; k++) {
-        Type* ta = count_expr_as_type_arg(count_exprs[k], params, args, n,
-                                          esd->param_kinds ? esd->param_kinds[k] : NULL,
-                                          count_vals[k], size_params[k]);
-        if (!ta) {
-            // A confirmed template short on type-shaped brackets (e.g. M[T][N]
-            // with M arity-2 and N a real value) is an arity error, not a
-            // silent fallthrough to "unapplied" -- that used to read as
-            // sizeof 0 instead of failing.
-            fprintf(stderr, "Error: generic struct '%s' expects %zu type arguments "
-                            "(used as %s[...] here), got fewer -- the remaining "
-                            "bracket(s) are not type-shaped\n",
-                            esd->name, arity, esd->name);
-            exit(1);
-        }
-        type_args[k] = ta;
-    }
-    StructDef* inst = Struct_Instantiate(esd, type_args, arity);
-    free(type_args);
-
-    // Rebuild any remaining OUTER-of-the-consumed-arity levels as genuine
-    // arrays (the brackets nearer the front that weren't needed for arity --
-    // for `M[T][N]` with a 1-ary M, arity consumes count_exprs[0]=T, leaving
-    // count_exprs[1]=N to wrap the instantiated result as a real array dim).
-    Type* result = (Type*)calloc(1, sizeof(Type));
-    result->cls = TYPE_STRUCT;
-    result->struct_name = inst->name;
-    for (size_t k = depth; k > arity; k--) {
-        Type* outer = (Type*)calloc(1, sizeof(Type));
-        outer->cls = TYPE_ARRAY;
-        outer->array.element = result;
-        fold_array_count(count_exprs[k - 1], params, args, n, &outer->array.count, &outer->array.count_expr);
-        result = outer;
-    }
-    free(count_exprs); free(count_vals); free(size_params);
-    return result;
-}
 
 // --- type substitution ---
 Type* Type_Substitute(Type* t, const char** params, Type** args, size_t n) {
@@ -937,30 +874,6 @@ Type* Type_Substitute(Type* t, const char** params, Type** args, size_t n) {
                 // Higher-kinded APPLICATION `M[A, B]`: M binds to a template
                 // (carried as a still-generic / deliberately-unapplied struct),
                 // and app_args are the type/value arguments to apply to it. Now
-                // that M's binding is known, substitute the args under the same
-                // frame and instantiate the template. Comma is the ONLY spelling
-                // (the chained `M[T][U]` form is gone).
-                if (t->app_has_brackets && bound && bound->cls == TYPE_STRUCT && bound->struct_name) {
-                    StructDef* tmpl = Struct_Find(bound->struct_name);
-                    if (tmpl && tmpl->is_generic && tmpl->type_param_count > 0) {
-                        size_t arity = tmpl->type_param_count;
-                        if (t->app_arg_count != arity) {
-                            fprintf(stderr, "Error: higher-kinded application of '%s' "
-                                            "expects %zu argument(s), got %zu\n",
-                                            tmpl->name, arity, t->app_arg_count);
-                            exit(1);
-                        }
-                        Type** sub_args = (Type**)malloc(arity * sizeof(Type*));
-                        for (size_t k = 0; k < arity; k++)
-                            sub_args[k] = Type_Substitute(t->app_args[k], params, args, n);
-                        StructDef* inst = Struct_Instantiate(tmpl, sub_args, arity);
-                        free(sub_args);
-                        Type* r = (Type*)calloc(1, sizeof(Type));
-                        r->cls = TYPE_STRUCT;
-                        r->struct_name = inst->name;
-                        return r;
-                    }
-                }
                 return bound; // replace with concrete type
             }
         }
@@ -972,7 +885,13 @@ Type* Type_Substitute(Type* t, const char** params, Type** args, size_t n) {
         // frame active so its params resolve, then produce a concrete value pinned
         // to the same type. Mirrors the array.count_expr deferral below.
         CeGenericFrame saved = ce_generic_frame_install(params, args, n);
-        Type* pin = t->cval.pin;
+        // The pin may itself reference sibling params in the same generic
+        // (e.g. fn(S*) Option[E*] for a const-generic fn slot F on
+        // Cursor[E,S,F]) -- substitute it through this frame before folding
+        // or storing, same discipline as every other type slot in
+        // Type_Substitute. Without this, clone_ast's LIT_FN_SYMBOL cast for F
+        // keeps the abstract S/E param types and F(&self.state) fails assignability.
+        Type* pin = Type_Substitute(t->cval.pin, params, args, n);
         bool aggregate = Type_IsAggregate(pin);
         Type* r = (Type*)calloc(1, sizeof(Type));
         r->cls = TYPE_CONST_VALUE;
@@ -1006,10 +925,6 @@ Type* Type_Substitute(Type* t, const char** params, Type** args, size_t n) {
     *c = *t;
     if (t->cls == TYPE_POINTER) c->pointer_base = Type_Substitute(t->pointer_base, params, args, n);
     else if (t->cls == TYPE_ARRAY) {
-        // M[T][N] on an unapplied template: see array_substitute_maybe_hkt.
-        Type* hkt = array_substitute_maybe_hkt(t, params, args, n);
-        if (hkt) return hkt;
-
         c->array.element = Type_Substitute(t->array.element, params, args, n);
         if (t->array.count_expr)
             fold_array_count(t->array.count_expr, params, args, n, &c->array.count, &c->array.count_expr);
@@ -1025,7 +940,7 @@ Type* Type_Substitute(Type* t, const char** params, Type** args, size_t n) {
             StructDef* new_sd = Struct_Instantiate(sd->generic_base, new_args, sd->type_arg_count);
             c->struct_name = new_sd->name;
             free(new_args);
-        } else if (sd && sd->is_generic && sd->type_param_count > 0 && !t->struct_unapplied) {
+        } else if (sd && sd->is_generic && sd->type_param_count > 0) {
             // Template struct (e.g. Box): if any of its type_params are in scope,
             // instantiate it with the substituted args. This handles `Box*` self
             // params (self's implicit type is a bare `TYPE_STRUCT{struct_name=Box}`
@@ -1208,9 +1123,28 @@ Type* Type_Substitute_Through_Instance(Type* t, StructDef* sd) {
 char* Method_Mangle(const Type* t, const char* mname, size_t mlen, size_t* out_len) {
     const Type* st = t;
     if (st && st->cls == TYPE_POINTER && st->pointer_base) st = st->pointer_base;
-    if (!st || st->cls != TYPE_STRUCT || !st->struct_name) return NULL;
-    StructDef* sd = Struct_Find(st->struct_name);
-    const char* base_name = (sd && sd->generic_base) ? sd->generic_base->name : st->struct_name;
+    if (!st) return NULL;
+    const char* base_name = NULL;
+    if (st->cls == TYPE_STRUCT && st->struct_name) {
+        StructDef* sd = Struct_Find(st->struct_name);
+        base_name = (sd && sd->generic_base) ? sd->generic_base->name : st->struct_name;
+    } else if (st->cls == TYPE_PRIMITIVE) {
+        switch (st->primitive) {
+            case PRIM_U8: base_name = "u8"; break;
+            case PRIM_U16: base_name = "u16"; break;
+            case PRIM_U32: base_name = "u32"; break;
+            case PRIM_U64: base_name = "u64"; break;
+            case PRIM_I8: base_name = "i8"; break;
+            case PRIM_I16: base_name = "i16"; break;
+            case PRIM_I32: base_name = "i32"; break;
+            case PRIM_I64: base_name = "i64"; break;
+            case PRIM_BOOL: base_name = "bool"; break;
+            case PRIM_F32: base_name = "f32"; break;
+            case PRIM_F64: base_name = "f64"; break;
+            default: break;
+        }
+    }
+    if (!base_name) return NULL;
     size_t blen = strlen(base_name);
     size_t manglen = blen + 1 + mlen;
     char* mangled = (char*)malloc(manglen + 1);
@@ -1265,6 +1199,70 @@ bool try_rewrite_call_operator(ASTNode* node, Type* tgt) {
 void try_rewrite_method_call(ASTNode* node) {
     if (!node->call.target_expr || node->call.target_expr->type != AST_FIELD) return;
     ASTNode* field_node = node->call.target_expr;
+
+    // `Type.method(...)`: the base is a bare TYPE used in expression
+    // position -- parser.c parses any registered struct/enum name there as
+    // AST_TYPE_EXPR (node->sizeof_expr.type), same node produced for `T ==
+    // i32`, NOT as AST_IDENT (types and values are different registries; a
+    // struct name has no Symbol at all). Ordinary Type_Infer hard-errors on
+    // AST_TYPE_EXPR ("a type cannot be used as a value here") -- exactly
+    // like every other legitimate AST_TYPE_EXPR consumer, this must be
+    // checked BEFORE calling Type_Infer below, not after. Anything else
+    // (a real value, a real field access, an instance call) falls through
+    // to the existing path untouched.
+    if (field_node->field.base->type == AST_TYPE_EXPR &&
+        field_node->field.base->sizeof_expr.type &&
+        field_node->field.base->sizeof_expr.type->cls == TYPE_STRUCT) {
+        StructDef* tsd = Struct_Find(field_node->field.base->sizeof_expr.type->struct_name);
+        if (tsd) {
+            size_t manglen = 0;
+            Type synth = {0};
+            synth.cls = TYPE_STRUCT;
+            synth.struct_name = tsd->name;
+            char* mangled = Method_Mangle(&synth, field_node->field.field_name,
+                                          field_node->field.field_name_len, &manglen);
+            if (mangled) {
+                Symbol* msym = SymTable_Find(Get_SymTable(), mangled, manglen);
+                if (msym && msym->kind == SYM_FUNCTION && msym->is_static) {
+                    // No self to inject -- this is a plain direct call under the
+                    // mangled name, args untouched.
+                    node->call.target_expr = NULL;
+                    node->call.target_name = mangled;
+                    node->call.target_name_len = manglen;
+                    node->call.sym = msym;
+                    // Seed the receiver instantiation's own type arguments, the
+                    // same way the instance path does below. A static has no self
+                    // to infer from, so without this its type params can only be
+                    // pinned by its ARGUMENTS -- and a static whose signature does
+                    // not mention them (`A[T, u32 N].step(...)`, iteration's step
+                    // function) had nothing at all to infer from and failed with
+                    // "cannot infer generic type arguments". The value form
+                    // (`A[i32,4].step` with no parens) already carried them; only
+                    // the call form was missing them.
+                    if (tsd->generic_base && tsd->type_arg_count > 0 &&
+                        node->call.type_arg_count == 0) {
+                        node->call.self_type_args = tsd->type_args;
+                        node->call.self_type_arg_count = tsd->type_arg_count;
+                    }
+                    return;
+                }
+                if (msym && msym->kind == SYM_FUNCTION && !msym->is_static) {
+                    char msg[256];
+                    snprintf(msg, sizeof(msg),
+                             "'%.*s' is an instance method of %s, call it as instance.%.*s(...)",
+                             (int)field_node->field.field_name_len, field_node->field.field_name,
+                             tsd->name,
+                             (int)field_node->field.field_name_len, field_node->field.field_name);
+                    Error_AtNode(node, msg, NULL);
+                }
+                free(mangled);
+            }
+            // No such method on this type at all -- fall through to whatever
+            // ordinary error the rest of the compiler gives an unresolved
+            // AST_IDENT with no Symbol (same as today, unchanged).
+        }
+    }
+
     // The receiver may itself be an unresolved generic method call (chained calls
     // on a generic return, e.g. `bb.get().get()`). The inner call needs its own
     // method-call rewrite (to set .sym = Box_get and populate self_type_args) AND
@@ -1278,30 +1276,85 @@ void try_rewrite_method_call(ASTNode* node) {
     }
     Type* bt = Type_Infer(field_node->field.base);
     Type* st = bt;
-    if (st && st->cls == TYPE_POINTER && st->pointer_base &&
-        st->pointer_base->cls == TYPE_STRUCT)
+    if (st && st->cls == TYPE_POINTER && st->pointer_base)
         st = st->pointer_base;
-    if (!st || st->cls != TYPE_STRUCT) return;
-    StructDef* sd = Struct_Find(st->struct_name);
-    StructField* f = sd ? Struct_FindField(sd, field_node->field.field_name,
-                                            field_node->field.field_name_len) : NULL;
-    if (f) return; // real field — leave to normal AST_FIELD resolution
+    if (!st) return;
+    if (st->cls == TYPE_STRUCT) {
+        StructDef* sd = Struct_Find(st->struct_name);
+        StructField* f = sd ? Struct_FindField(sd, field_node->field.field_name,
+                                                field_node->field.field_name_len) : NULL;
+        if (f) return; // real field — leave to normal AST_FIELD resolution
+    }
 
     size_t manglen = 0;
     char* mangled = Method_Mangle(st, field_node->field.field_name, field_node->field.field_name_len, &manglen);
     if (!mangled) return; // st isn't struct-shaped enough for Method_Mangle -- same bail as before
     Symbol* msym = SymTable_Find(Get_SymTable(), mangled, manglen);
+
+    ASTNode* base_arg = field_node->field.base;
+    StructDef* sd = (st->cls == TYPE_STRUCT) ? Struct_Find(st->struct_name) : NULL;
+    StructDef* target_sd = sd;
+
+    if ((!msym || msym->kind != SYM_FUNCTION) && sd) {
+        // Method not found directly on `st`. Check if `sd` has a `super` field!
+        for (size_t i = 0; i < sd->field_count; i++) {
+            StructField* sf = &sd->fields[i];
+            if (sf->is_super_alias || sf->is_super_param) {
+                Type* super_t = sf->type;
+                if (super_t && super_t->cls == TYPE_POINTER) super_t = super_t->pointer_base;
+                if (super_t && super_t->cls == TYPE_STRUCT && super_t->struct_name) {
+                    size_t super_manglen = 0;
+                    char* super_mangled = Method_Mangle(super_t, field_node->field.field_name, field_node->field.field_name_len, &super_manglen);
+                    if (super_mangled) {
+                        Symbol* super_msym = SymTable_Find(Get_SymTable(), super_mangled, super_manglen);
+                        if (super_msym && super_msym->kind == SYM_FUNCTION) {
+                            free(mangled);
+                            mangled = super_mangled;
+                            manglen = super_manglen;
+                            msym = super_msym;
+
+                            ASTNode* super_field_access = (ASTNode*)calloc(1, sizeof(ASTNode));
+                            super_field_access->type = AST_FIELD;
+                            super_field_access->field.base = field_node->field.base;
+                            super_field_access->field.field_name = strdup(sf->name);
+                            super_field_access->field.field_name_len = strlen(sf->name);
+
+                            base_arg = super_field_access;
+                            bt = super_t;
+                            target_sd = Struct_Find(super_t->struct_name);
+                            break;
+                        }
+                        free(super_mangled);
+                    }
+                }
+            }
+        }
+    }
+
     if (!msym || msym->kind != SYM_FUNCTION) { free(mangled); return; }
+
+    if (msym->is_static) {
+        // `instance.static_method()` -- static methods take no self, so
+        // there is nothing to inject and no receiver to route through the
+        // instance-call desugaring below. Reject explicitly rather than
+        // silently dropping `base_arg` and calling it anyway.
+        char msg[256];
+        snprintf(msg, sizeof(msg),
+                 "static method '%.*s' must be called as Type.%.*s(...), not through an instance",
+                 (int)field_node->field.field_name_len, field_node->field.field_name,
+                 (int)field_node->field.field_name_len, field_node->field.field_name);
+        Error_AtNode(node, msg, NULL);
+    }
 
     size_t old_argc = node->call.arg_count;
     ASTNode** new_args = (ASTNode**)malloc((old_argc + 1) * sizeof(ASTNode*));
     ASTNode* self_arg;
     if (bt && bt->cls == TYPE_POINTER) {
-        self_arg = field_node->field.base;
+        self_arg = base_arg;
     } else {
         self_arg = (ASTNode*)calloc(1, sizeof(ASTNode));
         self_arg->type = AST_ADDR;
-        self_arg->unary = field_node->field.base;
+        self_arg->unary = base_arg;
     }
     new_args[0] = self_arg;
     for (size_t i = 0; i < old_argc; i++) new_args[i + 1] = node->call.args[i];
@@ -1366,6 +1419,24 @@ static bool rewrite_operand_to_method_call(ASTNode* node, ASTNode* recv, ASTNode
     if (recv->type == AST_TYPE_EXPR || (arg && arg->type == AST_TYPE_EXPR)) return false;
     Type* rt = Type_Infer(recv);
     if (!rt) return false;
+
+    // An operator overload belongs to the STRUCT that declares it, so it can only
+    // dispatch when the receiver is that struct BY VALUE. A pointer receiver is
+    // never an overload site: `p != null`, `p == q`, `p + 1` are the language's
+    // own pointer operators, and pointer arithmetic/comparison is defined for
+    // every pointer type regardless of what its pointee happens to declare.
+    //
+    // Without this, Method_Resolve auto-derefs the pointer to find the pointee's
+    // method and hijacks the comparison. It bit exactly where it hurts most: a
+    // destructor's own null-guard. In `Vector[Vector[u8]].__delete`, `self.data`
+    // is a `Vector[u8]*`, so `self.data != null` resolved to Vector[u8]'s __neq
+    // and passed `null` as its Vector operand -- the guard that exists to stop a
+    // double free became a call INTO the type being freed. That is why a
+    // Vector[Vector[u8]] crashed merely because __neq was DEFINED (never called),
+    // and why rewriting the guard as `== null` made it vanish: __eq was reached
+    // through the same hole, but the arms happened to fall the other way.
+    if (rt->cls == TYPE_POINTER) return false;
+
     Symbol* msym = Method_Resolve(rt, mname, strlen(mname));
     if (!msym) return false;
 
@@ -1384,6 +1455,10 @@ static bool rewrite_operand_to_method_call(ASTNode* node, ASTNode* recv, ASTNode
     // left the other two free to rewrite (and corrupt) an ordinary assignment
     // whenever THEY happened to visit the node first.
     if (node->type == AST_ASSIGN) {
+        if (node->binary.is_init) {
+            Type* arg_t = Type_Infer(arg);
+            if (arg_t && Type_Equals(rt, arg_t)) return false; // Same-type initialization (T x = val) MUST NOT dispatch to __assign!
+        }
         if (!msym->type || msym->type->cls != TYPE_FUNCTION ||
             msym->type->function.param_count < 2) {
             return false;
@@ -1435,10 +1510,28 @@ static bool rewrite_operand_to_method_call(ASTNode* node, ASTNode* recv, ASTNode
                     }
                     if (all_fields_exist && arg->struct_lit.count > 0) return false;
                 } else if (arg->type == AST_ARRAY_LITERAL && !arg->array_lit.elem_type &&
-                           arg->array_lit.count <= rt_sd_for_check->field_count) {
+                           arg->array_lit.count <= rt_sd_for_check->field_count &&
+                           param_t->cls != TYPE_ARRAY) {
                     return false;
                 }
             }
+        }
+        // resolve_brace_literal writes the literal's element count back into
+        // target->array.count when the target's size is inferred (`T[N]` with
+        // N not yet pinned, count==0/count_expr==NULL — see its own comment).
+        // param_t here is __assign's DECLARED parameter type, read straight off
+        // msym's cached signature and shared by every call site that resolves
+        // against this same __assign. Left un-cloned, the first `w = {1,2,3,4}`
+        // would permanently bake count=4 into that shared Type*, so a later
+        // `w = {9,9}` on the same (or any other) variable would wrongly be
+        // checked against a pinned-4 array instead of getting its own N.
+        // Clone just the array-type shell (element pointer is shared/read-only,
+        // fine to alias) so the mutation lands on a throwaway copy local to
+        // this one assignment.
+        if (param_t->cls == TYPE_ARRAY && param_t->array.count == 0 && !param_t->array.count_expr) {
+            Type* param_t_copy = (Type*)malloc(sizeof(Type));
+            *param_t_copy = *param_t;
+            param_t = param_t_copy;
         }
         resolve_brace_literal(arg, param_t);
         bool matches = false;
@@ -1452,7 +1545,18 @@ static bool rewrite_operand_to_method_call(ASTNode* node, ASTNode* recv, ASTNode
         } else {
             matches = check_assignable_ne(param_t, arg, "__assign argument");
         }
-        if (!matches) return false;
+        if (!matches) {
+            if (!node->binary.is_init && param_t && param_t->cls == TYPE_POINTER) {
+                char msg[256];
+                char pt_buf[128], arg_buf[128];
+                Type_ToString(param_t, pt_buf, sizeof(pt_buf));
+                Type* arg_t = Type_Infer(arg);
+                Type_ToString(arg_t ? arg_t : (Type*)NULL, arg_buf, sizeof(arg_buf));
+                snprintf(msg, sizeof(msg), "__assign expects pointer '%s', got '%s' — use & for assignment", pt_buf, arg_buf);
+                Error_AtNode(node, msg, NULL);
+            }
+            return false;
+        }
     }
 
     ASTNode* target = (ASTNode*)calloc(1, sizeof(ASTNode));
@@ -1502,6 +1606,14 @@ bool try_rewrite_operator_method(ASTNode* node) {
 // try_rewrite_operator_method (see that function's own comment).
 bool try_rewrite_index_method(ASTNode* node) {
     if (node->type != AST_INDEX) return false;
+    Type* rt = Type_Infer(node->index.base);
+    if (rt && (rt->cls == TYPE_ARRAY || rt->cls == TYPE_POINTER)) {
+        // Raw array/pointer indexing already has built-in semantics; do not
+        // rewrite it to a __index method call. This avoids treating a pointer
+        // to a struct like Vector[u8]* as a method receiver and collapsing
+        // pointer indexing to the struct's own __index semantics.
+        return false;
+    }
     return rewrite_operand_to_method_call(node, node->index.base, node->index.index, "__index");
 }
 
@@ -1524,7 +1636,7 @@ bool try_rewrite_index_method(ASTNode* node) {
 // garbage/wrong union fields if `node` has already become AST_DEREF by the
 // time they run. So this is a SEPARATE step, applied once after the call is
 // fully resolved, not folded into try_rewrite_index_method itself.
-static void wrap_index_result_deref(ASTNode* node) {
+void wrap_index_result_deref(ASTNode* node) {
     if (node->type != AST_CALL || node->call.index_deref_wrapped) return;
     // try_rewrite_method_call (already run by the caller before this) resolves
     // target_expr's AST_FIELD to a mangled direct-call symbol and clears
@@ -1745,7 +1857,20 @@ Type* Type_Infer(ASTNode* node) {
 
         case AST_DEREF: {
             Type* base = Type_Infer(node->unary);
-            t = (base && base->cls == TYPE_POINTER) ? base->pointer_base : NULL;
+            if (base && base->cls == TYPE_POINTER) {
+                t = base->pointer_base;
+            } else if (base && base->cls == TYPE_STRUCT) {
+                Symbol* msym = Method_Resolve(base, "__deref", 7);
+                if (msym && msym->type && msym->type->cls == TYPE_FUNCTION && msym->type->function.return_type) {
+                    Type* ret = msym->type->function.return_type;
+                    ret = Type_Substitute_Through_Instance(ret, Struct_Find(base->struct_name));
+                    t = (ret->cls == TYPE_POINTER) ? ret->pointer_base : ret;
+                } else {
+                    t = NULL;
+                }
+            } else {
+                t = NULL;
+            }
             break;
         }
 
@@ -1777,6 +1902,39 @@ Type* Type_Infer(ASTNode* node) {
                 Error_AtNode(node, msg, NULL);
             }
             StructField* f = Struct_FindField(sd, node->field.field_name, node->field.field_name_len);
+            if (!f && bt && bt->cls == TYPE_STRUCT && Method_Resolve(bt, "__deref", 7)) {
+                Symbol* msym = Method_Resolve(bt, "__deref", 7);
+                if (msym && msym->type && msym->type->cls == TYPE_FUNCTION && msym->type->function.return_type) {
+                    Type* ret = msym->type->function.return_type;
+                    ret = Type_Substitute_Through_Instance(ret, Struct_Find(bt->struct_name));
+                    Type* deref_t = (ret->cls == TYPE_POINTER) ? ret->pointer_base : ret;
+                    if (deref_t && deref_t->cls == TYPE_STRUCT) {
+                        StructDef* dsd = Struct_Find(deref_t->struct_name);
+                        if (dsd) {
+                            f = Struct_FindField(dsd, node->field.field_name, node->field.field_name_len);
+                            if (f) {
+                                ASTNode* df = (ASTNode*)calloc(1, sizeof(ASTNode));
+                                df->type = AST_FIELD;
+                                df->field.base = node->field.base;
+                                df->field.field_name = "__deref";
+                                df->field.field_name_len = 7;
+                                df->line = node->line;
+                                df->column = node->column;
+                                
+                                ASTNode* dcall = (ASTNode*)calloc(1, sizeof(ASTNode));
+                                dcall->type = AST_CALL;
+                                dcall->call.target_expr = df;
+                                dcall->line = node->line;
+                                dcall->column = node->column;
+                                
+                                Typecheck_Tree(dcall);
+                                node->field.base = dcall;
+                                sd = dsd;
+                            }
+                        }
+                    }
+                }
+            }
             if (!f) {
                 char msg[192];
                 snprintf(msg, sizeof(msg), "%s '%s' has no field '%.*s'", sd->is_overlapping ? "union" : "struct", sd->name,
@@ -1807,8 +1965,9 @@ Type* Type_Infer(ASTNode* node) {
 
         case AST_INDEX: {
             Type* base = Type_Infer(node->index.base);
-            if (base && base->cls == TYPE_ARRAY) t = base->array.element;
-            else if (base && base->cls == TYPE_POINTER) {
+            if (base && base->cls == TYPE_ARRAY) {
+                t = base->array.element;
+            } else if (base && base->cls == TYPE_POINTER) {
                 // "array indexing auto-derefs through a pointer" (specs.md §8):
                 // p[i] means (*p)[i]. When the pointee is itself an array type
                 // (e.g. p: u32[8]*), the element we want is the pointee
@@ -1817,12 +1976,22 @@ Type* Type_Infer(ASTNode* node) {
                 Type* pointee = base->pointer_base;
                 t = (pointee && pointee->cls == TYPE_ARRAY) ? pointee->array.element : pointee;
             }
-            else { Error_AtNode(node, "indexing a non-array, non-pointer", NULL); }
+            else {
+                Error_AtNode(node, "indexing a non-array, non-pointer", NULL);
+            }
             break;
         }
 
         case AST_ARRAY_LITERAL:
-            t = node->result_type; // set at parse time (full array type w/ resolved size)
+            if (node->result_type) {
+                t = node->result_type;
+            } else if (node->array_lit.elem_type) {
+                t = (Type*)calloc(1, sizeof(Type));
+                t->cls = TYPE_ARRAY;
+                t->array.element = node->array_lit.elem_type;
+                t->array.count = node->array_lit.count;
+                node->result_type = t;
+            }
             break;
 
         case AST_SIZEOF:
@@ -2211,8 +2380,10 @@ void infer_generic(ASTNode* node, Type* target) {
         // __index call site already gets. A non-generic Fixed.__index bails
         // at the very next line (`!generic_decl`), so tucking this after
         // those checks would silently skip the non-generic case entirely.
-        wrap_index_result_deref(node);
-        if (node->call.type_arg_count > 0) return; // already explicit
+        if (node->call.type_arg_count > 0) {
+            wrap_index_result_deref(node);
+            return; // already explicit
+        }
         if (!node->call.sym || !node->call.sym->generic_decl) return; // not generic
         if (!node->call.sym->type || node->call.sym->type->cls != TYPE_FUNCTION) return;
 
@@ -2328,6 +2499,7 @@ void infer_generic(ASTNode* node, Type* target) {
         } else {
             free(inferred_args);
         }
+        wrap_index_result_deref(node);
         return;
     }
 
@@ -2426,6 +2598,26 @@ static bool anon_structs_field_type_compatible(const Type* dst, const Type* src)
     if (!dsd->is_anonymous || !ssd->is_anonymous) return false;
     if (dsd->is_overlapping != ssd->is_overlapping) return false;
     if (dsd->field_count != ssd->field_count) return false;
+    // Positional-only relaxation. A field written with no name gets a
+    // synthesized `_N` placeholder, so "is this side positional" is exactly
+    // "are its field names _0, _1, ...".
+    //
+    // The relaxation exists for pack-synthesized bundles (`V... fns`, which are
+    // always positional) flowing into a named-field target -- REFERENCE.md's
+    // hand-built existential showcase depends on it. It must NOT extend to two
+    // sides that both NAME their fields differently: `struct{f32 x  f32 y}` and
+    // `struct{f32 lat  f32 lon}` are different types, and assignment already
+    // rejects that pair. Letting a CALL perform the same conversion was a hole
+    // -- screen coordinates silently read as latitude/longitude, no diagnostic.
+    bool dst_positional = true;
+    bool src_positional = true;
+    for (size_t i = 0; i < dsd->field_count; i++) {
+        char pn[24];
+        snprintf(pn, sizeof(pn), "_%zu", i);
+        if (dsd->fields[i].name && strcmp(dsd->fields[i].name, pn) != 0) dst_positional = false;
+        if (ssd->fields[i].name && strcmp(ssd->fields[i].name, pn) != 0) src_positional = false;
+    }
+    if (!dst_positional && !src_positional) return false;
     for (size_t i = 0; i < dsd->field_count; i++) {
         Type* dft = dsd->fields[i].type;
         Type* sft = (dft->cls != TYPE_FN_LITERAL) ? fn_lit_shape(ssd->fields[i].type) : ssd->fields[i].type;
@@ -2508,6 +2700,7 @@ static bool check_assignable_ne(Type* dst, ASTNode* src, const char* where) {
         anon_structs_field_type_compatible(dst, cmp_st)) return true;
 
     if (Type_Equals(dst, cmp_st)) return true;
+
     // User requested to relax the strict assignability check.
     // Allow implicit primitive coercions (like C).
     return dst->cls == TYPE_PRIMITIVE && cmp_st->cls == TYPE_PRIMITIVE;
@@ -2521,6 +2714,37 @@ static bool check_assignable_ne(Type* dst, ASTNode* src, const char* where) {
 // pure message selection on a known-failing case).
 static void check_assignable(Type* dst, ASTNode* src, const char* where) {
     if (check_assignable_ne(dst, src, where)) return;
+
+    // Doesn't fit -- but if the SOURCE type declares a __cast, convert instead of
+    // erroring. Primitives already coerce implicitly (check_assignable_ne's last
+    // line); this extends the same "try a conversion, then bail" rule to any type
+    // that opted in by writing __cast.
+    //
+    // It lives HERE, in the one shared checker, rather than at the call-argument
+    // site: assignability is also decided for a declaration, a return, a struct
+    // field, an array element and an assignment, and a conversion that worked for
+    // arguments alone would be an arbitrary special case.
+    //
+    // A real AST_CAST is inserted, not merely a relaxed check -- permitting the
+    // mismatch alone let the destination reinterpret the source's raw bytes (a
+    // Wrap{junk,real} read as Small{v} yielded `junk`), which is silent wrongness
+    // rather than a conversion. `src` is rewritten IN PLACE so every caller sees
+    // the converted node without knowing this happened.
+    if (src && dst) {
+        Type* st0 = Type_Infer(src);
+        if (st0 && st0->cls == TYPE_STRUCT && Method_Resolve(st0, "__cast", 6)) {
+            ASTNode* inner = (ASTNode*)malloc(sizeof(ASTNode));
+            *inner = *src;
+            src->type = AST_CAST;
+            src->cast.target_type = dst;
+            src->cast.expr = inner;
+            if (try_rewrite_cast_operator(src)) {
+                Typecheck_Tree(src);
+                return;
+            }
+            *src = *inner;   // no usable __cast for this target -- restore and error
+        }
+    }
 
     if (src && src->type == AST_TYPE_EXPR) {
         char msg[160];
@@ -2664,14 +2888,138 @@ static bool reflect_match_select(ASTNode* node) {
     return true;
 }
 
+// Does this subtree `return <sym>` by name anywhere inside it?
+//
+// A local that a function hands back must NOT get a scope-exit destructor:
+// the value escapes, and destroying it here would free storage the caller is
+// about to receive (use-after-free), then free it again when the caller's own
+// scope ends (double free).
+//
+// This deliberately walks the WHOLE subtree rather than only inspecting the
+// block's final statement. An early `return r` guarded by an `if` is still a
+// return of `r`, even when other statements follow it:
+//
+//     R r = {...}
+//     if cond { return r }   // <- escapes here
+//     R other = {...}
+//     return other           // <- the old check only ever saw THIS one
+//
+// Any return-by-name suppresses the destructor for that symbol, so this
+// errs toward leaking (a return the value never reaches at runtime) rather
+// than toward a double free. Leaking is recoverable; freeing twice is not.
+static bool returns_symbol(ASTNode* n, Symbol* sym) {
+    if (!n || !sym) return false;
+
+    if (n->type == AST_RETURN) {
+        ASTNode* rv = n->unary;
+        return rv && rv->type == AST_IDENT && rv->ident.sym == sym;
+    }
+
+    switch (n->type) {
+        case AST_BLOCK:
+            for (size_t i = 0; i < n->block.count; i++) {
+                if (returns_symbol(n->block.statements[i], sym)) return true;
+            }
+            return false;
+        case AST_IF:
+            return returns_symbol(n->if_stmt.true_block, sym) ||
+                   returns_symbol(n->if_stmt.false_block, sym);
+        case AST_WHILE:
+            return returns_symbol(n->while_stmt.body, sym);
+        case AST_FOR:
+            return returns_symbol(n->for_stmt.body, sym);
+        case AST_DEFER:
+            return returns_symbol(n->unary, sym);
+        case AST_MATCH:
+            // A value `match` that has not been lowered to an if-chain yet
+            // (Lower_Match runs during typecheck). Statements are walked here
+            // AFTER Typecheck_Tree, so an arm usually arrives already lowered
+            // into AST_IF above -- this covers the un-lowered shape too, so a
+            // `return r` inside an arm suppresses the destructor either way.
+            for (size_t i = 0; i < n->match_stmt.arm_count; i++) {
+                if (returns_symbol(n->match_stmt.arm_bodies[i], sym)) return true;
+            }
+            return false;
+        default:
+            return false;
+    }
+}
+
 void Typecheck_Tree(ASTNode* node) {
     if (!node) return;
 
     switch (node->type) {
-        case AST_BLOCK:
-            for (size_t i = 0; i < node->block.count; i++)
-                Typecheck_Tree(node->block.statements[i]);
+        case AST_BLOCK: {
+            for (size_t i = 0; i < node->block.count; i++) {
+                ASTNode* stmt = node->block.statements[i];
+                Typecheck_Tree(stmt);
+                
+                if (!node->block.transparent) {
+                    ASTNode* decl = NULL;
+                    if (stmt) {
+                        if (stmt->type == AST_DECLARATION) {
+                            decl = stmt;
+                        } else if (stmt->type == AST_BLOCK && stmt->block.transparent && 
+                                   stmt->block.count > 0 && stmt->block.statements[0]->type == AST_DECLARATION) {
+                            decl = stmt->block.statements[0];
+                        }
+                    }
+                    
+                    if (decl) {
+                        Type* vt = decl->decl.var_type;
+                        // Don't destruct a local that this block returns by name --
+                        // anywhere in the block, not merely as its last statement
+                        // (see returns_symbol).
+                        bool is_return_value = false;
+                        for (size_t j = 0; j < node->block.count; j++) {
+                            if (returns_symbol(node->block.statements[j], decl->decl.sym)) {
+                                is_return_value = true;
+                                break;
+                            }
+                        }
+                        if (vt && vt->cls == TYPE_STRUCT && !is_return_value && Method_Resolve(vt, "__delete", 8)) {
+                            ASTNode* ident = (ASTNode*)calloc(1, sizeof(ASTNode));
+                            ident->type = AST_IDENT;
+                            ident->ident.name = decl->decl.name;
+                            ident->ident.name_len = decl->decl.name_len;
+                            ident->ident.sym = decl->decl.sym;
+                            ident->line = decl->line;
+                            ident->column = decl->column;
+                            
+                            ASTNode* field = (ASTNode*)calloc(1, sizeof(ASTNode));
+                            field->type = AST_FIELD;
+                            field->field.base = ident;
+                            field->field.field_name = "__delete";
+                            field->field.field_name_len = 8;
+                            field->line = decl->line;
+                            field->column = decl->column;
+                            
+                            ASTNode* call = (ASTNode*)calloc(1, sizeof(ASTNode));
+                            call->type = AST_CALL;
+                            call->call.target_expr = field;
+                            call->line = decl->line;
+                            call->column = decl->column;
+                            Typecheck_Tree(call);
+                            
+                            ASTNode* defer_node = (ASTNode*)calloc(1, sizeof(ASTNode));
+                            defer_node->type = AST_DEFER;
+                            defer_node->unary = call;
+                            defer_node->line = decl->line;
+                            defer_node->column = decl->column;
+                            
+                            node->block.count++;
+                            node->block.statements = realloc(node->block.statements, node->block.count * sizeof(ASTNode*));
+                            for (size_t j = node->block.count - 1; j > i + 1; j--) {
+                                node->block.statements[j] = node->block.statements[j - 1];
+                            }
+                            node->block.statements[i + 1] = defer_node;
+                            i++;
+                        }
+                    }
+                }
+            }
             return;
+        }
 
         case AST_FUNC_DECL: {
             if (node->func_decl.type_param_count > 0) return;
@@ -2821,7 +3169,11 @@ void Typecheck_Tree(ASTNode* node) {
             Typecheck_Tree(node->delete_expr.ptr);
             Type* pt = Type_Infer(node->delete_expr.ptr);
             Type* pointee = (pt && pt->cls == TYPE_POINTER) ? pt->pointer_base : NULL;
-            if (pointee && pointee->cls == TYPE_STRUCT &&
+            // `delete[] p` destroys EVERY element, which needs a runtime loop over
+            // the cookie's count -- emitted directly by the backend rather than
+            // desugared here, since this rewrite can only express a single call.
+            if (!node->delete_expr.is_array &&
+                pointee && pointee->cls == TYPE_STRUCT &&
                 Method_Resolve(pointee, "__delete", 8)) {
                 ASTNode* target = (ASTNode*)calloc(1, sizeof(ASTNode));
                 target->type = AST_FIELD;
@@ -2949,6 +3301,7 @@ void Typecheck_Tree(ASTNode* node) {
                 size_t pcount = 0;
                 bool is_vararg = false;
                 bool can_check_params = false;
+                Symbol* inst_sym = NULL;
 
                 if (has_sym && (!is_generic || generic_resolved)) {
                     can_check_params = true;
@@ -2956,8 +3309,8 @@ void Typecheck_Tree(ASTNode* node) {
                     is_vararg = node->call.sym->type->function.is_vararg;
 
                     if (generic_resolved) {
-                        Generic_Instantiate(node->call.sym, node->call.type_args, node->call.type_arg_count);
                         ASTNode* gdecl = node->call.sym->generic_decl;
+                        inst_sym = Generic_Instantiate(node->call.sym, node->call.type_args, node->call.type_arg_count);
                         ptypes = (Type**)malloc(pcount * sizeof(Type*));
                         for (size_t i = 0; i < pcount; i++) {
                             ptypes[i] = Type_Substitute(
@@ -2989,9 +3342,20 @@ void Typecheck_Tree(ASTNode* node) {
                 }
 
                 if (can_check_params) {
+                    Symbol* call_sym = inst_sym ? inst_sym : node->call.sym;
+                    ASTNode* fdecl_node = (call_sym && call_sym->func_decl) ? call_sym->func_decl : NULL;
+                    ASTNode** pdefaults = fdecl_node ? fdecl_node->func_decl.param_defaults : NULL;
+                    int pack_idx = fdecl_node ? fdecl_node->func_decl.pack_param_index : -1;
+
+                    expand_call_default_args(node, pdefaults, pcount, pack_idx, ptypes);
+
                     if (is_vararg) {
                         if (node->call.arg_count < pcount) {
                             Error_AtNode(node, "not enough arguments to vararg function", NULL);
+                        }
+                    } else if (pack_idx >= 0) {
+                        if (node->call.arg_count < (size_t)pack_idx) {
+                            Error_AtNode(node, "not enough arguments for function with pack parameter", NULL);
                         }
                     } else {
                         if (node->call.arg_count != pcount) {
@@ -3065,6 +3429,36 @@ void Typecheck_Tree(ASTNode* node) {
         case AST_DEREF: {
             Typecheck_Tree(node->unary);
             Type* base = Type_Infer(node->unary);
+            if (base && base->cls == TYPE_STRUCT && Method_Resolve(base, "__deref", 7)) {
+                ASTNode* field = (ASTNode*)calloc(1, sizeof(ASTNode));
+                field->type = AST_FIELD;
+                field->field.base = node->unary;
+                field->field.field_name = "__deref";
+                field->field.field_name_len = 7;
+                field->line = node->line;
+                field->column = node->column;
+                
+                ASTNode* call = (ASTNode*)calloc(1, sizeof(ASTNode));
+                call->type = AST_CALL;
+                call->call.target_expr = field;
+                call->line = node->line;
+                call->column = node->column;
+                
+                Typecheck_Tree(call);
+                Type* ret_t = Type_Infer(call);
+                if (ret_t && ret_t->cls == TYPE_POINTER) {
+                    ASTNode* deref = (ASTNode*)calloc(1, sizeof(ASTNode));
+                    deref->type = AST_DEREF;
+                    deref->unary = call;
+                    deref->line = node->line;
+                    deref->column = node->column;
+                    *node = *deref;
+                } else {
+                    *node = *call;
+                }
+                Type_Infer(node);
+                return;
+            }
             // *expr requires expr to be a pointer. Type_Infer's own AST_DEREF case
             // already detects this (returns NULL when base isn't TYPE_POINTER) but
             // treats it as "type unknown" rather than an error — every downstream
@@ -3208,7 +3602,44 @@ void Typecheck_Tree(ASTNode* node) {
             }
             return;
 
+        case AST_STATIC_ASSERT: {
+            // Checked HERE, not at parse time: a `match T` arm is selected during
+            // typecheck, and an assert in an arm that was never taken must not
+            // fire. By this point the surrounding arm is known to be live.
+            int64_t v = 0;
+            if (!ConstEval(node->static_assert_expr.cond, &v)) {
+                Error_AtNode(node, "static_assert condition is not a compile-time constant", NULL);
+            }
+            if (v == 0) {
+                char buf[320];
+                if (node->static_assert_expr.msg)
+                    snprintf(buf, sizeof(buf), "static assertion failed: %.*s",
+                             (int)node->static_assert_expr.msg_len, node->static_assert_expr.msg);
+                else
+                    snprintf(buf, sizeof(buf), "static assertion failed");
+                Error_AtNode(node, buf, NULL);
+            }
+            // Satisfied: becomes an empty block, so codegen emits nothing.
+            node->type = AST_BLOCK;
+            node->block.statements = NULL;
+            node->block.count = 0;
+            node->block.capacity = 0;
+            return;
+        }
+
         case AST_INDEX:
+            // Rewrite `v[i]` to `v.__index(i)` BEFORE recursing, the same way
+            // AST_CALL rewrites a method call before typechecking its target.
+            // Recursing first typechecks the operands of a node that is about to
+            // stop being an AST_INDEX at all, and the rewritten call then never
+            // gets the AST_CALL treatment -- so a `__index` body that calls a
+            // sibling method (`self.helper()`) resolved as a bare field access
+            // and failed with "has no field 'helper'". __eq and friends were
+            // unaffected because their rewrite already ran ahead of the recursion.
+            if (try_rewrite_index_method(node)) {
+                Typecheck_Tree(node);
+                return;
+            }
             Typecheck_Tree(node->index.base);
             Typecheck_Tree(node->index.index);
             Type_Infer(node);
@@ -3573,6 +4004,36 @@ static Symbol* clone_symbol(Symbol* s, const char** params, Type** args, size_t 
     return c;
 }
 
+static ASTNode* eval_const_in_frame(ASTNode* expr, const char** params, Type** args, size_t np, const char* err_msg) {
+    CeGenericFrame saved = ce_generic_frame_install(params, args, np);
+    int64_t v = 0;
+    s_ce_isfloat = false;
+    s_ce_isfnsym = false;
+    bool ok = ConstEval(expr, &v);
+    bool was_float = s_ce_isfloat;
+    bool was_fnsym = s_ce_isfnsym;
+    ce_generic_frame_restore(saved);
+
+    ASTNode* lit = (ASTNode*)calloc(1, sizeof(ASTNode));
+    lit->type = AST_INT_LITERAL;
+    if (!ok) {
+        if (err_msg) fprintf(stderr, "%s\n", err_msg);
+        lit->lit_kind = LIT_INT;
+        lit->int_value = 0;
+    } else if (was_float) {
+        lit->lit_kind = LIT_FLOAT;
+        double d; memcpy(&d, &v, sizeof d);
+        lit->float_value = d;
+    } else if (was_fnsym) {
+        lit->lit_kind = LIT_FN_SYMBOL;
+        lit->int_value = (uint64_t)v;
+    } else {
+        lit->lit_kind = LIT_INT;
+        lit->int_value = (uint64_t)v;
+    }
+    return lit;
+}
+
 ASTNode* clone_ast(ASTNode* n, const char** params, Type** args, size_t np, bool clone_symbols) {
     if (!n) return NULL;
     ASTNode* c = (ASTNode*)calloc(1, sizeof(ASTNode));
@@ -3584,31 +4045,13 @@ ASTNode* clone_ast(ASTNode* n, const char** params, Type** args, size_t np, bool
             break;
         case AST_SIZEOF:
         case AST_ALIGNOF:
-            c->sizeof_expr.type = Type_Substitute(n->sizeof_expr.type, params, args, np);
-            break;
-        case AST_OFFSETOF: {
-            Type* st = Type_Substitute(n->field_ref_expr.type, params, args, np);
-            c->field_ref_expr.type = st;
-            c->field_ref_expr.index_expr = clone_ast(n->field_ref_expr.index_expr, params, args, np, clone_symbols);
-            break;
-        }
-        case AST_NAMEOF: {
-            Type* st = Type_Substitute(n->field_ref_expr.type, params, args, np);
-            c->field_ref_expr.type = st;
-            c->field_ref_expr.index_expr = clone_ast(n->field_ref_expr.index_expr, params, args, np, clone_symbols);
-            break;
-        }
         case AST_TYPE_EXPR:
-            // Same field, same substitution as AST_SIZEOF right above — a bare
-            // type-param reference used as an expression (T == i32) must become
-            // fully concrete at monomorphization time, exactly like every other
-            // node that mentions a generic param. Without this, T stayed an
-            // abstract TYPE_PARAM reference all the way to codegen, which has
-            // no case for it at all (unlike AST_SIZEOF, which always folds away
-            // via ConstEval before codegen, or has its own real codegen case
-            // for the few situations where it can't) — that unconcretized node
-            // reaching compile_node_ctx was the actual cause of a real crash.
             c->sizeof_expr.type = Type_Substitute(n->sizeof_expr.type, params, args, np);
+            break;
+        case AST_OFFSETOF:
+        case AST_NAMEOF:
+            c->field_ref_expr.type = Type_Substitute(n->field_ref_expr.type, params, args, np);
+            c->field_ref_expr.index_expr = clone_ast(n->field_ref_expr.index_expr, params, args, np, clone_symbols);
             break;
         case AST_IDENT: {
             // Check if this ident refers to a const generic parameter
@@ -3728,6 +4171,16 @@ ASTNode* clone_ast(ASTNode* n, const char** params, Type** args, size_t np, bool
         case AST_LOGICAL_NOT: case AST_BIT_NOT: case AST_DEREF: case AST_ADDR: case AST_RETURN:
             c->unary = clone_ast(n->unary, params, args, np, clone_symbols);
             break;
+        case AST_STATIC_ASSERT:
+            // The condition must be substituted like any other expression, or a
+            // generic's assert sees the un-instantiated `T`: `static_assert(
+            // sizeof(T) == 8)` inside `fn g[T]()` reported "condition is not a
+            // compile-time constant" even though the same expression folds fine
+            // once T is written out. Missing this case meant the clone shared
+            // the TEMPLATE's condition node.
+            c->static_assert_expr.cond =
+                clone_ast(n->static_assert_expr.cond, params, args, np, clone_symbols);
+            break;
         case AST_CAST:
             c->cast.target_type = Type_Substitute(n->cast.target_type, params, args, np);
             c->cast.expr = clone_ast(n->cast.expr, params, args, np, clone_symbols);
@@ -3736,98 +4189,18 @@ ASTNode* clone_ast(ASTNode* n, const char** params, Type** args, size_t np, bool
             c->decl.var_type = Type_Substitute(n->decl.var_type, params, args, np);
             c->decl.init_expr = clone_ast(n->decl.init_expr, params, args, np, clone_symbols);
             c->decl.sym = clone_symbol(n->decl.sym, params, args, np, clone_symbols);
-            // A `const` deferred from parse time because its initializer
-            // mentioned a generic param (see parser.c parse_const_decl). Now
-            // that this clone belongs to one concrete instantiation, params/args
-            // hold real values, so fold it the same way Type_Substitute folds a
-            // deferred TYPE_CONST_VALUE (types.c): same frame convention, same
-            // ConstEval call, just applied to a statement's init_expr instead of
-            // a type's count_expr. Bake the result in as a literal so any later
-            // use of this name within the clone (e.g. as an array size) sees a
-            // concrete, per-instantiation value instead of a runtime expr.
             if (n->decl.is_generic_const) {
-                CeGenericFrame saved = ce_generic_frame_install(params, args, np);
-                int64_t v;
-                s_ce_isfloat = false;
-                s_ce_isfnsym = false;
-                bool ok = ConstEval(c->decl.init_expr, &v);
-                bool was_float = s_ce_isfloat;
-                bool was_fnsym = s_ce_isfnsym;
-                ce_generic_frame_restore(saved);
-                if (!ok) {
-                    fprintf(stderr, "Error: const '%.*s' initializer is not a constant "
-                            "expression for this instantiation\n",
-                            (int)n->decl.name_len, n->decl.name);
-                } else {
-                    ASTNode* lit = (ASTNode*)calloc(1, sizeof(ASTNode));
-                    lit->type = AST_INT_LITERAL;
-                    // Same reasoning as AST_CONST_EXPR just below: a fn-typed
-                    // generic const folds to a Symbol* (constexpr.c), not a
-                    // real integer -- tag it so the backend resolves the
-                    // function's real address instead of moving the raw
-                    // pointer bits. (Note: this path doesn't yet handle
-                    // was_float the way AST_CONST_EXPR does -- pre-existing
-                    // gap, out of scope for this fix.)
-                    if (was_fnsym) {
-                        lit->lit_kind = LIT_FN_SYMBOL;
-                        lit->int_value = (uint64_t)v;
-                    } else {
-                        lit->int_value = v;
-                    }
-                    lit->result_type = c->decl.var_type;
-                    c->decl.init_expr = lit;
-                }
+                char err_buf[256];
+                snprintf(err_buf, sizeof(err_buf), "Error: const '%.*s' initializer is not a constant expression for this instantiation", (int)n->decl.name_len, n->decl.name);
+                ASTNode* lit = eval_const_in_frame(c->decl.init_expr, params, args, np, err_buf);
+                lit->result_type = c->decl.var_type;
+                c->decl.init_expr = lit;
             }
             break;
         }
         case AST_CONST_EXPR: {
-            // const(EXPR) inside a generic body: the fold was deferred at parse time
-            // because EXPR mentions an in-scope generic param, and the template is
-            // parsed once, before any instantiation exists. Now that this clone
-            // belongs to ONE concrete instantiation, fold it -- same frame
-            // convention and same ConstEval call the deferred `is_generic_const`
-            // declaration path above uses, just yielding an expression instead of a
-            // statement's initializer.
-            //
-            // NOTE this replaces the AST_CONST_EXPR node with the folded literal, so
-            // nothing downstream ever sees this node kind -- const(...) leaves no
-            // trace in the tree and emits no code, exactly like a scalar const.
-            CeGenericFrame saved = ce_generic_frame_install(params, args, np);
-            int64_t v = 0;
-            s_ce_isfloat = false;
-            s_ce_isfnsym = false;
-            bool ok = ConstEval(n->const_expr.inner, &v);
-            bool was_float = s_ce_isfloat;
-            bool was_fnsym = s_ce_isfnsym;
-            ce_generic_frame_restore(saved);
-            if (!ok) {
-                fprintf(stderr, "Error: const(...) operand is not a constant "
-                                "expression for this instantiation\n");
-                c->type = AST_INT_LITERAL;
-                c->lit_kind = LIT_INT;
-                c->int_value = 0;
-            } else {
-                // Rewrite this node in place as the folded literal. Float-ness must
-                // be preserved: a comptime float travels as IEEE-754 bits in the
-                // int64 slot, so emit LIT_FLOAT (bitcast back) rather than an
-                // integer that happens to hold that bit pattern. Same reasoning
-                // for fn-symbol-ness: const(Op) on a fn-typed const generic
-                // param folds to a Symbol* (constexpr.c), not a real integer —
-                // emit LIT_FN_SYMBOL so the backend resolves it to the
-                // function's real address instead of moving the raw pointer.
-                c->type = AST_INT_LITERAL;
-                if (was_float) {
-                    c->lit_kind = LIT_FLOAT;
-                    double d; memcpy(&d, &v, sizeof d);
-                    c->float_value = d;
-                } else if (was_fnsym) {
-                    c->lit_kind = LIT_FN_SYMBOL;
-                    c->int_value = (uint64_t)v;
-                } else {
-                    c->lit_kind = LIT_INT;
-                    c->int_value = (uint64_t)v;
-                }
-            }
+            ASTNode* lit = eval_const_in_frame(n->const_expr.inner, params, args, np, "Error: const(...) operand is not a constant expression for this instantiation");
+            *c = *lit;
             break;
         }
         case AST_BLOCK: {
@@ -3908,6 +4281,13 @@ ASTNode* clone_ast(ASTNode* n, const char** params, Type** args, size_t np, bool
         case AST_FUNC_DECL: {
             c->func_decl.return_type = Type_Substitute(n->func_decl.return_type, params, args, np);
             c->func_decl.param_syms = (Symbol**)calloc(n->func_decl.param_count, sizeof(Symbol*));
+            if (n->func_decl.param_defaults) {
+                c->func_decl.param_defaults = (ASTNode**)calloc(n->func_decl.param_count, sizeof(ASTNode*));
+                for (size_t i = 0; i < n->func_decl.param_count; i++) {
+                    if (n->func_decl.param_defaults[i])
+                        c->func_decl.param_defaults[i] = clone_ast(n->func_decl.param_defaults[i], params, args, np, clone_symbols);
+                }
+            }
             for (size_t i = 0; i < n->func_decl.param_count; i++)
                 c->func_decl.param_syms[i] = clone_symbol(n->func_decl.param_syms[i], params, args, np, clone_symbols);
             c->func_decl.body = clone_ast(n->func_decl.body, params, args, np, clone_symbols);

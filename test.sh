@@ -72,8 +72,20 @@ pass() { $VERBOSE && echo "PASS  $1"; PASS=$((PASS+1)); }
 fail() { echo "FAIL  $1  --  $2"; FAIL=$((FAIL+1)); ERRORS+=("$1"); }
 
 # Compile+run a source FILE. Sets _STDOUT, _STDERR, _EXIT.
+#
+# _DEPS holds any files named by the test's `//@ use` directive (std/ modules it
+# needs). They are passed BEFORE the test file, which is also the order a user
+# would type -- the compiler takes any number of inputs as one compilation.
 _run() {
     local file="$1"
+    local -a srcs=()
+    if [[ -n "${_DEPS:-}" ]]; then
+        # Paths are written relative to the repo root (`std/vector.t`), not to
+        # the test file, so a test reads the same way it would be run by hand.
+        local d
+        for d in $_DEPS; do srcs+=("$SCRIPT_DIR/$d"); done
+    fi
+    srcs+=("$file")
     # Per-test stderr file: a single fixed /tmp path was shared mutable global
     # state -- one test's stderr could be read by another (or a stale read leak
     # in), producing flaky false failures on error-expectation tests. mktemp
@@ -84,7 +96,7 @@ _run() {
         local ll bin cc_exit link_exit run_exit
         ll=$(mktemp /tmp/torrent_llvm_XXXXXX.ll)
         bin=$(mktemp /tmp/torrent_llvm_XXXXXX)
-        "$TORRENT" -llvm "$ll" "$file" >/dev/null 2>"$err" && cc_exit=0 || cc_exit=$?
+        "$TORRENT" -llvm "$ll" "${srcs[@]}" >/dev/null 2>"$err" && cc_exit=0 || cc_exit=$?
         _STDERR=$(cat "$err")
         if [[ $cc_exit -ne 0 ]]; then
             rm -f "$ll" "$bin"; _STDOUT=""; _EXIT=$cc_exit; return
@@ -101,7 +113,7 @@ _run() {
         local obj bin cc_exit link_exit run_exit
         obj=$(mktemp /tmp/torrent_aot_XXXXXX.o)
         bin=$(mktemp /tmp/torrent_aot_XXXXXX)
-        "$TORRENT" -c -o "$obj" "$file" >/dev/null 2>"$err" && cc_exit=0 || cc_exit=$?
+        "$TORRENT" -c -o "$obj" "${srcs[@]}" >/dev/null 2>"$err" && cc_exit=0 || cc_exit=$?
         _STDERR=$(cat "$err")
         if [[ $cc_exit -ne 0 ]]; then
             rm -f "$obj" "$bin"; _STDOUT=""; _EXIT=$cc_exit; return
@@ -114,7 +126,7 @@ _run() {
         _STDOUT=$("$bin" 2>/dev/null) && run_exit=0 || run_exit=$?
         rm -f "$obj" "$bin"; _EXIT=0
     else
-        _STDOUT=$("$TORRENT" "$file" 2>"$err") && _EXIT=0 || _EXIT=$?
+        _STDOUT=$("$TORRENT" "${srcs[@]}" 2>"$err") && _EXIT=0 || _EXIT=$?
         _STDERR=$(cat "$err")
     fi
 }
@@ -126,12 +138,13 @@ while IFS= read -r file; do
     [[ -n "$FILTER" && "$name" != *"$FILTER"* ]] && continue
 
     # parse the //@ header
-    kind=""; arg=""; stdout_lines=()
+    kind=""; arg=""; stdout_lines=(); _DEPS=""
     while IFS= read -r line; do
         case "$line" in
             '//@ expect val '*)    kind="val";    arg="${line#//@ expect val }" ;;
             '//@ expect err '*)    kind="err";    arg="${line#//@ expect err }" ;;
             '//@ expect stdout'*)  kind="stdout" ;;
+            '//@ use '*)           _DEPS="${line#//@ use }" ;;
             '//@ | '*)             stdout_lines+=("${line#//@ | }") ;;
             *) ;;  # first non-directive line: header done
         esac

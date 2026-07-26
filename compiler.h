@@ -20,7 +20,7 @@ typedef enum {
     
     // Operators
     TOK_PLUS, TOK_MINUS, TOK_STAR, TOK_SLASH, TOK_MOD,
-    TOK_AMP, TOK_PIPE, TOK_CARET, TOK_SHL, TOK_SHR,
+    TOK_AMP, TOK_PIPE, TOK_CARET, TOK_SINGLE_QUOTE, TOK_SHL, TOK_SHR,
     TOK_EQEQ, TOK_NEQ, TOK_LT, TOK_GT, TOK_LTE, TOK_GTE,
     TOK_ANDAND, TOK_OROR, TOK_BANG, TOK_TILDE,
     TOK_EQ, // =
@@ -31,8 +31,8 @@ typedef enum {
     // Punctuation
     TOK_LPAREN, TOK_RPAREN, TOK_SEMI, TOK_LBRACE, TOK_RBRACE,
     TOK_DOT, TOK_LBRACKET, TOK_RBRACKET, TOK_STRUCT, TOK_CONST, TOK_SIZEOF,
-    TOK_ALIGNOF, TOK_OFFSETOF, TOK_NAMEOF,
-    TOK_ENUM, TOK_UNION, TOK_MATCH, TOK_UNPACK, TOK_EXTERN, TOK_ELLIPSIS, TOK_PUB, TOK_WITH, TOK_IMPL, TOK_ALIAS,
+    TOK_ALIGNOF, TOK_OFFSETOF, TOK_NAMEOF, TOK_TYPEOF,
+    TOK_ENUM, TOK_UNION, TOK_MATCH, TOK_CASE, TOK_UNPACK, TOK_EXTERN, TOK_ELLIPSIS, TOK_PUB, TOK_WITH, TOK_IMPL, TOK_ALIAS, TOK_STATIC, TOK_STATIC_ASSERT,
     
     // Keywords / Types
     TOK_U8, TOK_U16, TOK_U32, TOK_U64,
@@ -129,41 +129,6 @@ typedef enum {
 
 typedef struct Type {
     TypeClass cls;
-    // TYPE_STRUCT only: true iff this node names a still-generic template left
-    // DELIBERATELY unapplied (a "template template" argument, e.g. `M` bound to
-    // bare `Box` in `HKT[Box, i32]` -- Box is never instantiated here, just
-    // carried as a value). Set only at that one call-site path (parser.c's
-    // parse_generic_arg_list). Type_Substitute's TYPE_STRUCT case checks this to
-    // avoid its `Box*` self-param auto-completion firing by NAME COINCIDENCE on a
-    // node that was never meant to be completed at all.
-    bool struct_unapplied;
-    // A NOMINAL TAG (`struct`/`enum`/`union`) written before a type name.
-    // Optional and purely a no-op when the name is already known -- but still
-    // CHECKED, so `struct E` on an enum is an error rather than silently fine.
-    // When the name is UNKNOWN (a match wildcard), the tag is what makes the
-    // name readable as a nominal head at all: untagged `M[X]` stays an array
-    // pattern, tagged `struct M[X]` is a template application. The tag is the
-    // only place the kind can be stated, so it is required there, never guessed.
-    //   0 = no tag, 1 = struct, 2 = enum, 3 = union
-    unsigned char nominal_tag;
-    // TYPE_PARAM head of a tagged application (`struct M[X][Y]`): the bracket
-    // arguments, kept as pattern types so reflect_unify binds them pairwise
-    // against the concrete instantiation's own type_args.
-    struct Type** app_args;
-    size_t        app_arg_count;
-    // Index of a `Rest...` pack-tail among app_args (`struct M[H, Rest...]`), or
-    // -1 for none. The args before it bind positionally; every remaining concrete
-    // type-arg bundles into the tail hole, exactly as `Def[H, Rest...]` does for a
-    // named head. Set at parse time, consumed by reflect_unify's tagged-head path.
-    int           app_pack_idx;
-    // True iff a `[...]` (even empty, `M[]`) followed the tagged wildcard head in
-    // source. Distinguishes `struct M` (bare -- "any struct, don't care about type
-    // args") from `struct M[]` (explicit -- "a struct with exactly zero type
-    // args"). Both parse to app_arg_count == 0 with app_args == NULL, so without
-    // this flag they are indistinguishable to reflect_unify. calloc'd false by
-    // default, so anywhere this Type node is built by any OTHER path it correctly
-    // reads as "no brackets were written."
-    bool          app_has_brackets;
     union {
         PrimitiveKind primitive;
         struct Type* pointer_base;
@@ -397,6 +362,7 @@ typedef enum {
     AST_CONTINUE,
     AST_RETURN,
     AST_DEFER,
+    AST_STATIC_ASSERT,  // static_assert(cond, "msg") -- checked at typecheck
     AST_FOR,
     AST_FUNC_DECL,
     AST_CALL,
@@ -516,6 +482,7 @@ typedef struct ASTNode {
                                // right's binop) -- codegen must spill its address
                                // instead of walking it twice. See compile_lvalue's
                                // memo in backend_x64.c.
+            bool is_init;     // AST_ASSIGN only: true when this assign comes from a TYPE x = expr initialization
         } binary;
         struct {
             struct Type* var_type;
@@ -602,10 +569,15 @@ typedef struct ASTNode {
             size_t name_len;
             struct Symbol* params;
             struct Symbol** param_syms; // resolved param symbols (offset + type), in order
+            struct ASTNode** param_defaults; // default argument expressions (or NULL) per param slot
             size_t param_count;
             struct Type* return_type;
             struct ASTNode* body;
             struct Symbol* sym;
+            // Declared `static fn` inside an `impl` block: no `self` is injected
+            // (see parser.c's parse_fn_decl), and it is called as `Type.method(...)`,
+            // never `instance.method(...)`. False for every non-impl function.
+            bool is_static;
             // Generics (stage 1: functions only). A generic function is NOT compiled
             // at definition — its AST is kept and each [T] instantiation is cloned,
             // type-substituted, and compiled on demand.
@@ -669,6 +641,7 @@ typedef struct ASTNode {
             // (`{.field=..}`: field_names=designated fields). Ignored once sdef
             // is filled in (a resolved enum literal sets sdef + is_enum_variant).
             bool is_enum_variant;
+            int pack_index; // -1 if no pack tail (...), >= 0 for pack tail element index
         } struct_lit;
         struct {
             struct ASTNode* base;  // the array (or pointer) being indexed
@@ -678,6 +651,7 @@ typedef struct ASTNode {
             struct Type* elem_type;     // element type
             struct ASTNode** values;
             size_t count;
+            int pack_index; // -1 if no pack tail (...), >= 0 for pack tail element index
         } array_lit;
         struct {
             struct Type* alloc_type;    // the T in `new T` (element type for arrays)
@@ -685,7 +659,20 @@ typedef struct ASTNode {
             struct ASTNode* count;      // optional [expr] runtime count, else NULL (single)
         } new_expr;
         struct {
+            struct ASTNode* cond;   // must live in the SAME struct as msg: the
+            const char* msg;        // node payloads are a union, so storing the
+            size_t msg_len;         // condition in ->unary would be overwritten
+        } static_assert_expr;
+        struct {
             struct ASTNode* ptr;        // the pointer expression to free
+            // `delete[] p` -- p came from `new[n] T`. Needed because `new T` and
+            // `new[n] T` produce the SAME static type (T*), so the delete site
+            // cannot tell them apart on its own; the pointer's origin isn't even
+            // knowable in general (a function may return either). When T has a
+            // destructor, `new[n]` puts an 8-byte element-count cookie in front
+            // of the buffer -- this flag is what says "read it back, destroy all
+            // n, and free base-8" instead of destroying one object.
+            bool is_array;
         } delete_expr;
     };
 } ASTNode;
@@ -717,6 +704,10 @@ typedef struct Symbol {
     // scalar global_init path. Size is Type_SizeOf(sym->type).
     uint8_t* global_bytes;
     bool is_pub;
+    // Mirrors func_decl.is_static for SYM_FUNCTION symbols mangled from an
+    // `impl` block (Foo_method) -- checked at each call site to route to
+    // Type.method(...) resolution and to reject instance.method(...) for it.
+    bool is_static;
     // For a generic function symbol (SYM_FUNCTION with type params): a pointer to
     // its AST_FUNC_DECL node, kept so the backend can clone+substitute+compile each
     // instantiation. NULL for ordinary functions.
@@ -780,7 +771,8 @@ typedef struct {
 
 ConstDef* Const_Register(const char* name, size_t len, int64_t value, Type* type);
 ConstDef* Const_Find(const char* name, size_t len);
-ConstDef* Const_GetAll(size_t* out_count);
+size_t Const_Count(void);
+ConstDef* Const_At(size_t i);
 // Resolve any consts whose initializer was deferred (forward-referenced a later
 // fn). Returns false (and reports) if one still can't fold. Call after parsing.
 bool Const_ResolvePending(void);
@@ -816,7 +808,11 @@ bool ConstEval_Bytes(ASTNode* node, uint8_t* out_buf, uint64_t size); // aggrega
 int64_t ConstEval_AggPersist(struct ASTNode* node, Type* t); // aggregate const -> persistent arena offset
 bool ConstEval_ReadBytes(uint32_t off, uint8_t* out_buf, uint64_t size); // copy persisted arena bytes out
 bool ConstEval_AggHasEscapingPtr(Type* t, uint8_t* bytes, uint64_t size); // const stores a live comptime pointer?
-void try_rewrite_method_call(struct ASTNode* node); // rewrite expr.method(args) -> Base_method(&expr, args)
+void try_rewrite_method_call(struct ASTNode* node);
+// `v[i]` -> `*(v.__index(i))` when __index returns T*. Shared by Type_Infer,
+// infer_generic AND ConstEval: the comptime interpreter needs the identical
+// deref, or `const R = v[0]` folds the ADDRESS instead of the element.
+void wrap_index_result_deref(struct ASTNode* node);
 // (type, method-name) -> symbol name / Symbol. The single mangling used by method
 // CALLS, `impl {...}` MATCHING, and `fnof`, so all three agree. Resolves through
 // generic_base, which is why it is not nameof+concat.
@@ -898,6 +894,14 @@ void reflect_bindings_free(ReflectBindings* b);
 void AST_Dump(struct ASTNode* node, int depth);
 void  Typecheck_Tree(ASTNode* root); // eager pass: annotate every node's result_type (home for v1(b) checks)
 void  resolve_brace_literal(ASTNode* node, Type* target); // bind a bare `{...}` literal to its context type
+void  expand_call_default_args(ASTNode* node, ASTNode** pdefaults, size_t pcount, int pack_idx, Type** ptypes);
+
+// --- Match Engine ---
+struct ASTNode* Lower_Match(struct ASTNode* node, struct Type* st);
+struct ASTNode* make_tag_eq(struct ASTNode* scrut, int idx);
+bool pattern_covers_all(struct ASTNode* pat);
+void compile_pattern(struct ASTNode* pat, struct ASTNode* scrut, struct Type* scrut_type, struct ASTNode** out_cond, struct ASTNode*** out_decls, size_t* decl_count, size_t* decl_cap);
+void predeclare_binders(struct ASTNode* pat);
 
 // --- Parser ---
 
