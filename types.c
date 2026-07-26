@@ -1202,6 +1202,20 @@ void try_rewrite_method_call(ASTNode* node) {
                     node->call.target_name = mangled;
                     node->call.target_name_len = manglen;
                     node->call.sym = msym;
+                    // Seed the receiver instantiation's own type arguments, the
+                    // same way the instance path does below. A static has no self
+                    // to infer from, so without this its type params can only be
+                    // pinned by its ARGUMENTS -- and a static whose signature does
+                    // not mention them (`A[T, u32 N].step(...)`, iteration's step
+                    // function) had nothing at all to infer from and failed with
+                    // "cannot infer generic type arguments". The value form
+                    // (`A[i32,4].step` with no parens) already carried them; only
+                    // the call form was missing them.
+                    if (tsd->generic_base && tsd->type_arg_count > 0 &&
+                        node->call.type_arg_count == 0) {
+                        node->call.self_type_args = tsd->type_args;
+                        node->call.self_type_arg_count = tsd->type_arg_count;
+                    }
                     return;
                 }
                 if (msym && msym->kind == SYM_FUNCTION && !msym->is_static) {
@@ -1322,13 +1336,6 @@ void try_rewrite_method_call(ASTNode* node) {
     node->call.target_name = mangled;
     node->call.target_name_len = manglen;
     node->call.sym = msym;
-    if (node->call.target_name_len == 15 &&
-        strncmp(node->call.target_name, "Vector___delete", 15) == 0) {
-        char bt_name[256];
-        Type_ToString(bt, bt_name, sizeof(bt_name));
-        fprintf(stderr, "DEBUG delete receiver=%s method=%.*s\\n", bt_name,
-                (int)msym->name_len, msym->name);
-    }
     if (sd && sd->generic_base && sd->type_arg_count > 0 && node->call.type_arg_count == 0) {
         // The struct fixes only a PREFIX of the method's type params (its own T,...);
         // the method may declare additional ones of its own (fn map[U](...)). Stash
@@ -1384,6 +1391,24 @@ static bool rewrite_operand_to_method_call(ASTNode* node, ASTNode* recv, ASTNode
     if (recv->type == AST_TYPE_EXPR || (arg && arg->type == AST_TYPE_EXPR)) return false;
     Type* rt = Type_Infer(recv);
     if (!rt) return false;
+
+    // An operator overload belongs to the STRUCT that declares it, so it can only
+    // dispatch when the receiver is that struct BY VALUE. A pointer receiver is
+    // never an overload site: `p != null`, `p == q`, `p + 1` are the language's
+    // own pointer operators, and pointer arithmetic/comparison is defined for
+    // every pointer type regardless of what its pointee happens to declare.
+    //
+    // Without this, Method_Resolve auto-derefs the pointer to find the pointee's
+    // method and hijacks the comparison. It bit exactly where it hurts most: a
+    // destructor's own null-guard. In `Vector[Vector[u8]].__delete`, `self.data`
+    // is a `Vector[u8]*`, so `self.data != null` resolved to Vector[u8]'s __neq
+    // and passed `null` as its Vector operand -- the guard that exists to stop a
+    // double free became a call INTO the type being freed. That is why a
+    // Vector[Vector[u8]] crashed merely because __neq was DEFINED (never called),
+    // and why rewriting the guard as `== null` made it vanish: __eq was reached
+    // through the same hole, but the arms happened to fall the other way.
+    if (rt->cls == TYPE_POINTER) return false;
+
     Symbol* msym = Method_Resolve(rt, mname, strlen(mname));
     if (!msym) return false;
 
@@ -1843,13 +1868,6 @@ Type* Type_Infer(ASTNode* node) {
                 Error_AtNode(node, "field access on pointer-to-pointer; use (*pp).field", NULL);
             }
             if (!sd) {
-                char bbuf[256] = {0};
-                Type* bt2 = Type_Infer(node->field.base);
-                Type_ToString(bt2, bbuf, sizeof(bbuf));
-                fprintf(stderr, "DEBUG AST_FIELD base=%s field=%.*s base_node=%d\n",
-                        bbuf,
-                        (int)node->field.field_name_len, node->field.field_name,
-                        node->field.base ? node->field.base->type : -1);
                 char msg[160];
                 snprintf(msg, sizeof(msg), "field access '.%.*s' on a non-struct value",
                          (int)node->field.field_name_len, node->field.field_name);
@@ -1889,24 +1907,7 @@ Type* Type_Infer(ASTNode* node) {
                     }
                 }
             }
-            if (node->field.field_name_len == 4 &&
-                strncmp(node->field.field_name, "data", 4) == 0) {
-                char field_buf[256] = {0};
-                Type_ToString(f ? f->type : NULL, field_buf, sizeof(field_buf));
-                char base_buf[256] = {0};
-                Type_ToString(bt, base_buf, sizeof(base_buf));
-                fprintf(stderr, "DEBUG AST_FIELD data field type=%s base=%s\n",
-                        field_buf, base_buf);
-            }
             if (!f) {
-                char bname[256] = {0};
-                char btname[256] = {0};
-                Type_ToString(bt, btname, sizeof(btname));
-                Type_ToString(node->field.sdef ? Type_FromStruct(node->field.sdef) : NULL, bname, sizeof(bname));
-                fprintf(stderr, "DEBUG AST_FIELD failed base-type=%s field=%.*s base_node=%d\n",
-                        btname,
-                        (int)node->field.field_name_len, node->field.field_name,
-                        node->field.base ? node->field.base->type : -1);
                 char msg[192];
                 snprintf(msg, sizeof(msg), "%s '%s' has no field '%.*s'", sd->is_overlapping ? "union" : "struct", sd->name,
                          (int)node->field.field_name_len, node->field.field_name);
@@ -1946,21 +1947,8 @@ Type* Type_Infer(ASTNode* node) {
                 // p[i] would wrongly infer as u32[8] instead of u32.
                 Type* pointee = base->pointer_base;
                 t = (pointee && pointee->cls == TYPE_ARRAY) ? pointee->array.element : pointee;
-                if (node->index.base && node->index.base->type == AST_FIELD) {
-                    char baset[256] = {0};
-                    Type_ToString(base, baset, sizeof(baset));
-                    char elt[256] = {0};
-                    Type_ToString(t, elt, sizeof(elt));
-                    fprintf(stderr, "DEBUG INDEX base node=AST_FIELD base-type=%s result-type=%s\n", baset, elt);
-                }
             }
             else {
-                if (node->index.base) {
-                    char baset[256] = {0};
-                    Type_ToString(base, baset, sizeof(baset));
-                    fprintf(stderr, "DEBUG INDEX non-array-pointer base type=%s base node=%d\n",
-                            baset, node->index.base->type);
-                }
                 Error_AtNode(node, "indexing a non-array, non-pointer", NULL);
             }
             break;
@@ -2820,6 +2808,63 @@ static bool reflect_match_select(ASTNode* node) {
     return true;
 }
 
+// Does this subtree `return <sym>` by name anywhere inside it?
+//
+// A local that a function hands back must NOT get a scope-exit destructor:
+// the value escapes, and destroying it here would free storage the caller is
+// about to receive (use-after-free), then free it again when the caller's own
+// scope ends (double free).
+//
+// This deliberately walks the WHOLE subtree rather than only inspecting the
+// block's final statement. An early `return r` guarded by an `if` is still a
+// return of `r`, even when other statements follow it:
+//
+//     R r = {...}
+//     if cond { return r }   // <- escapes here
+//     R other = {...}
+//     return other           // <- the old check only ever saw THIS one
+//
+// Any return-by-name suppresses the destructor for that symbol, so this
+// errs toward leaking (a return the value never reaches at runtime) rather
+// than toward a double free. Leaking is recoverable; freeing twice is not.
+static bool returns_symbol(ASTNode* n, Symbol* sym) {
+    if (!n || !sym) return false;
+
+    if (n->type == AST_RETURN) {
+        ASTNode* rv = n->unary;
+        return rv && rv->type == AST_IDENT && rv->ident.sym == sym;
+    }
+
+    switch (n->type) {
+        case AST_BLOCK:
+            for (size_t i = 0; i < n->block.count; i++) {
+                if (returns_symbol(n->block.statements[i], sym)) return true;
+            }
+            return false;
+        case AST_IF:
+            return returns_symbol(n->if_stmt.true_block, sym) ||
+                   returns_symbol(n->if_stmt.false_block, sym);
+        case AST_WHILE:
+            return returns_symbol(n->while_stmt.body, sym);
+        case AST_FOR:
+            return returns_symbol(n->for_stmt.body, sym);
+        case AST_DEFER:
+            return returns_symbol(n->unary, sym);
+        case AST_MATCH:
+            // A value `match` that has not been lowered to an if-chain yet
+            // (Lower_Match runs during typecheck). Statements are walked here
+            // AFTER Typecheck_Tree, so an arm usually arrives already lowered
+            // into AST_IF above -- this covers the un-lowered shape too, so a
+            // `return r` inside an arm suppresses the destructor either way.
+            for (size_t i = 0; i < n->match_stmt.arm_count; i++) {
+                if (returns_symbol(n->match_stmt.arm_bodies[i], sym)) return true;
+            }
+            return false;
+        default:
+            return false;
+    }
+}
+
 void Typecheck_Tree(ASTNode* node) {
     if (!node) return;
 
@@ -2842,14 +2887,14 @@ void Typecheck_Tree(ASTNode* node) {
                     
                     if (decl) {
                         Type* vt = decl->decl.var_type;
-                        // Don't destruct a local that this block returns by name.
+                        // Don't destruct a local that this block returns by name --
+                        // anywhere in the block, not merely as its last statement
+                        // (see returns_symbol).
                         bool is_return_value = false;
-                        if (node->block.count > 0) {
-                            ASTNode* last = node->block.statements[node->block.count - 1];
-                            if (last && last->type == AST_RETURN && last->unary &&
-                                last->unary->type == AST_IDENT &&
-                                last->unary->ident.sym == decl->decl.sym) {
+                        for (size_t j = 0; j < node->block.count; j++) {
+                            if (returns_symbol(node->block.statements[j], decl->decl.sym)) {
                                 is_return_value = true;
+                                break;
                             }
                         }
                         if (vt && vt->cls == TYPE_STRUCT && !is_return_value && Method_Resolve(vt, "__delete", 8)) {
@@ -3044,7 +3089,11 @@ void Typecheck_Tree(ASTNode* node) {
             Typecheck_Tree(node->delete_expr.ptr);
             Type* pt = Type_Infer(node->delete_expr.ptr);
             Type* pointee = (pt && pt->cls == TYPE_POINTER) ? pt->pointer_base : NULL;
-            if (pointee && pointee->cls == TYPE_STRUCT &&
+            // `delete[] p` destroys EVERY element, which needs a runtime loop over
+            // the cookie's count -- emitted directly by the backend rather than
+            // desugared here, since this rewrite can only express a single call.
+            if (!node->delete_expr.is_array &&
+                pointee && pointee->cls == TYPE_STRUCT &&
                 Method_Resolve(pointee, "__delete", 8)) {
                 ASTNode* target = (ASTNode*)calloc(1, sizeof(ASTNode));
                 target->type = AST_FIELD;
@@ -3099,12 +3148,6 @@ void Typecheck_Tree(ASTNode* node) {
             }
             // Assignability: the initializer must be allowed into the declared type.
             if (node->decl.init_expr) {
-                if (node->decl.name_len == 1 && node->decl.name && node->decl.name[0] == 'e') {
-                    char want[256], got[256];
-                    Type_ToString(node->decl.var_type, want, sizeof(want));
-                    Type_ToString(Type_Infer(node->decl.init_expr), got, sizeof(got));
-                    fprintf(stderr, "DEBUG e declaration want=%s got=%s\\n", want, got);
-                }
                 char buf[256];
                 snprintf(buf, sizeof(buf), "declaration of %.*s",
                      node->decl.name ? (int)node->decl.name_len : 7,
@@ -4337,12 +4380,6 @@ Symbol* Generic_Instantiate(Symbol* generic, Type** targs, size_t targ_count) {
         }
     }
     // New instantiation: clone+substitute the generic decl now; compile later.
-    if (generic->name && strncmp(generic->name, "Vector___delete", 15) == 0) {
-        char arg_name[256] = {0}, sig_name[512] = {0};
-        if (targ_count > 0) Type_ToString(targs[0], arg_name, sizeof(arg_name));
-        Type_ToString(generic->type, sig_name, sizeof(sig_name));
-        fprintf(stderr, "DEBUG instantiate delete arg=%s sig=%s\\n", arg_name, sig_name);
-    }
     ASTNode* gdecl = generic->generic_decl;
     const char** params = gdecl->func_decl.type_params;
     size_t np = gdecl->func_decl.type_param_count;
@@ -4369,12 +4406,6 @@ Symbol* Generic_Instantiate(Symbol* generic, Type** targs, size_t targ_count) {
         }
     }
     ASTNode* inst = clone_ast(gdecl, params, argcopy, np, true);
-    if (generic->name && strncmp(generic->name, "Vector___delete", 15) == 0 &&
-        inst && inst->func_decl.param_count > 0 && inst->func_decl.param_syms[0]) {
-        char self_name[512];
-        Type_ToString(inst->func_decl.param_syms[0]->type, self_name, sizeof(self_name));
-        fprintf(stderr, "DEBUG cloned delete self=%s\\n", self_name);
-    }
     Resolve_Reflect_Matches(inst); // resolve every `match T` in this instantiation
                                     // once, here, so no downstream consumer
                                     // (Typecheck_Tree, ConstEval, or a future

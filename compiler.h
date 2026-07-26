@@ -659,6 +659,14 @@ typedef struct ASTNode {
         } new_expr;
         struct {
             struct ASTNode* ptr;        // the pointer expression to free
+            // `delete[] p` -- p came from `new[n] T`. Needed because `new T` and
+            // `new[n] T` produce the SAME static type (T*), so the delete site
+            // cannot tell them apart on its own; the pointer's origin isn't even
+            // knowable in general (a function may return either). When T has a
+            // destructor, `new[n]` puts an 8-byte element-count cookie in front
+            // of the buffer -- this flag is what says "read it back, destroy all
+            // n, and free base-8" instead of destroying one object.
+            bool is_array;
         } delete_expr;
     };
 } ASTNode;

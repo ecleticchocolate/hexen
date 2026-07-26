@@ -1,8 +1,21 @@
 // Vector[T] - dynamically resizing array.
 
-// Manual ownership: a Vector[T] owns its backing buffer. __delete() frees
-// it, called automatically by RAII on scope exit or explicitly via
-// `delete v` on a heap-allocated one.
+// Manual ownership: a Vector[T] owns its backing buffer.
+//
+// DESTRUCTION IS NEVER CALLED BY HAND. There are exactly three ways a thing is
+// destroyed, and __delete() is not one of them -- it is the *implementation*
+// the language invokes, the way __add is the implementation of `+`:
+//
+//   delete p      one heap object
+//   delete[] p    a heap array (destroys every element, then frees)
+//   scope exit    RAII, for any local
+//
+// Nothing in this file writes `.__delete()`. An earlier version did, and every
+// such call was a double free waiting for its object to go out of scope: the
+// explicit call does NOT suppress the scope-exit destructor, so the resource
+// was released twice. `delete[]` is what made the last of those calls
+// unnecessary -- destroying the elements of a heap buffer was the one job RAII
+// could not reach, and it is now the language's job rather than this file's.
 //
 // Element ownership is driven by ONE predicate, asked twice: does T have
 // __delete()? Two operations answer it, and every method that moves a T
@@ -72,8 +85,8 @@ pub impl Vector[T] {
     // once, impossible to apply inconsistently across call sites.
     fn store_elem(u32 index, T item) void {
         match T {
-            impl { fn __delete() } { self.data[index] = item.copy() }
-            else                   { self.data[index] = item }
+            Owning { self.data[index] = item.copy() }
+            else   { self.data[index] = item }
         }
     }
 
@@ -98,7 +111,14 @@ pub impl Vector[T] {
     // Replaces this Vector's contents from a fixed-size array literal.
     // Frees the old buffer first.
     fn __assign[u32 N](T[N] arr) void {
-        self.__delete()
+        // Release the old buffer with delete[] (which destroys any owning
+        // elements) rather than calling self.__delete(): that would run this
+        // object's whole destructor mid-assignment, and RAII will run it AGAIN
+        // when the owner goes out of scope -- a double free through the one
+        // path a destructor exists to prevent.
+        if self.data != null {
+            delete[] self.data
+        }
         self.data = new[N] T
         for u32 i = 0 to N {
             self.store_elem(i, arr[i])
@@ -119,29 +139,19 @@ pub impl Vector[T] {
         return out
     }
 
-    // Destroys every live element in [0, size) if T owns a resource
-    // (structural: any T with __delete() participates, no trait/
-    // registration needed). Shared by __delete() and clear() so the
-    // destroy-loop exists in exactly one place instead of two copies
-    // that must be kept in sync by hand.
-    fn destroy_elems() void {
-        match T {
-            impl { fn __delete() } {
-                for u32 i = 0 to self.size {
-                    self.data[i].__delete()
-                }
-            }
-            else { }
-        }
-    }
-
-    // Frees the backing buffer, first destroying every element (see
-    // destroy_elems), so Vector[Vector[u8]] recursively frees each inner
-    // Vector's buffer too.
+    // Frees the backing buffer. `delete[]` destroys every element first when T
+    // has a destructor, so Vector[Vector[u8]] recursively frees each inner
+    // Vector's buffer with nothing recursive written here -- no element loop and
+    // no `match T` deciding whether one is needed. The count comes from the
+    // allocation's own cookie, so it cannot disagree with what was allocated.
+    //
+    // It destroys all CAPACITY slots, not just the live [0, size) ones. That is
+    // safe rather than sloppy: `new` zero-initializes, so an unused slot is an
+    // all-zero T, and any __delete() that can run on a fresh T must already
+    // null-guard -- this one's own `if self.data != null` is exactly that guard.
     fn __delete() void {
         if self.data != null {
-            self.destroy_elems()
-            delete self.data
+            delete[] self.data
             self.data = null
         }
         self.capacity = 0
@@ -163,7 +173,13 @@ pub impl Vector[T] {
                 new_data[i] = self.move_out(i)
             }
 
-            if self.data != null { delete self.data }
+            // delete[] , not delete: this buffer came from `new[...] T`, and for
+            // an owning T that allocation carries an element-count cookie in
+            // front of it. The single-object `delete` would hand free() the
+            // element pointer instead of the true base and corrupt the heap.
+            // Every element was already moved out above, so the destructor pass
+            // this runs sees only blanked (zeroed) slots and does nothing.
+            if self.data != null { delete[] self.data }
             self.data = new_data
             self.capacity = new_capacity
         }
@@ -197,20 +213,83 @@ pub impl Vector[T] {
         return &self.data[index]
     }
 
+    // Element-wise equality: same length, and every element equal.
+    //
+    // The operand is a Vector[T]* and the call site therefore writes `a == &b`.
+    // That is not about speed -- a Vector[T] is three fields -- it is about
+    // ownership. A by-value operand would be a shallow copy (the language's one
+    // copy rule: `b = a` is always a memcpy, never a hook), so the parameter
+    // would alias this vector's buffer while claiming to be its own value. For a
+    // type that owns a heap allocation, taking the operand by pointer is the only
+    // spelling that does not manufacture a second owner of the same memory.
+    //
+    // Elements are compared with `*a == *b` rather than `a == b` on values: the
+    // deref form works uniformly for primitives, plain structs, AND an element
+    // type whose own __eq takes a pointer, which a value comparison cannot reach
+    // from generic code (`a == b` on two T values cannot call __eq(T* o)).
+    // So this one spelling covers every T without asking what T chose.
+    fn __eq(Vector[T] other) bool {
+        if self.size != other.size {
+            return false
+        }
+        for u32 i = 0 to self.size {
+            T* mine = &self.data[i]
+            T* theirs = &other.data[i]
+            if !(*mine == *theirs) {
+                return false
+            }
+        }
+        return true
+    }
+
+    // Element-wise inequality. `!=` dispatches to __neq on its own -- it does
+    // NOT fall back to `!(a == b)` -- so a type defining only __eq has no `!=`
+    // at all. Written as its own loop rather than delegating to __eq, because
+    // re-entering `==` on two Vector[T] VALUES from inside a generic
+    // instantiation still hits "aggregate operator not defined reached backend".
+    fn __neq(Vector[T] other) bool {
+        if self.size != other.size {
+            return true
+        }
+        for u32 i = 0 to self.size {
+            T* mine = &self.data[i]
+            T* theirs = &other.data[i]
+            if !(*mine == *theirs) {
+                return true
+            }
+        }
+        return false
+    }
+
     // Sets an element by index safely. Returns true if successful.
+    //
+    // The displaced element is moved out first. move_out() hands it back as an
+    // ordinary local, so scope exit destroys it -- the same RAII that destroys
+    // any other value that goes out of scope, rather than this file calling a
+    // destructor by name. It also blanks the slot, so the old element is never
+    // aliased by both `old` and the buffer at once.
     fn set(u32 index, T item) bool {
         if index >= self.size {
             return false
         }
-        self.data[index] = item
+        T old = self.move_out(index)
+        self.store_elem(index, item)
         return true
     }
 
-    // Removes all elements without freeing the backing buffer. Still runs
-    // element destructors first, via the same destroy_elems() __delete()
-    // uses -- one destroy-loop, not two copies that could drift apart.
+    // Removes all elements, destroying any that own a resource. The buffer is
+    // released and re-taken at the same capacity rather than being kept and
+    // hand-cleared: `delete[]` is the one operation that destroys elements, and
+    // it necessarily frees the storage they sat in. Nothing here calls a
+    // destructor by name -- __delete() is a procedure the language invokes, not
+    // an API this file is allowed to reach for.
     fn clear() void {
-        self.destroy_elems()
+        u32 cap = self.capacity
+        if self.data != null {
+            delete[] self.data
+        }
+        self.data = new[cap] T
+        self.capacity = cap
         self.size = 0
     }
 

@@ -64,6 +64,8 @@ ASTNode* new_node(ASTNodeType type);
 
 Token s_curr;
 static jmp_buf s_err_buf;
+// Set by parse_error (any pass), read by Parse_HadError after parsing.
+static bool s_parse_had_error = false;
 SymbolTable* s_symtable;
 
 const char** s_type_params = NULL;
@@ -798,6 +800,16 @@ void parse_error(const char* msg) {
     // of this refactor). Preserved as-is here rather than silently patched,
     // since suppressing it is a separate, deliberate fix, not a
     // side-effect of sharing the printer.
+    //
+    // Mark the compile as failed BEFORE unwinding. Parse_Block's setjmp sets this
+    // too, but it only sees errors raised while IT is the active recovery point.
+    // Lower_Match (match.c) calls parse_error during TYPECHECK, long after the last
+    // Parse_Block returned, so that longjmp lands on a stale frame: the flag stayed
+    // false, main() concluded the parse was clean, and a program with a genuine
+    // error ("match ... is not exhaustive") was executed anyway -- or crashed
+    // jumping into the dead frame. Setting it here makes "an error was reported"
+    // and "the compile failed" the same fact, whichever pass reported it.
+    s_parse_had_error = true;
     Error_AtToken(s_curr, msg, &s_err_buf);
 }
 
@@ -1345,13 +1357,43 @@ static Type* parse_alias_or_type_param_type(Type* base_t) {
         }
         advance();
         Type** targs; size_t tcount;
+        // A forward use -- the struct's name and arity come from pass 0a, but its
+        // KINDS are only filled in when pass 1 reaches the real declaration, which
+        // may be later in this file or in a file passed after this one. Until then
+        // fall back to the pass-0b side table, which parsed the genuine header with
+        // the real type grammar (see Parse_Signatures). Without this, a value slot
+        // reads as a type slot and `Cur[T, S, Vector[T].step]` fails on the `.`,
+        // making compilation depend on the order the files were passed in.
+        const char** gp_names = sd->type_params;
+        Type**       gp_kinds = sd->param_kinds;
+        size_t       gp_count = sd->type_param_count;
+        int          gp_pack  = sd->pack_type_param_index;
+        if (!gp_kinds) {
+            struct GenericSig* gs = gsig_find(sd->name, strlen(sd->name));
+            if (gs) {
+                // Trust the side table's arity over sd->type_param_count here.
+                // Pass 0a counts parameters with a flat token scan (every
+                // IDENTIFIER between the brackets), which overcounts any slot
+                // whose pin is more than a bare name: `[T, fn(T, T) T Op]` scans
+                // as 5, not 2. Pass 0b parsed the same header with the real
+                // grammar, so its count and kinds are the authoritative pair --
+                // and they must be taken TOGETHER, since a kinds array only makes
+                // sense against the arity it was built for. Pass 1 overwrites
+                // sd->type_param_count with the same real value when it reaches
+                // the declaration; this just makes the forward use agree early.
+                gp_names = gs->tparams;
+                gp_kinds = gs->pkinds;
+                gp_count = gs->pcount;
+                gp_pack  = gs->ppack;
+            }
+        }
         // Bundling applies in PATTERN position too, so an arm may be written in
         // the same sugar as the use site (`match X { Def[i32, u8] {...} }`).
         // The one carve-out lives in parse_generic_arg_list_packed: a lone
         // wildcard (`Def[E]`) binds the ALREADY-bundled struct rather than being
         // wrapped into struct{E}, which is what makes one arm cover every arity.
-        parse_generic_arg_list_packed(sd->type_params, sd->param_kinds, sd->type_param_count,
-                                      sd->pack_type_param_index, &targs, &tcount);
+        parse_generic_arg_list_packed(gp_names, gp_kinds, gp_count,
+                                      gp_pack, &targs, &tcount);
         if (s_curr.type != TOK_RBRACKET) parse_error("Expected ']' after generic struct type arguments");
         advance();
         StructDef* inst = Struct_Instantiate(sd, targs, tcount);
@@ -3312,6 +3354,18 @@ static ASTNode* parse_defer_statement(void) {
 static ASTNode* parse_delete_statement(void) {
     advance();
     ASTNode* node = new_node(AST_DELETE);
+    // `delete[] p` -- the array form. Empty brackets only: the element count is
+    // never written by hand, it is read back from the cookie `new[n] T` stored.
+    // (`delete[expr] p` is deliberately NOT grammar -- a count the user supplies
+    // is a count the user can get wrong, and the allocation already knows it.)
+    if (s_curr.type == TOK_LBRACKET) {
+        advance();
+        if (s_curr.type != TOK_RBRACKET)
+            parse_error("`delete[]` takes no count -- write `delete[] p`; the element "
+                        "count is recovered from the allocation itself");
+        advance();
+        node->delete_expr.is_array = true;
+    }
     node->delete_expr.ptr = parse_expr_prec(0);
     if (s_curr.type == TOK_SEMI) advance();
     return node;
@@ -4446,9 +4500,24 @@ static ASTNode* parse_fn_decl(bool is_pub, bool is_extern, bool is_static,
             ftype->function.param_types[i] = node->func_decl.param_syms[i]->type;
         }
         
-        Symbol* func_sym = impl_type_name
-            ? SymTable_Add(prev_table, mname, mname_len, ftype, SYM_FUNCTION)
-            : SymTable_Add(prev_table, name.start, name.length, ftype, SYM_FUNCTION);
+        // A `static fn` in an impl block was already given a stub symbol by the
+        // block's pre-scan (see parse_impl_block), so that a method declared
+        // EARLIER can name one declared LATER. Fill that stub in rather than
+        // adding a second symbol -- SymTable_Add exits on a duplicate.
+        Symbol* func_sym = NULL;
+        if (impl_type_name && is_static) {
+            func_sym = SymTable_Find(prev_table, mname, mname_len);
+            if (func_sym && func_sym->kind == SYM_FUNCTION) {
+                func_sym->type = ftype;   // stub carried no signature yet
+            } else {
+                func_sym = NULL;
+            }
+        }
+        if (!func_sym) {
+            func_sym = impl_type_name
+                ? SymTable_Add(prev_table, mname, mname_len, ftype, SYM_FUNCTION)
+                : SymTable_Add(prev_table, name.start, name.length, ftype, SYM_FUNCTION);
+        }
         node->func_decl.sym = func_sym;
         if (is_extern) func_sym->is_extern = true;
         if (is_pub) func_sym->is_pub = true;
@@ -4565,6 +4634,71 @@ void Parse_Signatures(const char* filename, const char* source) {
         if (s_curr.type == TOK_PUB) { advance(); continue; }
         if (s_curr.type == TOK_EXTERN) { advance(); continue; }
 
+        // `impl TYPE { ... }`: register a stub symbol for every `static fn` in
+        // the block, under its mangled `TYPE_name`, before ANY body is parsed.
+        //
+        // Methods are parsed sequentially, so a body only sees the methods above
+        // it. An ordinary call survives that (calls resolve late, at typecheck),
+        // but a static used as a const-generic VALUE must fold to the function's
+        // symbol AT PARSE TIME -- `IteratorCursor[..., Array[T, N].step]`, the
+        // iterator protocol. Forward-referencing one yielded a null symbol that
+        // surfaced later as "LIT_FN_SYMBOL literal doesn't hold a valid function
+        // symbol", forcing every impl block to be hand-ordered with `step` above
+        // `begin`. This pass already exists to make forward references work; it
+        // simply did not look inside impl.
+        //
+        // The stub carries name and kind only -- parse_fn_decl adopts it and
+        // fills in the real signature. Statics only: an instance method can
+        // never be a const-generic value.
+        if (s_curr.type == TOK_IMPL) {
+            advance();
+            if (s_curr.type != TOK_IDENTIFIER) continue;
+            Token tname = s_curr;
+            advance();
+            if (s_curr.type == TOK_LBRACKET) {   // skip the generic param list
+                int d = 1;
+                advance();
+                while (d > 0 && s_curr.type != TOK_EOF) {
+                    if (s_curr.type == TOK_LBRACKET) d++;
+                    else if (s_curr.type == TOK_RBRACKET) d--;
+                    advance();
+                }
+            }
+            if (s_curr.type != TOK_LBRACE) continue;
+            advance();   // enter the block
+            int depth = 0;
+            while (s_curr.type != TOK_EOF) {
+                if (s_curr.type == TOK_LBRACE) { depth++; advance(); continue; }
+                if (s_curr.type == TOK_RBRACE) {
+                    if (depth == 0) { advance(); break; }
+                    depth--; advance(); continue;
+                }
+                if (depth == 0 && s_curr.type == TOK_STATIC) {
+                    advance();
+                    if (s_curr.type == TOK_FN) {
+                        advance();
+                        if (s_curr.type == TOK_IDENTIFIER) {
+                            size_t ml = tname.length + 1 + s_curr.length;
+                            char* mn = (char*)malloc(ml + 1);
+                            memcpy(mn, tname.start, tname.length);
+                            mn[tname.length] = '_';
+                            memcpy(mn + tname.length + 1, s_curr.start, s_curr.length);
+                            mn[ml] = '\0';
+                            if (!SymTable_Find(s_symtable, mn, ml)) {
+                                Symbol* stub = SymTable_Add(s_symtable, mn, ml, NULL, SYM_FUNCTION);
+                                stub->is_static = true;
+                            } else {
+                                free(mn);
+                            }
+                        }
+                    }
+                    continue;
+                }
+                advance();
+            }
+            continue;
+        }
+
         bool is_struct = (s_curr.type == TOK_STRUCT || s_curr.type == TOK_ENUM || s_curr.type == TOK_UNION);
         bool is_fn     = (s_curr.type == TOK_FN);
         if (!is_struct && !is_fn) { advance(); continue; }
@@ -4587,19 +4721,32 @@ void Parse_Signatures(const char* filename, const char* source) {
         s_type_params = prev_tp; s_param_kinds = prev_pk; s_type_param_count = prev_tpc;
 
         if (is_struct) {
-            // Deliberately NOT recording struct kinds here.
+            // Record the struct's generic header in the SAME side table functions
+            // use, rather than installing type_params/param_kinds onto the StructDef.
             //
-            // Pass 0a already gives structs their arity, and the remaining gap (a
-            // forward use with an explicit VALUE arg, `Box[i32, 4]` above `struct
-            // Box[T, u32 N]`) turns out not to be fixable this way: installing
-            // type_params/param_kinds from THIS pass's arena leaves pass 1 re-parsing the
-            // real declaration and installing different pointers, while instantiations
-            // may already have cached against the pass-0b ones -- which silently produced
-            // an empty layout (sizeof == 0) instead of an error. Trading a loud failure
-            // for a silent wrong answer is the worst possible move (§1), so leave it.
+            // That distinction is the whole reason this is safe now. Installing them
+            // on the StructDef is what the earlier attempt did, and it silently broke:
+            // pass 1 re-parses the real declaration and installs DIFFERENT pointers,
+            // so any instantiation already cached against the pass-0b arena kept a
+            // stale layout and produced sizeof == 0 -- a silent wrong answer, which is
+            // worse than the loud failure it replaced (§1). A side table has no such
+            // hazard: it is consulted ONLY as a fallback, when the StructDef does not
+            // yet carry its own kinds (i.e. exactly the forward-reference case), and
+            // pass 1's real kinds always win once they exist. Nothing caches against it.
             //
-            // Functions have no such hazard: their kinds live in a side table that only
-            // the call site reads, and pass 1 builds the real func_decl independently.
+            // Without this, a generic struct whose header has a const-generic VALUE
+            // slot cannot be used before its declaration: parsing
+            // `IteratorCursor[T, S, Vector[T].step]` (std/vector.t) needs to know slot 3
+            // is a value slot, and a parser that reads it as a TYPE dies on the `.`
+            // ("Expected ']' after generic struct type arguments"). That made whole
+            // files order-dependent -- std/vector.t compiled after std/iterator.t and
+            // failed before it, which reads as "vector.t is broken" when nothing is.
+            //
+            // The kinds recorded here are parsed by the REAL type grammar
+            // (parse_generic_param_list, just above), so a pin can be anything the
+            // language allows -- `u32 N`, `Cfg C`, `T[3] arr`, `fn(T, T) T Op` --
+            // with nothing assumed or synthesized about it.
+            gsig_register(name.start, name.length, tparams, pkinds, pcount, gpack);
             skip_braced_body();
             continue;
         } else {
@@ -4618,7 +4765,6 @@ void Parse_Signatures(const char* filename, const char* source) {
 }
 
 
-static bool s_parse_had_error = false;
 bool Parse_HadError(void) { return s_parse_had_error; }
 
 ASTNode* Parse_Block(void) {

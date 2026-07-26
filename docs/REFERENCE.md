@@ -237,7 +237,9 @@ u8* arr = new[1024] u8                          // array (count, not bytes)
 delete n
 delete arr
 ```
-No GC, no RAII, no destructor call on `delete`.
+No GC. Allocation is manual; **destruction is not** — a struct that defines
+`__delete()` is destroyed automatically, both by `delete` and at scope exit.
+See "Ownership and `__delete`" below for the exact rules and their limits.
 
 ---
 
@@ -424,8 +426,31 @@ impl Counter {
   `Counter_m(&x, a)` (or `Counter_m(x, a)` if `x` is already `Counter*`).
 - Field lookup wins over method lookup — a method never shadows a field.
 - `pub impl` exports every method; no per-method `pub`.
-- Only `fn` inside `impl`. No nested types, no `const`, no static methods,
-  no constructors (write an ordinary function returning the struct instead).
+- Only `fn` inside `impl`. No nested types, no `const`.
+
+### `static fn` — associated functions
+
+A method marked `static` takes **no `self`** and is called on the *type*, not
+on an instance. This is the constructor idiom: a `static fn` returning the
+struct, rather than a dedicated constructor form.
+
+```
+struct P { i32 x }
+impl P {
+    static fn make(i32 v) P { return {.x = v} }
+    static fn origin() P    { return P.make(0) }   // statics call statics
+    fn get() i32            { return self.x }      // ordinary method: has self
+}
+P a = P.make(5)
+i32 v = a.get()
+```
+- Called as `Type.name(args)`. Calling one through an instance (`a.make(1)`)
+  is not the access path; go through the type.
+- Works on a generic `impl`, with the type arguments supplied on the type:
+  `Vector[u8].create()`, `Vector[T].with_capacity(16)`. Combined with default
+  arguments this replaces the usual `create()`/`with_capacity()` duplication —
+  see `std/vector.t`.
+- `self` is not in scope in a `static fn` body; referring to it is an error.
 - Generic struct: `impl Box[T] { ... }` — params read from the struct's own
   declaration. `impl Box[u8]` (a concrete instantiation) is a compile error.
 - A method may declare its own extra type params: `fn map[U](U v) U { ... }`.
@@ -838,6 +863,24 @@ a[i]                                    -> __index(i)   (T* return -> also writa
 a = b                                   -> __assign(b)  (only when b doesn't already fit a's own type)
 ```
 
+**Operands may be taken by pointer.** An overload's parameter is an ordinary
+parameter, checked the ordinary way — declare it `T*` and the operand is passed
+by pointer instead of copied. Nothing is inferred and nothing is inserted: the
+call site must supply a matching pointer, or it is a type error.
+```
+impl Big {
+    fn __eq(Big* o) bool { return self.key == o.key }   // no copy of Big
+}
+a == &b       // matches Big*
+a == x        // also fine: x is already a Big*
+a == b        // type error: cannot assign Big to Big*
+```
+By-value and by-pointer overloads coexist freely (different types may each
+choose), and both work inside generic functions. Applies to the whole family —
+`__add`, `__lt`, `__index`, … — since all of them are just functions. Prefer
+`T*` for aggregates, where the by-value form copies the whole struct per
+operation.
+
 `__index(i) T*` (pointer INTO the container, e.g. `&self.data[i]`, not `T`)
 makes `v[i]` both readable and writable — see `std/vector.t`. Known gap:
 `v[i]` as a direct argument to a variadic extern call (`printf`) is unreliable;
@@ -867,6 +910,93 @@ impl Vector[T] {
 }
 // delete v  ->  calls v.__delete() then frees v
 ```
+
+---
+
+## Ownership and `__delete`
+
+Defining `__delete()` on a struct makes it an **owning** type, and that one
+fact drives everything below. There is no `Drop` trait, no ownership
+annotation, no borrow checker — the destructor's mere existence is the whole
+declaration, queried structurally wherever it matters.
+
+### Two automatic call sites
+
+`__delete()` is called for you in exactly two places:
+
+```
+R* p = new R{...}
+delete p              // 1. explicit: __delete(), THEN the free
+{ R local = {...} }   // 2. scope exit: __delete() at the closing brace
+```
+
+Scope exit is real RAII and applies to every block kind — a bare `{ }`, a
+function body, an `if`/`while`/`for` body. Locals are destroyed in **LIFO**
+order, and the destructor runs on early `return` as well as on fall-through,
+because it is implemented as a synthesized `defer` (same machinery, same
+ordering rules as a hand-written one):
+
+```
+{
+    R a = {.id = 1}
+    R b = {.id = 2}
+}   // drops b, then a
+```
+
+`delete` always frees the storage afterward — `__delete()` is cleanup logic
+layered on top of the free, never a replacement for it.
+
+### `Owning` — the capability alias
+
+Generic code asks "does `T` own something?" with an ordinary structural
+`impl` query, which reads best behind an alias:
+
+```
+alias Owning = impl { fn __delete() }
+
+fn store[T](T item) void {
+    match T {
+        Owning { ... }   // T has a destructor: deep-copy it
+        else   { ... }   // plain data: a field copy is fine
+    }
+}
+```
+This resolves at compile time and costs nothing at runtime. `std/vector.t`
+declares `pub alias Owning` and routes every ownership decision through it, so
+the predicate is written once rather than respelled per call site.
+
+### What is NOT automatic — read before writing an owning type
+
+The rules below are the ones that bite. None of them are checked for you.
+
+**`b = a` is always a shallow memcpy** — never a hook, never recursive, for
+structs and arrays alike. There is no copy constructor and no move semantics,
+so a copy of an owning struct duplicates the *pointer* and now aliases the
+same resource. Deep copying is an ordinary, visible method call (`a.copy()`),
+by convention on the `Owning` branch of a `match` — see `std/vector.t`.
+
+Function parameters are copies and are **not** destroyed on return; the
+caller's original still owns the resource.
+
+**Owning fields are not destroyed recursively.** A struct's own `__delete()`
+is called; the destructors of its *fields* are not called for you. A container
+must walk its elements itself (`destroy_elems()` in `std/vector.t`).
+
+**Copy-binding in a `match` arm duplicates the payload.** Match a payload of
+an owning type with the write-through form `{.Some = *v}` (a pointer into the
+slot), never `{.Some = v}` (a copy):
+```
+match v.pop() {
+    {.Some = *x} { ... }   // aliases the payload
+    .None        { }
+}
+```
+
+**A returned local is not destroyed** — the value escapes to the caller, who
+destroys it. This holds for a `return r` anywhere in the function, including
+inside an `if`, loop, or `match` arm, not only as the final statement. The
+check is conservative: any `return r` at all suppresses `r`'s destructor, so a
+return that never executes at runtime leaks rather than double-frees.
 
 ---
 

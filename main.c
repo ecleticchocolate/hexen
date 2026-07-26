@@ -74,14 +74,37 @@ static void prescan_structs(const char* filename, const char* source) {
         // s_type_params. The real parser will do that with proper scoping.
         // Setting type_params here would cause T/K/V to be treated as registered
         // structs and mis-instantiate generics inside field types.
+        // Arity is the number of SLOTS -- i.e. top-level commas plus one -- not the
+        // number of identifiers. A slot's pin may itself contain identifiers, commas
+        // and brackets (`[T, fn(T, T) T Op]` is 2 params, but 5 identifiers and an
+        // inner comma), so counting identifiers overcounts every non-trivial header
+        // and made `IteratorCursor[E, S, fn(S*) Option[E*] F]` report "expects 5 type
+        // arguments, got 3". Depth tracking is what distinguishes a separator comma
+        // from one inside a slot; the real grammar is applied later by pass 0b /
+        // pass 1, which overwrite this with properly-parsed params.
         if (t.type == TOK_LBRACKET) {
             size_t pcount = 0;
+            size_t slot_tokens = 0;
+            int bracket_depth = 0, paren_depth = 0;
             t = Lexer_NextToken();
-            while (t.type != TOK_RBRACKET && t.type != TOK_EOF) {
-                if (t.type == TOK_IDENTIFIER) pcount++;
+            while (t.type != TOK_EOF) {
+                if (t.type == TOK_LBRACKET) bracket_depth++;
+                else if (t.type == TOK_RBRACKET) {
+                    if (bracket_depth == 0) break;   // closes the param list
+                    bracket_depth--;
+                } else if (t.type == TOK_LPAREN) paren_depth++;
+                else if (t.type == TOK_RPAREN) { if (paren_depth > 0) paren_depth--; }
+
+                if (t.type == TOK_COMMA && bracket_depth == 0 && paren_depth == 0) {
+                    if (slot_tokens > 0) pcount++;
+                    slot_tokens = 0;
+                    t = Lexer_NextToken();
+                    continue;
+                }
+                slot_tokens++;
                 t = Lexer_NextToken();
-                if (t.type == TOK_COMMA) t = Lexer_NextToken();
             }
+            if (slot_tokens > 0) pcount++;   // final slot (no trailing comma)
             sd->is_generic = (pcount > 0);
             sd->type_param_count = pcount;
             if (t.type == TOK_RBRACKET) t = Lexer_NextToken();
@@ -223,6 +246,15 @@ int main(int argc, char** argv) {
 
         // --- Pass 1: Typecheck the whole program, which resolves all generics ---
         Typecheck_Program(units, count);
+
+        // Typecheck raises parser-style errors too -- Lower_Match (match.c) reports a
+        // non-exhaustive `match` via parse_error, which happens HERE, well after the
+        // pre-typecheck check above. Without this second check the error printed and
+        // the program ran anyway (exit 0), so a genuinely rejected program still
+        // executed. Same guard, at the other point an error can now originate.
+        if (Parse_HadError()) {
+            return 1;
+        }
 
         if (emit_mod_file) {
             Module_Generate(emit_mod_file);
